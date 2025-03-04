@@ -1,4 +1,5 @@
-facebook-business
-python-telegram-bot
-schedule
-requests
+facebook-business==11.0.0
+python-telegram-bot==20.0
+schedule==1.1.0
+requests==2.26.0
+python_version >= '3.7'
