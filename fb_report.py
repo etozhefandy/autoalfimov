@@ -2,6 +2,8 @@ import asyncio
 import re
 import hashlib
 import hmac
+import schedule
+import time
 from facebook_business.adobjects.adaccount import AdAccount
 from facebook_business.api import FacebookAdsApi
 from telegram import Bot
@@ -30,7 +32,6 @@ TELEGRAM_TOKEN = "8033028841:AAGp7856PuHCrAeIXYHGN2W6q83SsCWxxXI"
 CHAT_ID = "253181449"
 bot = Bot(token=TELEGRAM_TOKEN)
 
-
 # ===== Оставленные метрики =====
 ALLOWED_ACTIONS = {
     "link_click"  # Клики (все)
@@ -38,11 +39,10 @@ ALLOWED_ACTIONS = {
 
 # ===== Функция для удаления проблемных символов =====
 def clean_text(text):
-    """Удаляет символы, запрещённые в Telegram MarkdownV2."""
+    """Экранирует символы, запрещённые в Telegram MarkdownV2."""
     if not isinstance(text, str):
         return str(text)
-    text = re.sub(r'[*_~`\[\](){}!#>+=|]', '', text)  # Полностью удаляем запрещённые символы
-    text = text.replace(".", ",")  # Меняем точки в числах на запятые (чтобы Telegram не ругался)
+    text = re.sub(r'([_*[\]()~`>#+-=|{}.!])', r'\\\1', text)  # Экранируем специальные символы
     return text
 
 # ===== Функция для вычисления appsecret_proof =====
@@ -97,7 +97,9 @@ def get_facebook_data(account_id):
                     if action_type in ALLOWED_ACTIONS:
                         report += f"\n💰 Стоимость клика: {clean_text(str(round(float(cost['value']), 2)))} USD"
 
-            report += f"\n💵 Сумма затрат: {clean_text(str(round(float(campaign.get('spend', 0)), 2)))} USD"
+            # Проверяем, есть ли сумма затрат перед округлением
+            spend = campaign.get('spend', 0)
+            report += f"\n💵 Сумма затрат: {clean_text(str(round(float(spend), 2)))} USD"
 
     return report
 
@@ -113,6 +115,14 @@ async def main():
     for account_id in AD_ACCOUNTS:
         await send_to_telegram(get_facebook_data(account_id))
 
-# ===== Запуск =====
-if __name__ == "__main__":
+# ===== Запуск по расписанию =====
+def run_bot():
     asyncio.run(main())
+
+# Запускать каждый день в 9:30 утра
+schedule.every().day.at("09:30").do(run_bot)
+
+if __name__ == "__main__":
+    while True:
+        schedule.run_pending()
+        time.sleep(60)  # Проверяем расписание каждую минуту
