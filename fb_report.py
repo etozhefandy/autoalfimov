@@ -40,7 +40,7 @@ ALLOWED_ACTIONS = {"link_click"}
 def clean_text(text):
     if not isinstance(text, str):
         return str(text)
-    return re.sub(r'([_\*\[\]()~`>#+\-=|{}.!])', r'\\\1', text)
+    return re.sub(r'([_*\[\]()~`>#+\-=|{}.!])', r'\\\1', text)
 
 # ===== Функция для вычисления appsecret_proof =====
 def generate_appsecret_proof():
@@ -103,7 +103,6 @@ async def send_to_telegram(message):
 app = Application.builder().token(TELEGRAM_TOKEN).build()
 
 async def today_report(update: Update, context: CallbackContext):
-    print("Команда получена!")
     await update.message.reply_text("Собираю данные за сегодня...")
     for account_id in AD_ACCOUNTS:
         await send_to_telegram(get_facebook_data(account_id, "today"))
@@ -124,4 +123,12 @@ schedule.every().day.at("04:30").do(lambda: asyncio.run(send_yesterday_report())
 # ===== Запуск бота =====
 if __name__ == "__main__":
     print("🚀 Бот запущен, задачи по расписанию...")
-    asyncio.run(main())
+    
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    loop.create_task(main())
+
+    while True:
+        schedule.run_pending()
+        time.sleep(60)
