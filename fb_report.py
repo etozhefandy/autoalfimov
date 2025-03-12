@@ -121,13 +121,14 @@ schedule.every().day.at("04:30").do(lambda: asyncio.run(send_yesterday_report())
 async def main():
     print("🚀 Telegram-бот запущен и задачи по расписанию...")
     
-    # Запускаем бота и задачи в одном event loop
+    # Запускаем бота в asyncio без создания нового цикла
     bot_task = asyncio.create_task(app.run_polling())
-    
+
     while True:
         schedule.run_pending()
         await asyncio.sleep(60)
 
 # ===== Запуск системы =====
 if __name__ == "__main__":
-    asyncio.run(main())
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(main())
