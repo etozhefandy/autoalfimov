@@ -129,3 +129,42 @@ if __name__ == "__main__":
         schedule.run_pending()
         print("Скрипт работает, ждет следующего запуска...")
         time.sleep(60)
+
+# ===== Храним отправленные предупреждения =====
+sent_warnings = set()
+
+# ===== Функция для проверки статуса рекламных аккаунтов и платежей =====
+def check_billing_and_status():
+    global sent_warnings
+    problem_accounts = []
+
+    for account_id in AD_ACCOUNTS:
+        try:
+            account = AdAccount(account_id)
+            account_info = account.api_get(fields=['account_status', 'name', 'disable_reason'])
+
+            account_name = account_info.get('name', 'Неизвестный аккаунт')
+            status = account_info.get('account_status', 0)
+            disable_reason = account_info.get('disable_reason', None)
+
+            # Если аккаунт отключен или есть проблема с платежом
+            if status != 1 or disable_reason:
+                if account_id not in sent_warnings:
+                    problem_accounts.append(f"🚨 Внимание! Рекламный аккаунт *{account_name}* отключен или есть проблемы с платежом!")
+                    sent_warnings.add(account_id)  # Запоминаем, что отправили предупреждение
+
+            # Если аккаунт снова активен, убираем его из списка предупреждений
+            elif account_id in sent_warnings:
+                problem_accounts.append(f"✅ Рекламный аккаунт *{account_name}* снова активен!")
+                sent_warnings.remove(account_id)
+
+        except Exception as e:
+            problem_accounts.append(f"❌ Ошибка при проверке аккаунта {account_id}: {clean_text(str(e))}")
+
+    # Если есть проблемы, отправляем уведомление
+    if problem_accounts:
+        message = "\n".join(problem_accounts)
+        asyncio.run(send_to_telegram(message))
+
+# Запуск проверки биллинга и статуса аккаунтов каждые 30 минут
+schedule.every(30).minutes.do(check_billing_and_status)
