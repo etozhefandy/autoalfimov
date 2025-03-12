@@ -25,7 +25,7 @@ AD_ACCOUNTS = [
     "act_508239018969999",
     "act_1513759385846431",
     "act_1042955424178074",
-    "act_1415004142524014"  # Новый аккаунт
+    "act_1415004142524014"
 ]
 
 # ===== Настройки Telegram =====
@@ -34,21 +34,17 @@ CHAT_ID = "253181449"
 bot = Bot(token=TELEGRAM_TOKEN)
 
 # ===== Оставленные метрики =====
-ALLOWED_ACTIONS = {
-    "link_click"  # Клики (все)
-}
+ALLOWED_ACTIONS = {"link_click"}
 
 # ===== Функция для удаления проблемных символов =====
 def clean_text(text):
-    """Экранирует символы, запрещённые в Telegram MarkdownV2."""
     if not isinstance(text, str):
         return str(text)
-    text = re.sub(r'([_*[\]()~`>#+-=|{}.!])', r'\\\1', text)  # Экранируем специальные символы
+    text = re.sub(r'([_\*\[\]()~`>#+\-=|{}.!])', r'\\\1', text)
     return text
 
 # ===== Функция для вычисления appsecret_proof =====
 def generate_appsecret_proof():
-    """Создаёт appsecret_proof для безопасности запросов."""
     return hmac.new(APP_SECRET.encode(), ACCESS_TOKEN.encode(), hashlib.sha256).hexdigest()
 
 # ===== Функция для проверки, активен ли рекламный кабинет =====
@@ -63,25 +59,21 @@ def is_account_active(account_id):
 def get_facebook_data(account_id):
     account = AdAccount(account_id)
     fields = ['impressions', 'cpm', 'clicks', 'cpc', 'actions', 'cost_per_action_type', 'spend']
-    params = {
-        'date_preset': 'yesterday',
-        'level': 'account',
-        'appsecret_proof': generate_appsecret_proof()
-    }
-
+    params = {'date_preset': 'yesterday', 'level': 'account', 'appsecret_proof': generate_appsecret_proof()}
+    
     try:
         campaigns = account.get_insights(fields=fields, params=params)
     except Exception as e:
         return f"⚠ Ошибка загрузки данных для {account_id}: {clean_text(str(e))}"
-
+    
     try:
         account_name = account.api_get(fields=['name'])['name']
     except Exception:
         account_name = "Неизвестный аккаунт"
-
+    
     status_emoji = is_account_active(account_id)
     report = f"{status_emoji} {clean_text(account_name)}\n"
-
+    
     if not campaigns:
         report += "\n⚠ Данных за вчера нет"
     else:
@@ -90,22 +82,19 @@ def get_facebook_data(account_id):
             report += f"\n🎯 CPM: {clean_text(str(round(float(campaign.get('cpm', 0)) / 100, 2)))} USD"
             report += f"\n🖱 Клики: {clean_text(campaign.get('clicks', '—'))}"
             report += f"\n💸 CPC: {clean_text(str(round(float(campaign.get('cpc', 0)), 2)))} USD"
-
-            # Стоимость результата (только нужные)
+            
             if 'cost_per_action_type' in campaign:
                 for cost in campaign['cost_per_action_type']:
-                    action_type = cost['action_type']
-                    if action_type in ALLOWED_ACTIONS:
+                    if cost['action_type'] in ALLOWED_ACTIONS:
                         report += f"\n💰 Стоимость клика: {clean_text(str(round(float(cost['value']), 2)))} USD"
-
-            # Проверяем, есть ли сумма затрат перед округлением
+            
             spend = campaign.get('spend', 0)
             report += f"\n💵 Сумма затрат: {clean_text(str(round(float(spend), 2)))} USD"
-
     return report
 
 # ===== Функция для отправки отчёта в Telegram =====
 async def send_to_telegram(message):
+    print(f"Отправка сообщения в Telegram: {message}")
     try:
         await bot.send_message(chat_id=CHAT_ID, text=message, parse_mode="MarkdownV2")
     except Exception as e:
@@ -118,12 +107,15 @@ async def main():
 
 # ===== Запуск по расписанию =====
 def run_bot():
+    print("Запуск run_bot()")
     asyncio.run(main())
 
 # Запускать каждый день в 9:30 утра
 schedule.every().day.at("09:30").do(run_bot)
 
 if __name__ == "__main__":
+    print("Скрипт стартовал, будет запускать задачи по расписанию")
     while True:
         schedule.run_pending()
-        time.sleep(60)  # Проверяем расписание каждую минуту
+        print("Скрипт работает, ждет следующего запуска...")
+        time.sleep(60)
