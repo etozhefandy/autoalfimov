@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import schedule
 import time
+import threading
 from facebook_business.adobjects.adaccount import AdAccount
 from facebook_business.api import FacebookAdsApi
 from telegram import Bot, Update
@@ -41,7 +42,7 @@ ALLOWED_ACTIONS = {"link_click"}
 def clean_text(text):
     if not isinstance(text, str):
         return str(text)
-    text = re.sub(r'([_*\[\]()~`>#+\-=|{}.!])', r'\\\1', text)
+    text = re.sub(r'([_\*\[\]()~`>#+\-=|{}.!])', r'\\\1', text)
     return text
 
 # ===== Функция для вычисления appsecret_proof =====
@@ -110,21 +111,22 @@ async def today_report(update: Update, context: CallbackContext):
 
 app.add_handler(CommandHandler("today_report", today_report))
 
-async def start_bot():
-    await app.run_polling()
+# ===== Запуск бота в отдельном потоке =====
+def run_telegram_bot():
+    print("📡 Bot started polling")
+    app.run_polling()
 
 # ===== Запуск автоматического отчёта =====
-async def send_yesterday_report():
-    for account_id in AD_ACCOUNTS:
-        await send_to_telegram(get_facebook_data(account_id, "yesterday"))
+def run_auto_report():
+    asyncio.run(send_yesterday_report())
 
-schedule.every().day.at("04:30").do(lambda: asyncio.run(send_yesterday_report()))
+schedule.every().day.at("04:30").do(run_auto_report)
 
 # ===== Запуск системы =====
 if __name__ == "__main__":
     print("🚀 Бот запущен, задачи по расписанию...")
-    loop = asyncio.get_event_loop()
-    loop.create_task(start_bot())
+    bot_thread = threading.Thread(target=run_telegram_bot, daemon=True)
+    bot_thread.start()
     while True:
         schedule.run_pending()
         time.sleep(60)
