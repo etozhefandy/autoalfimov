@@ -18,7 +18,7 @@ FacebookAdsApi.init(APP_ID, APP_SECRET, ACCESS_TOKEN)
 # ===== Список рекламных аккаунтов =====
 AD_ACCOUNTS = [
     "act_1206987573792913",
-  "act_1415004142524014",
+    "act_1415004142524014",
     "act_1333550570916716",
     "act_798205335840576",
     "act_844229314275496",
@@ -27,7 +27,6 @@ AD_ACCOUNTS = [
     "act_508239018969999",
     "act_1513759385846431",
     "act_1042955424178074"
-    
 ]
 
 # ===== Настройки Telegram =====
@@ -57,15 +56,7 @@ def is_account_active(account_id):
     except Exception:
         return "🔴"
 
-# ===== Функция для получения данных за вчера (автоотчёт) =====
-def get_facebook_data_yesterday(account_id):
-    return get_facebook_data(account_id, "yesterday")
-
-# ===== Функция для получения данных за сегодня (по кнопке) =====
-def get_facebook_data_today(account_id):
-    return get_facebook_data(account_id, "today")
-
-# ===== Общая функция для получения данных =====
+# ===== Функция для получения данных =====
 def get_facebook_data(account_id, date_preset):
     account = AdAccount(account_id)
     fields = ['impressions', 'cpm', 'clicks', 'cpc', 'actions', 'cost_per_action_type', 'spend']
@@ -112,13 +103,13 @@ async def send_to_telegram(message):
 # ===== Запуск автоматического отчёта =====
 async def send_yesterday_report():
     for account_id in AD_ACCOUNTS:
-        await send_to_telegram(get_facebook_data_yesterday(account_id))
+        await send_to_telegram(get_facebook_data(account_id, "yesterday"))
 
 # ===== Запуск отчёта по команде в боте =====
 async def today_report(update: Update, context: CallbackContext):
     await update.message.reply_text("Собираю данные за сегодня...")
     for account_id in AD_ACCOUNTS:
-        await send_to_telegram(get_facebook_data_today(account_id))
+        await send_to_telegram(get_facebook_data(account_id, "today"))
 
 # ===== Бот Telegram с командой /today_report =====
 app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -127,46 +118,18 @@ app.add_handler(CommandHandler("today_report", today_report))
 async def start_telegram_bot():
     await app.run_polling()
 
-# ===== Запуск по расписанию =====
-def run_auto_report():
-    asyncio.run(send_yesterday_report())
-
-schedule.every().day.at("04:30").do(run_auto_report)  # Автоотчёт в 9:30 по твоему времени
-
-# ===== Проверка биллинга и отключённых аккаунтов =====
-sent_warnings = set()
-
-def check_billing_and_status():
-    global sent_warnings
-    problem_accounts = []
-
-    for account_id in AD_ACCOUNTS:
-        try:
-            account = AdAccount(account_id)
-            account_info = account.api_get(fields=['account_status', 'name', 'disable_reason'])
-            account_name = account_info.get('name', 'Неизвестный аккаунт')
-            status = account_info.get('account_status', 0)
-            disable_reason = account_info.get('disable_reason', None)
-
-            if status != 1 or disable_reason:
-                if account_id not in sent_warnings:
-                    problem_accounts.append(f"🚨 Аккаунт *{account_name}* отключен или есть проблема с платежом!")
-                    sent_warnings.add(account_id)
-            elif account_id in sent_warnings:
-                problem_accounts.append(f"✅ Аккаунт *{account_name}* снова активен!")
-                sent_warnings.remove(account_id)
-
-        except Exception as e:
-            problem_accounts.append(f"❌ Ошибка проверки {account_id}: {clean_text(str(e))}")
-
-    if problem_accounts:
-        asyncio.run(send_to_telegram("\n".join(problem_accounts)))
-
-schedule.every(30).minutes.do(check_billing_and_status)
-
-if __name__ == "__main__":
-    print("🚀 Бот запущен, задачи по расписанию...")
-    asyncio.run(start_telegram_bot())
+# ===== Функция запуска всего приложения =====
+async def main_loop():
+    asyncio.create_task(start_telegram_bot())  # Запускаем бота
     while True:
         schedule.run_pending()
-        time.sleep(60)
+        await asyncio.sleep(60)
+
+# ===== Запуск по расписанию =====
+schedule.every().day.at("04:30").do(lambda: asyncio.create_task(send_yesterday_report()))
+schedule.every(30).minutes.do(lambda: asyncio.create_task(check_billing_and_status()))
+
+# ===== Запуск всего кода =====
+if __name__ == "__main__":
+    print("🚀 Бот запущен, задачи по расписанию...")
+    asyncio.run(main_loop())
