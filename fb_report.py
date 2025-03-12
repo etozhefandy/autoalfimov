@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import schedule
 import time
+import threading
 from facebook_business.adobjects.adaccount import AdAccount
 from facebook_business.api import FacebookAdsApi
 from telegram import Bot, Update
@@ -117,18 +118,16 @@ async def send_yesterday_report():
 
 schedule.every().day.at("04:30").do(lambda: asyncio.run(send_yesterday_report()))
 
-# ===== Основная функция с asyncio =====
-async def main():
-    print("🚀 Telegram-бот запущен и задачи по расписанию...")
-    
-    # Запускаем бота в asyncio без создания нового цикла
-    bot_task = asyncio.create_task(app.run_polling())
-
+# ===== Запуск системы =====
+def run_scheduler():
     while True:
         schedule.run_pending()
-        await asyncio.sleep(60)
+        time.sleep(60)
 
-# ===== Запуск системы =====
+def run_telegram_bot():
+    app.run_polling()
+
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(main())
+    print("🚀 Telegram-бот запущен и задачи по расписанию...")
+    threading.Thread(target=run_scheduler, daemon=True).start()
+    run_telegram_bot()
