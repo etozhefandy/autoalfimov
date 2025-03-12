@@ -94,24 +94,34 @@ def get_facebook_data(account_id):
 
 # ===== Функция для отправки отчёта в Telegram =====
 async def send_to_telegram(message):
+    print(f"Отправка сообщения в Telegram: {message}")  # Отладочный вывод
+    try:
+        await bot.send_message(chat_id=CHAT_ID, text=message, parse_mode="MarkdownV2")
+        print("✅ Сообщение отправлено!")
+    except Exception as e:
+        print(f"❌ Ошибка отправки в Telegram: {e}")  # Вывод ошибки
+async def send_to_telegram(message):
     print(f"Отправка сообщения в Telegram: {message}")
     try:
         await bot.send_message(chat_id=CHAT_ID, text=message, parse_mode="MarkdownV2")
     except Exception as e:
         print(f"Ошибка отправки в Telegram: {e}")
-
 # ===== Основная асинхронная функция =====
 async def main():
+    print("🔍 Запуск main() — проверка отправки сообщений в Telegram")  # Отладка
     for account_id in AD_ACCOUNTS:
-        await send_to_telegram(get_facebook_data(account_id))
-
+        print(f"📡 Получение данных для аккаунта: {account_id}")  # Отладка
+        report = get_facebook_data(account_id)
+        print(f"📤 Отправка отчёта: {report}")  # Отладка перед отправкой
+        await send_to_telegram(report) 
 # ===== Запуск по расписанию =====
 def run_bot():
     print("Запуск run_bot()")
-    asyncio.run(main())
+print("🚀 Вызов main() — отправка сообщений началась!")    
+asyncio.run(main())
 
 # Запускать каждый день в 9:30 утра
-schedule.every().day.at("09:30").do(run_bot)
+schedule.every().day.at("04:30").do(run_bot) # Вместо 09:30 ставим 04:30 (по UTC)
 
 if __name__ == "__main__":
     print("Скрипт стартовал, будет запускать задачи по расписанию")
