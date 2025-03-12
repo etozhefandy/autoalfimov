@@ -4,7 +4,6 @@ import hashlib
 import hmac
 import schedule
 import time
-import threading
 from facebook_business.adobjects.adaccount import AdAccount
 from facebook_business.api import FacebookAdsApi
 from telegram import Bot, Update
@@ -15,6 +14,7 @@ ACCESS_TOKEN = "EAASZCrBwhoH0BO6hvTPZBtAX3OFPcJjZARZBZCIllnjc4GkxagyhvvrylPKWdU9
 APP_ID = "1336645834088573"
 APP_SECRET = "01bf23c5f726c59da318daa82dd0e9dc"
 FacebookAdsApi.init(APP_ID, APP_SECRET, ACCESS_TOKEN)
+
 
 # ===== Список рекламных аккаунтов =====
 AD_ACCOUNTS = [
@@ -33,7 +33,6 @@ AD_ACCOUNTS = [
 # ===== Настройки Telegram =====
 TELEGRAM_TOKEN = "8033028841:AAGud3hSZdR8KQiOSaAcwfbkv8P0p-P3Dt4"
 CHAT_ID = "253181449"
-bot = Bot(token=TELEGRAM_TOKEN)
 
 # ===== Оставленные метрики =====
 ALLOWED_ACTIONS = {"link_click"}
@@ -42,8 +41,7 @@ ALLOWED_ACTIONS = {"link_click"}
 def clean_text(text):
     if not isinstance(text, str):
         return str(text)
-    text = re.sub(r'([_*\[\]()~`>#+\-=|{}.!])', r'\\\1', text)
-    return text
+    return re.sub(r'([_*\[\]()~`>#+\-=|{}.!])', r'\\\1', text)
 
 # ===== Функция для вычисления appsecret_proof =====
 def generate_appsecret_proof():
@@ -96,6 +94,7 @@ def get_facebook_data(account_id, date_preset):
 
 # ===== Функция для отправки отчёта в Telegram =====
 async def send_to_telegram(message):
+    bot = Bot(token=TELEGRAM_TOKEN)
     try:
         await bot.send_message(chat_id=CHAT_ID, text=message, parse_mode="MarkdownV2")
     except Exception as e:
@@ -111,6 +110,10 @@ async def today_report(update: Update, context: CallbackContext):
 
 app.add_handler(CommandHandler("today_report", today_report))
 
+async def main():
+    print("📡 Bot started polling")
+    await app.run_polling()
+
 # ===== Запуск автоматического отчёта =====
 async def send_yesterday_report():
     for account_id in AD_ACCOUNTS:
@@ -118,16 +121,20 @@ async def send_yesterday_report():
 
 schedule.every().day.at("04:30").do(lambda: asyncio.run(send_yesterday_report()))
 
-# ===== Запуск системы =====
-def run_scheduler():
+# ===== Запуск бота =====
+if __name__ == "__main__":
+    print("🚀 Бот запущен, задачи по расписанию...")
+    
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    # Запускаем Telegram-бота
+    loop.create_task(main())
+
+    # Запускаем планировщик
     while True:
         schedule.run_pending()
         time.sleep(60)
 
-def run_telegram_bot():
-    app.run_polling()
 
-if __name__ == "__main__":
-    print("🚀 Telegram-бот запущен и задачи по расписанию...")
-    threading.Thread(target=run_scheduler, daemon=True).start()
-    run_telegram_bot()
+
