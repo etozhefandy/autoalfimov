@@ -4,7 +4,7 @@ import hashlib
 import hmac
 from facebook_business.adobjects.adaccount import AdAccount
 from facebook_business.api import FacebookAdsApi
-from telegram import Update
+from telegram import Bot, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 ACCESS_TOKEN = "EAASZCrBwhoH0BO6hvTPZBtAX3OFPcJjZARZBZCIllnjc4GkxagyhvvrylPKWdU9jMijZA051BJRRvVuV1nab4k5jtVO5q0TsDIKbXzphumaFIbqKDcJ3JMvQTmORdrNezQPZBP14pq4NKB56wpIiNJSLFa5yXFsDttiZBgUHAmVAJknN7Ig1ZBVU2q0vRyQKtyuXXwZDZD"
@@ -23,10 +23,12 @@ TELEGRAM_TOKEN = "8033028841:AAGud3hSZdR8KQiOSaAcwfbkv8P0p-P3Dt4"
 CHAT_ID = "253181449"
 ALLOWED_ACTIONS = {"link_click"}
 
+bot = Bot(token=TELEGRAM_TOKEN)
+
 def clean_text(text):
     if not isinstance(text, str):
-        return str(text)
-    return re.sub(r'([_*\[\]()~`>#+\-=|{}.!-])', '', text)
+        text = str(text)
+    return re.sub(r'([_\*\[\]\(\)~`>#+\-=|{}.!])', r'\\\1', text)
 
 def generate_appsecret_proof():
     return hmac.new(APP_SECRET.encode(), ACCESS_TOKEN.encode(), hashlib.sha256).hexdigest()
@@ -41,7 +43,12 @@ def is_account_active(account_id):
 def get_facebook_data(account_id, date_preset):
     account = AdAccount(account_id)
     fields = ['impressions', 'cpm', 'clicks', 'cpc', 'actions', 'cost_per_action_type', 'spend']
-    params = {'date_preset': date_preset, 'level': 'account', 'appsecret_proof': generate_appsecret_proof()}
+    params = {
+        'date_preset': date_preset,
+        'level': 'account',
+        'appsecret_proof': generate_appsecret_proof(),
+        'fields': ','.join(fields)
+    }
 
     try:
         campaigns = account.get_insights(fields=fields, params=params)
@@ -60,18 +67,18 @@ def get_facebook_data(account_id, date_preset):
         report += "\n⚠ Данных за выбранный период нет"
     else:
         campaign = campaigns[0]
-        report += f"\nПоказы: {clean_text(campaign.get('impressions', '—'))}"
-        report += f"\nCPM: {clean_text(str(round(float(campaign.get('cpm', 0)) / 100, 2)))} USD"
-        report += f"\nКлики: {clean_text(campaign.get('clicks', '—'))}"
-        report += f"\nCPC: {clean_text(str(round(float(campaign.get('cpc', 0)), 2)))} USD"
+        report += f"\n👁 Показы: {clean_text(campaign.get('impressions', '—'))}"
+        report += f"\n🎯 CPM: {clean_text(str(round(float(campaign.get('cpm', 0)), 2)))} USD"
+        report += f"\n🖱 Клики: {clean_text(campaign.get('clicks', '—'))}"
+        report += f"\n💸 CPC: {clean_text(str(round(float(campaign.get('cpc', 0)), 2)))} USD"
 
         if 'cost_per_action_type' in campaign:
             for cost in campaign['cost_per_action_type']:
-                if cost.get('action_type') in ALLOWED_ACTIONS:
-                    report += f"\nСтоимость действия: {clean_text(str(round(float(cost['value']), 2)))} USD"
+                if cost.get('action_type') == 'link_click':
+                    report += f"\n💰 Стоимость действия: {clean_text(str(round(float(cost['value']), 2)))} USD"
 
         spend = campaign.get('spend', 0)
-        report += f"\nСумма затрат: {clean_text(str(round(float(spend), 2)))} USD"
+        report += f"\n💵 Сумма затрат: {clean_text(str(round(float(spend), 2)))} USD"
 
     return report
 
