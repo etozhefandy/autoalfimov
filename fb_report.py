@@ -102,7 +102,7 @@ app.add_handler(CommandHandler("today_report", today_report))
 
 async def main():
     print("📡 Bot started polling")
-    await app.run_polling()
+    await app.run_polling()  # Оставляем здесь, так как он сам блокирует поток
 
 async def schedule_loop():
     while True:
@@ -111,14 +111,14 @@ async def schedule_loop():
 
 async def run_all():
     """ Основная функция запуска бота и расписания """
-    loop = asyncio.get_running_loop()
-    task1 = loop.create_task(main())  # Запуск бота
-    task2 = loop.create_task(schedule_loop())  # Запуск планировщика
-    await asyncio.gather(task1, task2)  # Запуск в параллель
+    asyncio.create_task(schedule_loop())  # Запуск планировщика
+    await main()  # Запуск бота (он сам блокирует поток)
 
 if __name__ == "__main__":
     print("🚀 Бот запущен, задачи по расписанию...")
     
-    loop = asyncio.get_event_loop()
-    loop.create_task(run_all())
-    loop.run_forever()  # Запуск главного цикла
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    loop.create_task(run_all())  # Запускаем бота и планировщик
+    loop.run_forever()  # Запускаем главный цикл
