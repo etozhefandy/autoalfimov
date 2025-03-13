@@ -111,11 +111,13 @@ async def schedule_loop():
 
 async def run_all():
     """ Основная функция запуска бота и расписания """
-    task1 = asyncio.create_task(main())  # Запуск бота
-    task2 = asyncio.create_task(schedule_loop())  # Запуск планировщика
+    loop = asyncio.get_event_loop()
+    task1 = loop.create_task(main())  # Запуск бота
+    task2 = loop.create_task(schedule_loop())  # Запуск планировщика
     await asyncio.gather(task1, task2)  # Запуск в параллель
 
 if __name__ == "__main__":
     print("🚀 Бот запущен, задачи по расписанию...")
-
-    asyncio.run(run_all())  # Запускаем всё в одной `asyncio` среде
+    
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(run_all())  # Теперь корректный запуск
