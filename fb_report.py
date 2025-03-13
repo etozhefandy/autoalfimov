@@ -2,13 +2,12 @@ import asyncio
 import re
 import hashlib
 import hmac
-import schedule
-import time
 from facebook_business.adobjects.adaccount import AdAccount
 from facebook_business.api import FacebookAdsApi
-from telegram import Bot
+from telegram import Bot, Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-ACCESS_TOKEN = "EAASZCrBwhoH0BO6hvTPZBtAX3OFPcJjZARZBZCIllnjc4GkxagyhvvrylPKWdU9jMijZA051BJRRvVuV1nab4k5jtVO5q0TsDIKbXzphumaFIbqKDcJ3JMvQTmORdrNezQPZBP14pq4NKB56wpIiNJSLFa5yXFsDttiZBgUHAmVAJknN7Ig1ZBVU2q0vRyQKJtyuXXwZDZD"
+ACCESS_TOKEN = "EAASZCrBwhoH0BO6hvTPZBtAX3OFPcJjZARZBZCIllnjc4GkxagyhvvrylPKWdU9jMijZA051BJRRvVuV1nab4k5jtVO5q0TsDIKbXzphumaFIbqKDcJ3JMvQTmORdrNezQPZBP14pq4NKB56wpIiNJSLFa5yXFsDttiZBgUHAmVAJknN7Ig1ZBVU2q0vRyQKtyuXXwZDZD"
 APP_ID = "1336645834088573"
 APP_SECRET = "01bf23c5f726c59da318daa82dd0e9dc"
 FacebookAdsApi.init(APP_ID, APP_SECRET, ACCESS_TOKEN)
@@ -29,7 +28,7 @@ bot = Bot(token=TELEGRAM_TOKEN)
 def clean_text(text):
     if not isinstance(text, str):
         return str(text)
-    return re.sub(r'([_*\[\]()~`>#+\-=|{}.!])', r'\\\1', text)
+    return re.sub(r'([_*\[\]()~`>#+\-=|{}.!-])', r'\\\1', text)
 
 def generate_appsecret_proof():
     return hmac.new(APP_SECRET.encode(), ACCESS_TOKEN.encode(), hashlib.sha256).hexdigest()
@@ -62,41 +61,57 @@ def get_facebook_data(account_id, date_preset):
     if not campaigns:
         report += "\n⚠ Данных за выбранный период нет"
     else:
-        for campaign in campaigns:
-            report += f"\n👁 Показы: {clean_text(campaign.get('impressions', '—'))}"
-            report += f"\n🎯 CPM: {clean_text(str(round(float(campaign.get('cpm', 0)) / 100, 2)))} USD"
-            report += f"\n🖱 Клики: {clean_text(campaign.get('clicks', '—'))}"
-            report += f"\n💸 CPC: {clean_text(str(round(float(campaign.get('cpc', 0)), 2)))} USD"
-            
-            if 'cost_per_action_type' in campaign:
-                for cost in campaign['cost_per_action_type']:
-                    if cost['action_type'] in ALLOWED_ACTIONS:
-                        report += f"\n💰 Стоимость клика: {clean_text(str(round(float(cost['value']), 2)))} USD"
-            
-            spend = campaign.get('spend', 0)
-            report += f"\n💵 Сумма затрат: {clean_text(str(round(float(spend), 2)))} USD"
-    return report
+        campaign = campaigns[0]  # Учитываем только первую запись, т.к. уровень аккаунта один
+        report += f"\n👁 Показы: {clean_text(campaign.get('impressions', '—'))}"
+        report += f"\n🎯 CPM: {clean_text(str(round(float(campaign.get('cpm', 0)) / 100, 2)))} USD"
+        report += f"\n🖱 Клики: {clean_text(campaign.get('clicks', '—'))}"
+        report += f"\n💸 CPC: {clean_text(str(round(float(campaign.get('cpc', 0)), 2)))} USD"
+        
+        if 'cost_per_action_type' in campaign:
+            for cost in campaign['cost_per_action_type']:
+                if cost.get('action_type') == 'link_click':
+                    report += f"\n💰 Стоимость действия: {clean_text(str(round(float(cost['value']), 2)))} USD"
+        
+        spend = campaign.get('spend', 0)
+        report += f"\n💵 Сумма затрат: {clean_text(str(round(float(spend), 2)))} USD"
 
-async def send_to_telegram(message):
-    try:
-        await bot.send_message(chat_id=CHAT_ID, text=message, parse_mode="MarkdownV2")
-    except Exception as e:
-        print(f"❌ Ошибка отправки в Telegram: {e}")
+    return f"{is_account_active(account_id)} {clean_text(account_name)}\n" + report
 
-async def send_billing_alert(account_name, billing_amount):
-    message = f"🚨 Ёбушки-воробушки, у нас биллинг\n📢 Рекламный аккаунт: {clean_text(account_name)}\n💰 Сумма биллинга: {billing_amount} KZT"
-    print(f"📢 Уведомление о биллинге: {message}")
-    await send_to_telegram(message)
+async def send_to_telegram(context: ContextTypes.DEFAULT_TYPE, message: str, chat_id: int):
+    await context.bot.send_message(chat_id=context.job.chat_id, text=message, parse_mode='MarkdownV2')
 
-async def run_tasks():
-    while True:
-        schedule.run_pending()
-        await asyncio.sleep(60)
+async def today_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Собираю данные за сегодня...")
+    for account_id in AD_ACCOUNTS:
+        report = get_facebook_data(account_id, 'today')
+        await send_to_telegram_message(context, update.effective_chat.id, report)
 
-async def main():
-    print("🚀 Бот запущен, задачи по расписанию...")
-    schedule.every().day.at("04:30").do(lambda: asyncio.create_task(send_billing_alert("Тестовый аккаунт", 5000)))
-    await run_tasks()
+async def send_to_telegram_message(context: ContextTypes.DEFAULT_TYPE, chat_id, message):
+    await context.bot.send_message(chat_id=chat_id, text=message, parse_mode='MarkdownV2')
+
+async def billing_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Собираю данные по биллингам...")
+    for account_id in AD_ACCOUNTS:
+        account_name = "Неизвестный аккаунт"
+        try:
+            account_name = AdAccount(account_id).api_get(fields=['name'])['name']
+        except:
+            pass
+        await send_to_telegram_message(
+            context,
+            update.effective_chat.id,
+            f"📢 Рекламный аккаунт: *{clean_text(account_name)}* - статус {is_account_active(account_id)}"
+        )
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🤖 Бот активен! Используй команды /today и /billing")
+
+app = Application.builder().token(TELEGRAM_TOKEN).build()
+
+app.add_handler(CommandHandler("today", today_report))
+app.add_handler(CommandHandler("billing", send_to_telegram_message))
+app.add_handler(CommandHandler("start", start))
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    print("🚀 Бот запущен и ожидает команд.")
+    app.run_polling()
