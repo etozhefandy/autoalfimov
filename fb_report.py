@@ -4,7 +4,7 @@ import hashlib
 import hmac
 from facebook_business.adobjects.adaccount import AdAccount
 from facebook_business.api import FacebookAdsApi
-from telegram import Update
+from telegram import Bot, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 ACCESS_TOKEN = "EAASZCrBwhoH0BO6hvTPZBtAX3OFPcJjZARZBZCIllnjc4GkxagyhvvrylPKWdU9jMijZA051BJRRvVuV1nab4k5jtVO5q0TsDIKbXzphumaFIbqKDcJ3JMvQTmORdrNezQPZBP14pq4NKB56wpIiNJSLFa5yXFsDttiZBgUHAmVAJknN7Ig1ZBVU2q0vRyQKtyuXXwZDZD"
@@ -25,8 +25,8 @@ ALLOWED_ACTIONS = {"link_click"}
 
 def clean_text(text):
     if not isinstance(text, str):
-        return str(text)
-    return re.sub(r'([_*\[\]()~`>#+\-=|{}.!-])', '', text)
+        text = str(text)
+    return re.sub(r'([*\[\]()~`>#+|{}!])', '', text)
 
 def generate_appsecret_proof():
     return hmac.new(APP_SECRET.encode(), ACCESS_TOKEN.encode(), hashlib.sha256).hexdigest()
@@ -65,7 +65,7 @@ def get_facebook_data(account_id, date_preset):
     else:
         campaign = campaigns[0]
         report += f"\nПоказы: {clean_text(campaign.get('impressions', '—'))}"
-        report += f"\nCPM: {clean_text(str(round(float(campaign.get('cpm', 0)) / 100, 2)))} USD"
+        report += f"\nCPM: {clean_text(str(round(float(campaign.get('cpm', 0)), 2)))} USD"
         report += f"\nКлики: {clean_text(campaign.get('clicks', '—'))}"
         report += f"\nCPC: {clean_text(str(round(float(campaign.get('cpc', 0)), 2)))} USD"
 
