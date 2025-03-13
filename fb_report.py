@@ -31,7 +31,7 @@ ALLOWED_ACTIONS = {"link_click"}
 bot = Bot(token=TELEGRAM_TOKEN)
 
 def clean_text(text):
-    return re.sub(r'[-!*_]', '', text)  # Убираем символы, мешающие Markdown
+    return re.sub(r'[-!*_]', '', text)  # Убираем символы, мешающие Telegram
 
 def generate_appsecret_proof():
     return hmac.new(APP_SECRET.encode(), ACCESS_TOKEN.encode(), hashlib.sha256).hexdigest()
@@ -103,29 +103,17 @@ async def today_report(update: Update, context: CallbackContext):
 
 app.add_handler(CommandHandler("today_report", today_report))
 
-async def main():
-    print("📡 Bot started polling")
-    await app.run_polling()  # Telegram-бот запускается в фоне
-
 async def schedule_loop():
     while True:
         schedule.run_pending()
         await asyncio.sleep(60)  # Вместо блокирующего sleep
 
-async def run_all():
-    """ Основная функция запуска бота и расписания """
-    asyncio.create_task(schedule_loop())  # Запуск планировщика
-    await main()  # Запуск бота (он сам блокирует поток)
+async def main():
+    """ Основная функция: запускаем планировщик и бота """
+    task1 = asyncio.create_task(schedule_loop())  # Запуск планировщика
+    task2 = asyncio.create_task(app.run_polling())  # Запуск Telegram-бота
+    await asyncio.gather(task1, task2)  # Запуск в параллель
 
 if __name__ == "__main__":
     print("🚀 Бот запущен, задачи по расписанию...")
-    
-    loop = asyncio.get_event_loop()
-
-    # Запускаем бота и планировщик как отдельные задачи
-    loop.create_task(run_all())
-    
-    try:
-        loop.run_forever()
-    except KeyboardInterrupt:
-        print("🛑 Бот остановлен пользователем")
+    asyncio.run(main())  # `asyncio.run()` корректно запускает event loop
