@@ -6,7 +6,7 @@ from facebook_business.api import FacebookAdsApi
 from telegram import Bot, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-ACCESS_TOKEN = "EAASZCrBwhoH0BO6mUkgfM9oeDIas5gzGVKvJCl2QSFkMzMJyYK9mesXEHhFR1yPQ68A4UL54PUr5aD8iWHQSBd31CSIZCBCU5hslguZCUnhmBbbXdZCM6mLRXZAMwydyxvAQK2A72K1fvL96Mf0TEzYkjfl2z0LOysnQW8Mo6650eoUZCsQej6xvjc0ZBqZBUUR4VwZDZD"
+ACCESS_TOKEN = "EAASZCrBwhoH0BO6mUkgfZvAQK2A72K1fvL96Mf0TEzYkjfl2z0LOysnQW8Mo6650eoUZCsQej6xvjc0ZBqZBUUR4VwZDZD"
 APP_ID = "1336645834088573"
 APP_SECRET = "01bf23c5f726c59da318daa82dd0e9dc"
 FacebookAdsApi.init(APP_ID, APP_SECRET, ACCESS_TOKEN, api_version='v22.0')
@@ -52,24 +52,24 @@ def get_facebook_data(account_id, date_preset):
     except Exception:
         account_name = "Неизвестный аккаунт"
 
-    status_emoji = is_account_active(account_id).replace("✅", "🟢")
+    status_emoji = is_account_active(account_id)
     today = datetime.now().strftime("%Y-%m-%d")
-    report = f"{today} {status_emoji} {clean_text(account_name)}\n"
+    report = f"📅 {today}\n{status_emoji} {clean_text(account_name)}\n"
 
     if not campaigns:
         report += "\n⚠ Данных за выбранный период нет"
     else:
         campaign = campaigns[0]
-        report += f"\nПоказы: {clean_text(campaign.get('impressions', '—'))}"
-        report += f"\nКлики: {clean_text(campaign.get('clicks', '—'))}"
+        report += f"\n👁️ Показы: {clean_text(campaign.get('impressions', '—'))}"
+        report += f"\n🖱️ Клики: {clean_text(campaign.get('clicks', '—'))}"
 
         if 'cost_per_action_type' in campaign:
             for cost in campaign['cost_per_action_type']:
                 if cost.get('action_type') == "link_click":
-                    report += f"\nСтоимость клика: {clean_text(str(round(float(cost['value']), 2)))} $"
+                    report += f"\n💰 Стоимость клика: {clean_text(str(round(float(cost['value']), 2)))} $"
 
         spend = campaign.get('spend', 0)
-        report += f"\nСумма затрат: {clean_text(str(round(float(spend), 2)))} $"
+        report += f"\n💵 Сумма затрат: {clean_text(str(round(float(spend), 2)))} $"
 
     return report
 
