@@ -79,16 +79,17 @@ def get_facebook_data(account_id, date_preset):
     return report
 
 async def send_to_telegram(message):
+    message = clean_text(message)  # Автоматическое экранирование
     try:
         await bot.send_message(chat_id=CHAT_ID, text=message, parse_mode="MarkdownV2")
     except Exception as e:
         print(f"❌ Ошибка отправки в Telegram: {e}")
 
 async def send_billing_alert(account_name, billing_amount):
-    message = f"🚨 Ёбушки-воробушки, у нас биллинг!\n📢 Рекламный аккаунт: *{account_name}*\n💰 Сумма биллинга: *{billing_amount} KZT*"
+    message = f"🚨 Ёбушки-воробушки, у нас биллинг\!\n📢 Рекламный аккаунт: *{clean_text(account_name)}*\n💰 Сумма биллинга: *{billing_amount} KZT*"
     print(f"📢 Уведомление о биллинге: {message}")
     try:
-        await bot.send_message(chat_id=CHAT_ID, text=message, parse_mode="Markdown")
+        await bot.send_message(chat_id=CHAT_ID, text=message, parse_mode="MarkdownV2")
         print("✅ Уведомление отправлено!")
     except Exception as e:
         print(f"❌ Ошибка отправки в Телеграм: {e}")
@@ -106,25 +107,13 @@ async def main():
     print("📡 Bot started polling")
     await app.run_polling()
 
-async def scheduler_loop():
-    while True:
-        schedule.run_pending()
-        await asyncio.sleep(5)  # Проверка задач каждые 5 секунд
-
-# **Используем `asyncio.create_task()` для уведомлений**
-schedule.every().day.at("04:30").do(lambda: asyncio.create_task(send_billing_alert("Тестовый аккаунт", 5000)))
+schedule.every().day.at("04:30").do(lambda: asyncio.run(send_billing_alert("Тестовый аккаунт", 5000)))
 
 if __name__ == "__main__":
     print("🚀 Бот запущен, задачи по расписанию...")
-    
-    loop = asyncio.get_event_loop()
-    
-    tasks = [
-        loop.create_task(main()),  # Запуск бота
-        loop.create_task(scheduler_loop())  # Запуск планировщика
-    ]
-
-    try:
-        loop.run_until_complete(asyncio.gather(*tasks))  # Запускаем всё вместе
-    except KeyboardInterrupt:
-        print("⏹ Бот остановлен вручную")
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.create_task(main())
+    while True:
+        schedule.run_pending()
+        time.sleep(60)
