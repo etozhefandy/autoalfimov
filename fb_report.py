@@ -106,13 +106,24 @@ async def main():
     print("📡 Bot started polling")
     await app.run_polling()
 
-schedule.every().day.at("04:30").do(lambda: asyncio.run(send_billing_alert("Тестовый аккаунт", 5000)))
+async def scheduler_loop():
+    while True:
+        schedule.run_pending()
+        await asyncio.sleep(5)  # Проверка задач каждые 5 секунд
+
+# **Используем `asyncio.create_task()` для уведомлений**
+schedule.every().day.at("04:30").do(lambda: asyncio.create_task(send_billing_alert("Тестовый аккаунт", 5000)))
 
 if __name__ == "__main__":
     print("🚀 Бот запущен, задачи по расписанию...")
+    
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    loop.create_task(main())
-    while True:
-        schedule.run_pending()
-        time.sleep(60)
+    
+    loop.create_task(main())  # Запуск бота
+    loop.create_task(scheduler_loop())  # Запуск планировщика
+    
+    try:
+        loop.run_forever()  # Вместо блокирующего while True
+    except KeyboardInterrupt:
+        print("⏹ Бот остановлен вручную")
