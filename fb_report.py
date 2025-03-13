@@ -9,7 +9,7 @@ from facebook_business.api import FacebookAdsApi
 from telegram import Bot, Update
 from telegram.ext import Application, CommandHandler, CallbackContext
 
-ACCESS_TOKEN = "EAASZCrBwhoH0BO6hvTPZBtAX3OFPcJjZARZBZCIllnjc4GkxagyhvvrylPKWdU9jMijZA051BJRRvVuV1nab4k5jtVO5q0TsDIKbXzphumaFIbqKDcJ3JMvQTmORdrNezQPZBP14pq4NKB56wpIiNJSLFa5yXFsDttiZBgUHAmVAJknN7Ig1ZBVU2q0vRyQKJtyuXXwZDZD"
+ACCESS_TOKEN = "EAASZCrBwhoH0BO6hvTPZBtAX3OFPcJjZARZBZCIllnjc4GkxagyhvvrylPKWdU9jMijZA051BJRRvVuV1nab4k5jtVO5q0TsDIKbXzphumaFIbqKDcJ3JMvQTmORdrNezQPZBP14pq4NKB56wpIiNJSLFa5yXFsDttiZBgUHAmVAJknN7Ig1ZBVU2q0vRyQKtyuXXwZDZD"
 APP_ID = "1336645834088573"
 APP_SECRET = "01bf23c5f726c59da318daa82dd0e9dc"
 FacebookAdsApi.init(APP_ID, APP_SECRET, ACCESS_TOKEN)
@@ -28,9 +28,7 @@ ALLOWED_ACTIONS = {"link_click"}
 bot = Bot(token=TELEGRAM_TOKEN)
 
 def clean_text(text):
-    if not isinstance(text, str):
-        return str(text)
-    return re.sub(r'([_*[\]()~`>#+\-=|{}.!])', r'\\\1', text)
+    return re.sub(r'[-!*_]', '', text)  # Убираем спецсимволы
 
 def generate_appsecret_proof():
     return hmac.new(APP_SECRET.encode(), ACCESS_TOKEN.encode(), hashlib.sha256).hexdigest()
@@ -80,15 +78,15 @@ def get_facebook_data(account_id, date_preset):
 
 async def send_to_telegram(message):
     try:
-        await bot.send_message(chat_id=CHAT_ID, text=clean_text(message), parse_mode="MarkdownV2")
+        await bot.send_message(chat_id=CHAT_ID, text=clean_text(message))
     except Exception as e:
         print(f"❌ Ошибка отправки в Telegram: {e}")
 
 async def send_billing_alert(account_name, billing_amount):
-    message = f"🚨 Ёбушки-воробушки, у нас биллинг!\n📢 Рекламный аккаунт: *{clean_text(account_name)}*\n💰 Сумма биллинга: *{billing_amount} KZT*"
+    message = f"🚨 Ёбушки-воробушки, у нас биллинг\n📢 Рекламный аккаунт: {clean_text(account_name)}\n💰 Сумма биллинга: {billing_amount} KZT"
     print(f"📢 Уведомление о биллинге: {message}")
     try:
-        await bot.send_message(chat_id=CHAT_ID, text=message, parse_mode="MarkdownV2")
+        await bot.send_message(chat_id=CHAT_ID, text=message)
         print("✅ Уведомление отправлено!")
     except Exception as e:
         print(f"❌ Ошибка отправки в Телеграм: {e}")
@@ -106,8 +104,12 @@ async def main():
     print("📡 Bot started polling")
     await app.run_polling()
 
-schedule.every().day.at("04:30").do(lambda: asyncio.run(send_billing_alert("Тестовый аккаунт", 5000)))
+schedule.every().day.at("04:30").do(lambda: asyncio.create_task(send_billing_alert("Тестовый аккаунт", 5000)))
 
 if __name__ == "__main__":
     print("🚀 Бот запущен, задачи по расписанию...")
-    asyncio.run(main())
+    loop = asyncio.get_event_loop()
+    loop.create_task(main())
+    while True:
+        schedule.run_pending()
+        time.sleep(60)
