@@ -41,14 +41,14 @@ def is_account_active(account_id):
 def get_facebook_data(account_id, date_preset):
     account = AdAccount(account_id)
     fields = ['impressions', 'cpm', 'clicks', 'cpc', 'actions', 'cost_per_action_type', 'spend']
-    params = {
-        'date_preset': date_preset,
-        'level': 'account',
-        'appsecret_proof': generate_appsecret_proof()
-    }
 
     try:
-        campaigns = account.get_insights(fields=fields, params=params)
+        campaigns = account.get_insights(params={
+            'fields': ','.join(fields),
+            'date_preset': date_preset,
+            'level': 'account',
+            'appsecret_proof': generate_appsecret_proof()
+        })
     except Exception as e:
         return f"⚠ Ошибка загрузки данных для {account_id}: {clean_text(str(e))}"
 
