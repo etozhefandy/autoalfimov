@@ -1,9 +1,10 @@
 import asyncio
 import re
+import os
 from datetime import datetime
 from facebook_business.adobjects.adaccount import AdAccount
 from facebook_business.api import FacebookAdsApi
-from telegram import Bot, Update
+from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 ACCESS_TOKEN = "EAASZCrBwhoH0BO6mUkgfM9oeDIas5gzGVKvJCl2QSFkMzMJyYK9mesXEHhFR1yPQ68A4UL54PUr5aD8iWHQSBd31CSIZCBCU5hslguZCUnhmBbbXdZCM6mLRXZAMwydyxvAQK2A72K1fvL96Mf0TEzYkjfl2z0LOysnQW8Mo6650eoUZCsQej6xvjc0ZBqZBUUR4VwZDZD"
@@ -21,6 +22,9 @@ AD_ACCOUNTS = [
 TELEGRAM_TOKEN = "8033028841:AAGud3hSZdR8KQiOSaAcwfbkv8P0p-P3Dt4"
 CHAT_ID = "253181449"
 ALLOWED_ACTIONS = {"link_click"}
+
+reply_keyboard = [['Сегодня', 'Вчера', 'Неделя']]
+markup = ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=False, resize_keyboard=True)
 
 def clean_text(text):
     if not isinstance(text, str):
@@ -53,8 +57,8 @@ def get_facebook_data(account_id, date_preset):
         account_name = "Неизвестный аккаунт"
 
     status_emoji = is_account_active(account_id)
-    today = datetime.now().strftime("%Y-%m-%d")
-    report = f"📅 {today}\n{status_emoji} {clean_text(account_name)}\n"
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    report = f"{status_emoji} {clean_text(account_name)}\n📅 {date_str}\n"
 
     if not campaigns:
         report += "\n⚠ Данных за выбранный период нет"
@@ -82,13 +86,27 @@ async def today_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         report = get_facebook_data(account_id, 'today')
         await send_to_telegram_message(context, update.effective_chat.id, report)
 
+async def yesterday_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Собираю данные за вчера...")
+    for account_id in AD_ACCOUNTS:
+        report = get_facebook_data(account_id, 'yesterday')
+        await send_to_telegram_message(context, update.effective_chat.id, report)
+
+async def week_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Собираю данные за неделю...")
+    for account_id in AD_ACCOUNTS:
+        report = get_facebook_data(account_id, 'last_7d')
+        await send_to_telegram_message(context, update.effective_chat.id, report)
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 Бот активен! Используй команду /today")
+    await update.message.reply_text("🤖 Бот активен! Используй кнопки для получения отчета:", reply_markup=markup)
 
 app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-app.add_handler(CommandHandler("today", today_report))
 app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("Сегодня", today_report))
+app.add_handler(CommandHandler("Вчера", yesterday_report))
+app.add_handler(CommandHandler("Неделя", week_report))
 
 if __name__ == "__main__":
     print("🚀 Бот запущен и ожидает команд.")
