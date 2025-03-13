@@ -30,7 +30,7 @@ bot = Bot(token=TELEGRAM_TOKEN)
 def clean_text(text):
     if not isinstance(text, str):
         return str(text)
-    return re.sub(r'([_*\\[\\]()~`>#+\-=|{}.!])', r'\\\1', text)
+    return re.sub(r'([_*[\]()~`>#+\-=|{}.!])', r'\\\1', text)
 
 def generate_appsecret_proof():
     return hmac.new(APP_SECRET.encode(), ACCESS_TOKEN.encode(), hashlib.sha256).hexdigest()
@@ -79,14 +79,13 @@ def get_facebook_data(account_id, date_preset):
     return report
 
 async def send_to_telegram(message):
-    message = clean_text(message)  # Автоматическое экранирование
     try:
-        await bot.send_message(chat_id=CHAT_ID, text=message, parse_mode="MarkdownV2")
+        await bot.send_message(chat_id=CHAT_ID, text=clean_text(message), parse_mode="MarkdownV2")
     except Exception as e:
         print(f"❌ Ошибка отправки в Telegram: {e}")
 
 async def send_billing_alert(account_name, billing_amount):
-    message = f"🚨 Ёбушки-воробушки, у нас биллинг\!\n📢 Рекламный аккаунт: *{clean_text(account_name)}*\n💰 Сумма биллинга: *{billing_amount} KZT*"
+    message = f"🚨 Ёбушки-воробушки, у нас биллинг!\n📢 Рекламный аккаунт: *{clean_text(account_name)}*\n💰 Сумма биллинга: *{billing_amount} KZT*"
     print(f"📢 Уведомление о биллинге: {message}")
     try:
         await bot.send_message(chat_id=CHAT_ID, text=message, parse_mode="MarkdownV2")
@@ -111,9 +110,4 @@ schedule.every().day.at("04:30").do(lambda: asyncio.run(send_billing_alert("Те
 
 if __name__ == "__main__":
     print("🚀 Бот запущен, задачи по расписанию...")
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.create_task(main())
-    while True:
-        schedule.run_pending()
-        time.sleep(60)
+    asyncio.run(main())
