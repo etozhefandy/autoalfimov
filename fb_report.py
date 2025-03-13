@@ -9,11 +9,13 @@ from facebook_business.api import FacebookAdsApi
 from telegram import Bot, Update
 from telegram.ext import Application, CommandHandler, CallbackContext
 
-ACCESS_TOKEN = "EAASZCrBwhoH0BO6hvTPZBtAX3OFPcJjZARZBZCIllnjc4GkxagyhvvrylPKWdU9jMijZA051BJRRvVuV1nab4k5jtVO5q0TsDIKbXzphumaFIbqKDcJ3JMvQTmORdrNezQPZBP14pq4NKB56wpIiNJSLFa5yXFsDttiZBgUHAmVAJknN7Ig1ZBVU2q0vRyQKtyuXXwZDZD"
+# ===== Настройки Facebook =====
+ACCESS_TOKEN = "EAASZCrBwhoH0BO6hvTPZBtAX3OFPcJjZARZBZCIllnjc4GkxagyhvvrylPKWdU9jMijZA051BJRRvVuV1nab4k5jtVO5q0TsDIKbXzphumaFIbqKDcJ3JMvQTmORdrNezQPZBP14pq4NKB56wpIiNJSLFa5yXFsDttiZBgUHAmVAJknN7Ig1ZBVU2q0vRyQKJtyuXXwZDZD"
 APP_ID = "1336645834088573"
 APP_SECRET = "01bf23c5f726c59da318daa82dd0e9dc"
 FacebookAdsApi.init(APP_ID, APP_SECRET, ACCESS_TOKEN)
 
+# ===== Список рекламных аккаунтов =====
 AD_ACCOUNTS = [
     "act_1206987573792913", "act_1415004142524014", "act_1333550570916716",
     "act_798205335840576", "act_844229314275496", "act_1108417930211002",
@@ -21,6 +23,7 @@ AD_ACCOUNTS = [
     "act_1042955424178074"
 ]
 
+# ===== Настройки Telegram =====
 TELEGRAM_TOKEN = "8033028841:AAGud3hSZdR8KQiOSaAcwfbkv8P0p-P3Dt4"
 CHAT_ID = "253181449"
 ALLOWED_ACTIONS = {"link_click"}
@@ -102,7 +105,7 @@ app.add_handler(CommandHandler("today_report", today_report))
 
 async def main():
     print("📡 Bot started polling")
-    await app.run_polling()  # Оставляем здесь, так как он сам блокирует поток
+    await app.run_polling()  # Telegram-бот запускается в фоне
 
 async def schedule_loop():
     while True:
@@ -117,8 +120,12 @@ async def run_all():
 if __name__ == "__main__":
     print("🚀 Бот запущен, задачи по расписанию...")
     
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+    loop = asyncio.get_event_loop()
 
-    loop.create_task(run_all())  # Запускаем бота и планировщик
-    loop.run_forever()  # Запускаем главный цикл
+    # Запускаем бота и планировщик как отдельные задачи
+    loop.create_task(run_all())
+    
+    try:
+        loop.run_forever()
+    except KeyboardInterrupt:
+        print("🛑 Бот остановлен пользователем")
