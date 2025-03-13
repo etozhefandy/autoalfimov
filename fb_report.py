@@ -6,7 +6,7 @@ from facebook_business.api import FacebookAdsApi
 from telegram import Bot, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-ACCESS_TOKEN = "EAASZCrBwhoH0BO6mUkgfZvAQK2A72K1fvL96Mf0TEzYkjfl2z0LOysnQW8Mo6650eoUZCsQej6xvjc0ZBqZBUUR4VwZDZD"
+ACCESS_TOKEN = "EAASZCrBwhoH0BO6mUkgfM9oeDIas5gzGVKvJCl2QSFkMzMJyYK9mesXEHhFR1yPQ68A4UL54PUr5aD8iWHQSBd31CSIZCBCU5hslguZCUnhmBbbXdZCM6mLRXZAMwydyxvAQK2A72K1fvL96Mf0TEzYkjfl2z0LOysnQW8Mo6650eoUZCsQej6xvjc0ZBqZBUUR4VwZDZD"
 APP_ID = "1336645834088573"
 APP_SECRET = "01bf23c5f726c59da318daa82dd0e9dc"
 FacebookAdsApi.init(APP_ID, APP_SECRET, ACCESS_TOKEN, api_version='v22.0')
