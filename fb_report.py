@@ -117,13 +117,14 @@ schedule.every().day.at("04:30").do(lambda: asyncio.create_task(send_billing_ale
 if __name__ == "__main__":
     print("🚀 Бот запущен, задачи по расписанию...")
     
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+    loop = asyncio.get_event_loop()
     
-    loop.create_task(main())  # Запуск бота
-    loop.create_task(scheduler_loop())  # Запуск планировщика
-    
+    tasks = [
+        loop.create_task(main()),  # Запуск бота
+        loop.create_task(scheduler_loop())  # Запуск планировщика
+    ]
+
     try:
-        loop.run_forever()  # Вместо блокирующего while True
+        loop.run_until_complete(asyncio.gather(*tasks))  # Запускаем всё вместе
     except KeyboardInterrupt:
         print("⏹ Бот остановлен вручную")
