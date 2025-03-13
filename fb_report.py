@@ -6,16 +6,13 @@ import schedule
 import time
 from facebook_business.adobjects.adaccount import AdAccount
 from facebook_business.api import FacebookAdsApi
-from telegram import Bot, Update
-from telegram.ext import Application, CommandHandler, CallbackContext
+from telegram import Bot
 
-# ===== Настройки Facebook =====
 ACCESS_TOKEN = "EAASZCrBwhoH0BO6hvTPZBtAX3OFPcJjZARZBZCIllnjc4GkxagyhvvrylPKWdU9jMijZA051BJRRvVuV1nab4k5jtVO5q0TsDIKbXzphumaFIbqKDcJ3JMvQTmORdrNezQPZBP14pq4NKB56wpIiNJSLFa5yXFsDttiZBgUHAmVAJknN7Ig1ZBVU2q0vRyQKJtyuXXwZDZD"
 APP_ID = "1336645834088573"
 APP_SECRET = "01bf23c5f726c59da318daa82dd0e9dc"
 FacebookAdsApi.init(APP_ID, APP_SECRET, ACCESS_TOKEN)
 
-# ===== Список рекламных аккаунтов =====
 AD_ACCOUNTS = [
     "act_1206987573792913", "act_1415004142524014", "act_1333550570916716",
     "act_798205335840576", "act_844229314275496", "act_1108417930211002",
@@ -23,7 +20,6 @@ AD_ACCOUNTS = [
     "act_1042955424178074"
 ]
 
-# ===== Настройки Telegram =====
 TELEGRAM_TOKEN = "8033028841:AAGud3hSZdR8KQiOSaAcwfbkv8P0p-P3Dt4"
 CHAT_ID = "253181449"
 ALLOWED_ACTIONS = {"link_click"}
@@ -31,7 +27,9 @@ ALLOWED_ACTIONS = {"link_click"}
 bot = Bot(token=TELEGRAM_TOKEN)
 
 def clean_text(text):
-    return re.sub(r'[-!*_]', '', text)  # Убираем символы, мешающие Telegram
+    if not isinstance(text, str):
+        return str(text)
+    return re.sub(r'([_*\[\]()~`>#+\-=|{}.!])', r'\\\1', text)
 
 def generate_appsecret_proof():
     return hmac.new(APP_SECRET.encode(), ACCESS_TOKEN.encode(), hashlib.sha256).hexdigest()
@@ -81,39 +79,24 @@ def get_facebook_data(account_id, date_preset):
 
 async def send_to_telegram(message):
     try:
-        await bot.send_message(chat_id=CHAT_ID, text=clean_text(message))
+        await bot.send_message(chat_id=CHAT_ID, text=message, parse_mode="MarkdownV2")
     except Exception as e:
         print(f"❌ Ошибка отправки в Telegram: {e}")
 
 async def send_billing_alert(account_name, billing_amount):
     message = f"🚨 Ёбушки-воробушки, у нас биллинг\n📢 Рекламный аккаунт: {clean_text(account_name)}\n💰 Сумма биллинга: {billing_amount} KZT"
     print(f"📢 Уведомление о биллинге: {message}")
-    try:
-        await bot.send_message(chat_id=CHAT_ID, text=message)
-        print("✅ Уведомление отправлено!")
-    except Exception as e:
-        print(f"❌ Ошибка отправки в Телеграм: {e}")
+    await send_to_telegram(message)
 
-app = Application.builder().token(TELEGRAM_TOKEN).build()
-
-async def today_report(update: Update, context: CallbackContext):
-    await update.message.reply_text("Собираю данные за сегодня...")
-    for account_id in AD_ACCOUNTS:
-        await send_to_telegram(get_facebook_data(account_id, "today"))
-
-app.add_handler(CommandHandler("today_report", today_report))
-
-async def schedule_loop():
+async def run_tasks():
     while True:
         schedule.run_pending()
-        await asyncio.sleep(60)  # Вместо блокирующего sleep
+        await asyncio.sleep(60)
 
 async def main():
-    """ Основная функция: запускаем планировщик и бота """
-    task1 = asyncio.create_task(schedule_loop())  # Запуск планировщика
-    task2 = asyncio.create_task(app.run_polling())  # Запуск Telegram-бота
-    await asyncio.gather(task1, task2)  # Запуск в параллель
+    print("🚀 Бот запущен, задачи по расписанию...")
+    schedule.every().day.at("04:30").do(lambda: asyncio.create_task(send_billing_alert("Тестовый аккаунт", 5000)))
+    await run_tasks()
 
 if __name__ == "__main__":
-    print("🚀 Бот запущен, задачи по расписанию...")
-    asyncio.run(main())  # `asyncio.run()` корректно запускает event loop
+    asyncio.run(main())
