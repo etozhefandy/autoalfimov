@@ -1,13 +1,11 @@
 import asyncio
 import re
-import hashlib
-import hmac
 from facebook_business.adobjects.adaccount import AdAccount
 from facebook_business.api import FacebookAdsApi
 from telegram import Bot, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-ACCESS_TOKEN = "EAASZCrBwhoH0BO6hvTPZBtAX3OFPcJjZARZBZCIllnjc4GkxagyhvvrylPKWdU9jMijZA051BJRRvVuV1nab4k5jtVO5q0TsDIKbXzphumaFIbqKDcJ3JMvQTmORdrNezQPZBP14pq4NKB56wpIiNJSLFa5yXFsDttiZBgUHAmVAJknN7Ig1ZBVU2q0vRyQKtyuXXwZDZD"
+ACCESS_TOKEN = "EAASZCrBwhoH0BO6mUkgfM9oeDIas5gzGVKvJCl2QSFkMzMJyYK9mesXEHhFR1yPQ68A4UL54PUr5aD8iWHQSBd31CSIZCBCU5hslguZCUnhmBbbXdZCM6mLRXZAMwydyxvAQK2A72K1fvL96Mf0TEzYkjfl2z0LOysnQW8Mo6650eoUZCsQej6xvjc0ZBqZBUUR4VwZDZD"
 APP_ID = "1336645834088573"
 APP_SECRET = "01bf23c5f726c59da318daa82dd0e9dc"
 FacebookAdsApi.init(APP_ID, APP_SECRET, ACCESS_TOKEN, api_version='v22.0')
@@ -28,9 +26,6 @@ def clean_text(text):
         text = str(text)
     return re.sub(r'([*\[\]()~`>#+|{}!])', '', text)
 
-def generate_appsecret_proof():
-    return hmac.new(APP_SECRET.encode(), ACCESS_TOKEN.encode(), hashlib.sha256).hexdigest()
-
 def is_account_active(account_id):
     try:
         account_data = AdAccount(account_id).api_get(fields=['account_status'])
@@ -41,14 +36,14 @@ def is_account_active(account_id):
 def get_facebook_data(account_id, date_preset):
     account = AdAccount(account_id)
     fields = ['impressions', 'cpm', 'clicks', 'cpc', 'actions', 'cost_per_action_type', 'spend']
+    params = {
+        'fields': ','.join(fields),
+        'date_preset': date_preset,
+        'level': 'account'
+    }
 
     try:
-        campaigns = account.get_insights(params={
-            'fields': ','.join(fields),
-            'date_preset': date_preset,
-            'level': 'account',
-            'appsecret_proof': generate_appsecret_proof()
-        })
+        campaigns = account.get_insights(params=params)
     except Exception as e:
         return f"⚠ Ошибка загрузки данных для {account_id}: {clean_text(str(e))}"
 
