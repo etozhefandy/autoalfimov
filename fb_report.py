@@ -28,7 +28,7 @@ ALLOWED_ACTIONS = {"link_click"}
 bot = Bot(token=TELEGRAM_TOKEN)
 
 def clean_text(text):
-    return re.sub(r'[-!*_]', '', text)  # Убираем спецсимволы
+    return re.sub(r'[-!*_]', '', text)  # Убираем спецсимволы, мешающие Markdown
 
 def generate_appsecret_proof():
     return hmac.new(APP_SECRET.encode(), ACCESS_TOKEN.encode(), hashlib.sha256).hexdigest()
@@ -109,10 +109,13 @@ async def schedule_loop():
         schedule.run_pending()
         await asyncio.sleep(60)  # Вместо блокирующего sleep
 
+async def run_all():
+    """ Основная функция запуска бота и расписания """
+    task1 = asyncio.create_task(main())  # Запуск бота
+    task2 = asyncio.create_task(schedule_loop())  # Запуск планировщика
+    await asyncio.gather(task1, task2)  # Запуск в параллель
+
 if __name__ == "__main__":
     print("🚀 Бот запущен, задачи по расписанию...")
 
-    loop = asyncio.get_event_loop()
-    loop.create_task(main())  # Запускаем бота
-    loop.create_task(schedule_loop())  # Запускаем планировщик
-    loop.run_forever()  # Оставляем выполнение в фоне
+    asyncio.run(run_all())  # Запускаем всё в одной `asyncio` среде
