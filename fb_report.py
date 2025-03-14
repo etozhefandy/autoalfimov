@@ -122,10 +122,16 @@ async def main():
     scheduler = AsyncIOScheduler(timezone="Asia/Aqtobe")
     scheduler.add_job(auto_report, 'cron', hour=9, minute=30, args=[app])
     
-    async with app:
-        scheduler.start()
-        print("🚀 Бот запущен и ожидает команд.")
-        await app.run_polling()
+    loop = asyncio.get_running_loop()
+    loop.create_task(app.run_polling())
+
+    scheduler.start()
+    print("🚀 Бот запущен и ожидает команд.")
+    await asyncio.Event().wait()  # Держим процесс активным
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except RuntimeError:
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(main())
