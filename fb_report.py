@@ -1,10 +1,9 @@
-import asyncio
 import re
 from datetime import datetime, timedelta
 from facebook_business.adobjects.adaccount import AdAccount
 from facebook_business.api import FacebookAdsApi
 from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 ACCESS_TOKEN = "EAASZCrBwhoH0BO6mUkgfM9oeDIas5gzGVKvJCl2QSFkMzMJyYK9mesXEHhFR1yPQ68A4UL54PUr5aD8iWHQSBd31CSIZCBCU5hslguZCUnhmBbbXdZCM6mLRXZAMwydyxvAQK2A72K1fvL96Mf0TEzYkjfl2z0LOysnQW8Mo6650eoUZCsQej6xvjc0ZBqZBUUR4VwZDZD"
@@ -21,7 +20,6 @@ AD_ACCOUNTS = [
 
 TELEGRAM_TOKEN = "8033028841:AAGud3hSZdR8KQiOSaAcwfbkv8P0p-P3Dt4"
 CHAT_ID = "253181449"
-ALLOWED_ACTIONS = {"link_click"}
 
 reply_keyboard = [['Сегодня', 'Вчера', 'Неделя']]
 markup = ReplyKeyboardMarkup(reply_keyboard, resize_keyboard=True)
@@ -61,6 +59,8 @@ def get_facebook_data(account_id, date_preset):
     if date_preset == 'last_7d':
         start_period = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
         period_text = f"{start_period} — {today}"
+    else:
+        period_text = today
 
     report = f"{status_emoji} {clean_text(account_name)} ({period_text})\n"
 
@@ -84,10 +84,10 @@ def get_facebook_data(account_id, date_preset):
 async def send_to_telegram_message(bot, chat_id, message):
     await bot.send_message(chat_id=chat_id, text=message)
 
-async def auto_report(bot):
+async def auto_report(context: ContextTypes.DEFAULT_TYPE):
     for account_id in AD_ACCOUNTS:
         report = get_facebook_data(account_id, 'today')
-        await send_to_telegram_message(bot, CHAT_ID, report)
+        await send_to_telegram_message(context.bot, CHAT_ID, report)
 
 async def today_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Собираю данные за сегодня...")
@@ -102,13 +102,12 @@ async def yesterday_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_to_telegram_message(context.bot, update.effective_chat.id, report)
 
 async def week_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Собираю данные за неделю...")
+    today = datetime.now().strftime("%Y-%m-%d")
+    start_period = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+    await update.message.reply_text(f"Собираю данные за неделю ({start_period} — {today})...")
     for account_id in AD_ACCOUNTS:
         report = get_facebook_data(account_id, 'last_7d')
         await send_to_telegram_message(context.bot, update.effective_chat.id, report)
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 Бот активен! Используй кнопки:", reply_markup=markup)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.text == 'Сегодня':
@@ -118,18 +117,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif update.message.text == 'Неделя':
         await week_report(update, context)
 
-async def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🤖 Бот активен! Используй кнопки:", reply_markup=markup
+    )
+
+if __name__ == "__main__":
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
+    scheduler = AsyncIOScheduler(timezone="Asia/Aqtobe")
+    scheduler.add_job(lambda: asyncio.create_task(auto_report(app)), 'cron', hour=9, minute=30)
+    scheduler.start()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
 
-    scheduler = AsyncIOScheduler(timezone="Asia/Aqtobe")
-    scheduler.add_job(lambda: asyncio.create_task(auto_report(app.bot)), 'cron', hour=9, minute=30)
-    scheduler.start()
-
     print("🚀 Бот запущен и ожидает команд.")
-    await app.run_polling()
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    app.run_polling()
