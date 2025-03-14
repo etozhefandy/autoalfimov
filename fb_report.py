@@ -1,10 +1,12 @@
 import asyncio
 import re
-from datetime import datetime
+import os
+from datetime import datetime, time as dtime
 from facebook_business.adobjects.adaccount import AdAccount
 from facebook_business.api import FacebookAdsApi
-from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram import Bot, Update, ReplyKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 ACCESS_TOKEN = "EAASZCrBwhoH0BO6mUkgfM9oeDIas5gzGVKvJCl2QSFkMzMJyYK9mesXEHhFR1yPQ68A4UL54PUr5aD8iWHQSBd31CSIZCBCU5hslguZCUnhmBbbXdZCM6mLRXZAMwydyxvAQK2A72K1fvL96Mf0TEzYkjfl2z0LOysnQW8Mo6650eoUZCsQej6xvjc0ZBqZBUUR4VwZDZD"
 APP_ID = "1336645834088573"
@@ -54,7 +56,7 @@ def get_facebook_data(account_id, date_preset):
 
     status_emoji = is_account_active(account_id)
     date_str = datetime.now().strftime("%Y-%m-%d")
-    report = f"{status_emoji} {clean_text(account_name)}\n📅 {date_str}\n"
+    report = f"{status_emoji} {clean_text(account_name)} ({date_str})\n"
 
     if not campaigns:
         report += "\n⚠ Данных за выбранный период нет"
@@ -76,11 +78,22 @@ def get_facebook_data(account_id, date_preset):
 async def send_to_telegram_message(context: ContextTypes.DEFAULT_TYPE, chat_id, message):
     await context.bot.send_message(chat_id=chat_id, text=message)
 
+async def daily_auto_report(context: ContextTypes.DEFAULT_TYPE):
+    for account_id in AD_ACCOUNTS:
+        report = get_facebook_data(account_id, 'today')
+        await send_to_telegram_message(context, CHAT_ID, report)
+
 async def today_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Собираю данные за сегодня...")
     for account_id in AD_ACCOUNTS:
         report = get_facebook_data(account_id, 'today')
         await send_to_telegram_message(context, update.effective_chat.id, report)
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🤖 Бот активен! Используй кнопки для получения отчета:",
+        reply_markup=markup
+    )
 
 async def yesterday_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Собираю данные за вчера...")
@@ -94,9 +107,6 @@ async def week_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         report = get_facebook_data(account_id, 'last_7d')
         await send_to_telegram_message(context, update.effective_chat.id, report)
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 Бот активен! Используй кнопки для получения отчета:", reply_markup=markup)
-
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     if text == 'Сегодня':
@@ -107,9 +117,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await week_report(update, context)
 
 app = Application.builder().token(TELEGRAM_TOKEN).build()
+scheduler = AsyncIOScheduler(timezone="Asia/Aqtobe")
+scheduler.add_job(daily_report, 'cron', hour=9, minute=30)
+scheduler.start()
+
 app.add_handler(CommandHandler("start", start))
 app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
 
 if __name__ == "__main__":
     print("🚀 Бот запущен и ожидает команд.")
+    scheduler.start()
     app.run_polling()
