@@ -3,8 +3,8 @@ import re
 from datetime import datetime, timedelta
 from facebook_business.adobjects.adaccount import AdAccount
 from facebook_business.api import FacebookAdsApi
-from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 ACCESS_TOKEN = "EAASZCrBwhoH0BO6mUkgfM9oeDIas5gzGVKvJCl2QSFkMzMJyYK9mesXEHhFR1yPQ68A4UL54PUr5aD8iWHQSBd31CSIZCBCU5hslguZCUnhmBbbXdZCM6mLRXZAMwydyxvAQK2A72K1fvL96Mf0TEzYkjfl2z0LOysnQW8Mo6650eoUZCsQej6xvjc0ZBqZBUUR4VwZDZD"
@@ -22,20 +22,10 @@ AD_ACCOUNTS = [
 TELEGRAM_TOKEN = "8033028841:AAGud3hSZdR8KQiOSaAcwfbkv8P0p-P3Dt4"
 CHAT_ID = "253181449"
 
-reply_keyboard = [['Сегодня', 'Вчера', 'Неделя']]
-markup = ReplyKeyboardMarkup(reply_keyboard, resize_keyboard=True)
-
 def clean_text(text):
     if not isinstance(text, str):
         text = str(text)
     return re.sub(r'([*\[\]()~`>#+|{}!])', '', text)
-
-def is_account_active(account_id):
-    try:
-        account_data = AdAccount(account_id).api_get(fields=['account_status'])
-        return "🟢" if account_data['account_status'] == 1 else "🔴"
-    except Exception:
-        return "🔴"
 
 def get_facebook_data(account_id, date_preset):
     account = AdAccount(account_id)
@@ -52,8 +42,6 @@ def get_facebook_data(account_id, date_preset):
     except Exception:
         account_name = "Неизвестный аккаунт"
 
-    status_emoji = is_account_active(account_id)
-
     today = datetime.now().strftime("%Y-%m-%d")
     period_text = today
 
@@ -61,7 +49,7 @@ def get_facebook_data(account_id, date_preset):
         start_period = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
         period_text = f"{start_period} — {today}"
 
-    report = f"{status_emoji} {clean_text(account_name)} ({period_text})\n"
+    report = f"📊 {clean_text(account_name)} ({period_text})\n"
 
     if not campaigns:
         report += "\n⚠ Данных за выбранный период нет"
@@ -89,43 +77,42 @@ async def auto_report(context: ContextTypes.DEFAULT_TYPE):
         await send_to_telegram_message(context.bot, CHAT_ID, report)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🤖 Бот активен! Используй кнопки:", reply_markup=markup
-    )
+    keyboard = [
+        [InlineKeyboardButton("📅 Сегодня", callback_data='today')],
+        [InlineKeyboardButton("📆 Вчера", callback_data='yesterday')],
+        [InlineKeyboardButton("📊 Неделя", callback_data='week')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("🤖 Выберите период:", reply_markup=reply_markup)
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.text == 'Сегодня':
-        await today_report(update, context)
-    elif update.message.text == 'Вчера':
-        await yesterday_report(update, context)
-    elif update.message.text == 'Неделя':
-        await week_report(update, context)
+async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
 
-async def today_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Собираю данные за сегодня...")
-    for account_id in AD_ACCOUNTS:
-        report = get_facebook_data(account_id, 'today')
-        await send_to_telegram_message(context.bot, update.effective_chat.id, report)
+    if query.data == 'today':
+        await query.edit_message_text(text="Собираю данные за сегодня...")
+        for account_id in AD_ACCOUNTS:
+            report = get_facebook_data(account_id, 'today')
+            await send_to_telegram_message(context.bot, update.effective_chat.id, report)
+    
+    elif query.data == 'yesterday':
+        await query.edit_message_text(text="Собираю данные за вчера...")
+        for account_id in AD_ACCOUNTS:
+            report = get_facebook_data(account_id, 'yesterday')
+            await send_to_telegram_message(context.bot, update.effective_chat.id, report)
 
-async def yesterday_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Собираю данные за вчера...")
-    for account_id in AD_ACCOUNTS:
-        report = get_facebook_data(account_id, 'yesterday')
-        await send_to_telegram_message(context.bot, update.effective_chat.id, report)
-
-async def week_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    start_period = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
-    today = datetime.now().strftime("%Y-%m-%d")
-    await update.message.reply_text(f"Собираю данные за неделю ({start_period} — {today})...")
-    for account_id in AD_ACCOUNTS:
-        report = get_facebook_data(account_id, 'last_7d')
-        await send_to_telegram_message(context.bot, update.effective_chat.id, report)
+    elif query.data == 'week':
+        start_period = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+        today = datetime.now().strftime("%Y-%m-%d")
+        await query.edit_message_text(text=f"Собираю данные за неделю ({start_period} — {today})...")
+        for account_id in AD_ACCOUNTS:
+            report = get_facebook_data(account_id, 'last_7d')
+            await send_to_telegram_message(context.bot, update.effective_chat.id, report)
 
 async def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+    app.add_handler(CallbackQueryHandler(button_click))
 
     scheduler = AsyncIOScheduler(timezone="Asia/Aqtobe")
     scheduler.add_job(auto_report, 'cron', hour=9, minute=30, args=[app])
@@ -136,5 +123,4 @@ async def main():
     await app.run_polling()
 
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    loop.create_task(main())
+    asyncio.run(main())
