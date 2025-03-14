@@ -60,8 +60,6 @@ def get_facebook_data(account_id, date_preset):
     if date_preset == 'last_7d':
         start_period = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
         period_text = f"{start_period} — {today}"
-    else:
-        period_text = today
 
     report = f"{status_emoji} {clean_text(account_name)} ({period_text})\n"
 
@@ -85,10 +83,15 @@ def get_facebook_data(account_id, date_preset):
 async def send_to_telegram_message(bot, chat_id, message):
     await bot.send_message(chat_id=chat_id, text=message)
 
-async def auto_report(application):
+async def auto_report(context: ContextTypes.DEFAULT_TYPE):
     for account_id in AD_ACCOUNTS:
         report = get_facebook_data(account_id, 'today')
-        await send_to_telegram_message(application.bot, CHAT_ID, report)
+        await send_to_telegram_message(context.bot, CHAT_ID, report)
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🤖 Бот активен! Используй кнопки:", reply_markup=markup
+    )
 
 async def today_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Собираю данные за сегодня...")
@@ -110,28 +113,19 @@ async def week_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         report = get_facebook_data(account_id, 'last_7d')
         await send_to_telegram_message(context.bot, update.effective_chat.id, report)
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.text == 'Сегодня':
-        await today_report(update, context)
-    elif update.message.text == 'Вчера':
-        await yesterday_report(update, context)
-    elif update.message.text == 'Неделя':
-        await week_report(update, context)
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🤖 Бот активен! Используй кнопки:", reply_markup=markup
-    )
-
-if __name__ == "__main__":
+async def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
 
     scheduler = AsyncIOScheduler(timezone="Asia/Aqtobe")
-    scheduler.add_job(auto_report, trigger='cron', hour=9, minute=30, args=[app])
-    scheduler.start()
+    scheduler.add_job(auto_report, 'cron', hour=9, minute=30, args=[app])
+    
+    async with app:
+        scheduler.start()
+        print("🚀 Бот запущен и ожидает команд.")
+        await app.run_polling()
 
-    print("🚀 Бот запущен и ожидает команд.")
-    app.run_polling()
+if __name__ == "__main__":
+    asyncio.run(main())
