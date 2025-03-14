@@ -93,6 +93,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🤖 Бот активен! Используй кнопки:", reply_markup=markup
     )
 
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text == 'Сегодня':
+        await today_report(update, context)
+    elif update.message.text == 'Вчера':
+        await yesterday_report(update, context)
+    elif update.message.text == 'Неделя':
+        await week_report(update, context)
+
 async def today_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Собираю данные за сегодня...")
     for account_id in AD_ACCOUNTS:
@@ -112,14 +120,6 @@ async def week_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for account_id in AD_ACCOUNTS:
         report = get_facebook_data(account_id, 'last_7d')
         await send_to_telegram_message(context.bot, update.effective_chat.id, report)
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.text == 'Сегодня':
-        await today_report(update, context)
-    elif update.message.text == 'Вчера':
-        await yesterday_report(update, context)
-    elif update.message.text == 'Неделя':
-        await week_report(update, context)
 
 async def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
