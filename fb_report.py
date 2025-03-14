@@ -113,6 +113,14 @@ async def week_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         report = get_facebook_data(account_id, 'last_7d')
         await send_to_telegram_message(context.bot, update.effective_chat.id, report)
 
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text == 'Сегодня':
+        await today_report(update, context)
+    elif update.message.text == 'Вчера':
+        await yesterday_report(update, context)
+    elif update.message.text == 'Неделя':
+        await week_report(update, context)
+
 async def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
@@ -122,16 +130,10 @@ async def main():
     scheduler = AsyncIOScheduler(timezone="Asia/Aqtobe")
     scheduler.add_job(auto_report, 'cron', hour=9, minute=30, args=[app])
     
-    loop = asyncio.get_running_loop()
-    loop.create_task(app.run_polling())
-
     scheduler.start()
     print("🚀 Бот запущен и ожидает команд.")
-    await asyncio.Event().wait()  # Держим процесс активным
+    
+    await app.run_polling()
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except RuntimeError:
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(main())
+    asyncio.run(main())  # Окончательное исправление!
