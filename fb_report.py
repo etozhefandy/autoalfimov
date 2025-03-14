@@ -1,6 +1,5 @@
 import asyncio
 import re
-import os
 from datetime import datetime, timedelta
 from facebook_business.adobjects.adaccount import AdAccount
 from facebook_business.api import FacebookAdsApi
@@ -57,8 +56,8 @@ def get_facebook_data(account_id, date_preset):
     status_emoji = is_account_active(account_id)
 
     today = datetime.now().strftime("%Y-%m-%d")
-    period_text = f"{today}"
-    
+    period_text = today
+
     if date_preset == 'last_7d':
         start_period = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
         period_text = f"{start_period} — {today}"
@@ -119,14 +118,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif update.message.text == 'Неделя':
         await week_report(update, context)
 
-app = Application.builder().token(TELEGRAM_TOKEN).build()
-app.add_handler(CommandHandler("start", start))
-app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+async def main():
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-scheduler = AsyncIOScheduler(timezone="Asia/Aqtobe")
-scheduler.add_job(lambda: asyncio.create_task(auto_report(app.bot)), 'cron', hour=9, minute=30)
-scheduler.start()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+
+    scheduler = AsyncIOScheduler(timezone="Asia/Aqtobe")
+    scheduler.add_job(lambda: asyncio.create_task(auto_report(app.bot)), 'cron', hour=9, minute=30)
+    scheduler.start()
+
+    print("🚀 Бот запущен и ожидает команд.")
+    await app.run_polling()
 
 if __name__ == "__main__":
-    print("🚀 Бот запущен.")
-    app.run_polling()
+    asyncio.run(main())
