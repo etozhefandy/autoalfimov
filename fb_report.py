@@ -1,4 +1,5 @@
 import re
+import asyncio
 from datetime import datetime, timedelta
 from facebook_business.adobjects.adaccount import AdAccount
 from facebook_business.api import FacebookAdsApi
@@ -18,6 +19,9 @@ AD_ACCOUNTS = [
 ]
 
 TELEGRAM_TOKEN = "8033028841:AAGud3hSZdR8KQiOSaAcwfbkv8P0p-P3Dt4"
+CHAT_ID = "253181449"
+
+previous_balances = {}
 
 
 def clean_text(text):
@@ -66,24 +70,24 @@ async def send_report(context, chat_id, period):
         await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='MarkdownV2')
 
 
-async def billing_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def check_billing(context: ContextTypes.DEFAULT_TYPE):
+    global previous_balances
     for account_id in AD_ACCOUNTS:
-        try:
-            account = AdAccount(account_id)
-            billing_info = account.api_get(fields=['name', 'amount_spent', 'balance'])
-            name = billing_info.get('name', 'Неизвестный аккаунт')
-            amount_spent = billing_info.get('amount_spent', '0')
-            balance = billing_info.get('balance', '0')
+        account = AdAccount(account_id)
+        billing_info = account.api_get(fields=['name', 'balance'])
+        current_balance = billing_info.get('balance', '0')
 
+        if account_id in previous_balances and previous_balances[account_id] != current_balance:
+            diff = float(current_balance) - float(previous_balances[account_id])
             message = (
-                f"💳 Биллинг аккаунта: *{clean_text(name)}* {is_account_active(account_id)}\n"
-                f"🧾 Потрачено: {clean_text(amount_spent)} USD\n"
-                f"💰 Баланс: {clean_text(balance)} USD"
+                f"💳 Изменение биллинга: *{clean_text(billing_info.get('name', 'Неизвестный'))}*\n"
+                f"💰 Было: {previous_balances[account_id]} USD\n"
+                f"💸 Стало: {current_balance} USD\n"
+                f"🔔 Изменение: {round(diff, 2)} USD"
             )
+            await context.bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='MarkdownV2')
 
-            await context.bot.send_message(chat_id=update.message.chat_id, text=message, parse_mode='MarkdownV2')
-        except Exception as e:
-            await context.bot.send_message(chat_id=update.message.chat_id, text=f"⚠ Ошибка при загрузке биллинга: {clean_text(str(e))}")
+        previous_balances[account_id] = current_balance
 
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -101,16 +105,13 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_keyboard = [['Сегодня', 'Вчера', 'Прошедшая неделя']]
-    await update.message.reply_text(
-        '🤖 Выберите отчёт:',
-        reply_markup=ReplyKeyboardMarkup(reply_keyboard, resize_keyboard=True)
-    )
+    await update.message.reply_text('🤖 Выберите отчёт:', reply_markup=ReplyKeyboardMarkup(reply_keyboard, resize_keyboard=True))
 
 
 app = Application.builder().token(TELEGRAM_TOKEN).build()
 app.add_handler(CommandHandler("start", start))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
-app.add_handler(CommandHandler("billing", billing_report))
+app.job_queue.run_repeating(check_billing, interval=600, first=10)
 
 if __name__ == "__main__":
     print("🚀 Бот запущен и ожидает команд.")
