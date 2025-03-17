@@ -1,12 +1,11 @@
-import asyncio
 import re
 from datetime import datetime, timedelta
 from facebook_business.adobjects.adaccount import AdAccount
 from facebook_business.api import FacebookAdsApi
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-ACCESS_TOKEN = "EAASZCrBwhoH0BO6hvTPZBtAX3OFPcJjZARZBZCIllnjc4GkxagyhvvrylPKWdU9jMijZA051BJRRvVuV1nab4k5jtVO5q0TsDIKbXzphumaFIbqKDcJ3JMvQTmORdrNezQPZBP14pq4NKB56wpIiNJSLFa5yXFsDttiZBgUHAmVAJknN7Ig1ZBVU2q0vRyQKtyuXXwZDZD"
+ACCESS_TOKEN = "EAASZCrBwhoH0BO7xBXr2h2sGTzvWzUyViJjnrXIvmI5w3uRQOszdntxDiFYxXH4hrKTmZBaPKtuthKuNx3rexRev5zAkby2XbrM5UmwzRGz8a2Q4WBDKp3d1ZCZAAhZCeWFBObQayL4XPwrOFQUtuPcGP5XVYubaXjZCsNT467yKBg90O71oVPZCbI0FrWcZAZC4GtgZDZD"
 APP_ID = "1336645834088573"
 APP_SECRET = "01bf23c5f726c59da318daa82dd0e9dc"
 FacebookAdsApi.init(APP_ID, APP_SECRET, ACCESS_TOKEN)
@@ -19,7 +18,6 @@ AD_ACCOUNTS = [
 ]
 
 TELEGRAM_TOKEN = "8033028841:AAGud3hSZdR8KQiOSaAcwfbkv8P0p-P3Dt4"
-CHAT_ID = "253181449"
 
 
 def clean_text(text):
@@ -62,45 +60,44 @@ def get_facebook_data(account_id, date_preset):
     return report
 
 
-async def report(update: Update, context: ContextTypes.DEFAULT_TYPE, period: str):
-    await update.message.reply_text(f"📊 Сбор отчета ({period})...")
+async def send_report(context, chat_id, period):
     for acc in AD_ACCOUNTS:
         msg = get_facebook_data(acc, period)
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=msg, parse_mode='MarkdownV2')
+        await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='MarkdownV2')
 
 
-async def today_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await report(update, context, 'today')
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    period = query.data
 
-
-async def yesterday_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await report(update, context, 'yesterday')
-
-
-async def last_week_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    until = datetime.now() - timedelta(days=1)
-    since = until - timedelta(days=6)
-    period = {'since': since.strftime('%Y-%m-%d'), 'until': until.strftime('%Y-%m-%d')}
-    await update.message.reply_text(f"📊 Сбор отчета с {period['since']} по {period['until']}...")
-    for acc in AD_ACCOUNTS:
-        msg = get_facebook_data(acc, period)
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=msg, parse_mode='MarkdownV2')
+    if period == 'today':
+        await send_report(context, query.message.chat_id, 'today')
+    elif period == 'yesterday':
+        await send_report(context, query.message.chat_id, 'yesterday')
+    elif period == 'week':
+        until = datetime.now() - timedelta(days=1)
+        since = until - timedelta(days=6)
+        custom_period = {'since': since.strftime('%Y-%m-%d'), 'until': until.strftime('%Y-%m-%d')}
+        await send_report(context, query.message.chat_id, custom_period)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("Сегодня", callback_data='today')],
+        [InlineKeyboardButton("Вчера", callback_data='yesterday')],
+        [InlineKeyboardButton("Прошедшая неделя", callback_data='week')]
+    ]
+
     await update.message.reply_text(
-        "🤖 *Бот активен*\n"
-        "/today — Отчет за сегодня\n"
-        "/yesterday — Отчет за вчера\n"
-        "/week — Отчет за прошедшую неделю"
+        '🤖 Выберите отчёт:',
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
 
 app = Application.builder().token(TELEGRAM_TOKEN).build()
-app.add_handler(CommandHandler("today", today_report))
-app.add_handler(CommandHandler("yesterday", yesterday_report))
-app.add_handler(CommandHandler("week", last_week_report))
 app.add_handler(CommandHandler("start", start))
+app.add_handler(CallbackQueryHandler(button_handler))
 
 if __name__ == "__main__":
     print("🚀 Бот запущен и ожидает команд.")
