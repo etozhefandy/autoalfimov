@@ -1,5 +1,6 @@
 import asyncio
-from datetime import datetime, timedelta
+import re
+from datetime import datetime, timedelta, time
 from facebook_business.adobjects.adaccount import AdAccount
 from facebook_business.api import FacebookAdsApi
 from telegram import Update, ReplyKeyboardMarkup
@@ -22,18 +23,16 @@ CHAT_ID = "253181449"
 
 account_statuses = {}
 
-
 def is_account_active(account_id):
     try:
-        account_data = AdAccount(account_id).api_get(fields=['account_status'])
-        return "🟢" if account_data['account_status'] == 1 else "🔴"
-    except Exception:
+        status = AdAccount(account_id).api_get(fields=['account_status'])['account_status']
+        return "🟢" if status == 1 else "🔴"
+    except:
         return "🔴"
-
 
 def get_facebook_data(account_id, date_preset, date_label=''):
     account = AdAccount(account_id)
-    fields = ['impressions', 'cpm', 'clicks', 'cpc', 'actions', 'cost_per_action_type', 'spend']
+    fields = ['impressions', 'cpm', 'clicks', 'cpc', 'spend']
     params = {'time_range': date_preset, 'level': 'account'} if isinstance(date_preset, dict) else {'date_preset': date_preset, 'level': 'account'}
 
     try:
@@ -58,12 +57,10 @@ def get_facebook_data(account_id, date_preset, date_label=''):
     )
     return report
 
-
 async def send_report(context, chat_id, period, date_label=''):
     for acc in AD_ACCOUNTS:
         msg = get_facebook_data(acc, period, date_label)
         await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='HTML')
-
 
 async def check_billing(context: ContextTypes.DEFAULT_TYPE):
     global account_statuses
@@ -73,13 +70,14 @@ async def check_billing(context: ContextTypes.DEFAULT_TYPE):
         current_status = account_info.get('account_status')
 
         if account_id in account_statuses and account_statuses[account_id] == 1 and current_status != 1:
-            message = (
-                f"⚠️ Аккаунт <b>{account_info.get('name', 'Неизвестный аккаунт')}</b> был отключён (проблемы с биллингом)."
-            )
+            message = f"⚠️ Аккаунт <b>{account_info.get('name')}</b> был отключён (проблемы с биллингом)."
             await context.bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='HTML')
 
         account_statuses[account_id] = current_status
 
+async def daily_report(context: ContextTypes.DEFAULT_TYPE):
+    date_label = (datetime.now() - timedelta(days=1)).strftime('%d.%m.%Y')
+    await send_report(context, CHAT_ID, 'yesterday', date_label)
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
@@ -96,16 +94,15 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         date_label = f"{since.strftime('%d.%m')}-{until.strftime('%d.%m')}"
         await send_report(context, update.message.chat_id, period, date_label)
 
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_keyboard = [['Сегодня', 'Вчера', 'Прошедшая неделя']]
     await update.message.reply_text('🤖 Выберите отчёт:', reply_markup=ReplyKeyboardMarkup(reply_keyboard, resize_keyboard=True))
-
 
 app = Application.builder().token(TELEGRAM_TOKEN).build()
 app.add_handler(CommandHandler("start", start))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 app.job_queue.run_repeating(check_billing, interval=600, first=10)
+app.job_queue.run_daily(daily_report, time=time(hour=9, minute=30))
 
 if __name__ == "__main__":
     print("🚀 Бот запущен и ожидает команд.")
