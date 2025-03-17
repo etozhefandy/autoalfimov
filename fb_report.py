@@ -1,4 +1,3 @@
-import re
 import asyncio
 from datetime import datetime, timedelta
 from facebook_business.adobjects.adaccount import AdAccount
@@ -23,19 +22,12 @@ CHAT_ID = "253181449"
 
 previous_balances = {}
 
-
-def clean_text(text):
-    escape_chars = r'_*[]()~`>#+-=|{}.!'
-    return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', str(text))
-
-
 def is_account_active(account_id):
     try:
         account_data = AdAccount(account_id).api_get(fields=['account_status'])
         return "🟢" if account_data['account_status'] == 1 else "🔴"
     except Exception:
         return "🔴"
-
 
 def get_facebook_data(account_id, date_preset, date_label=''):
     account = AdAccount(account_id)
@@ -46,21 +38,21 @@ def get_facebook_data(account_id, date_preset, date_label=''):
         insights = account.get_insights(fields=fields, params=params)
         account_name = account.api_get(fields=['name'])['name']
     except Exception as e:
-        return f"⚠ Ошибка: {clean_text(str(e))}"
+        return f"⚠ Ошибка: {str(e)}"
 
     date_info = f" ({date_label})" if date_label else ""
-    report = f"*{clean_text(account_name)}*{date_info} {is_account_active(account_id)}\n"
+    report = f"<b>{account_name}</b>{date_info} {is_account_active(account_id)}\n"
 
     if not insights:
-        return report + "_Нет данных за выбранный период_"
+        return report + "Нет данных за выбранный период"
 
     insight = insights[0]
     report += (
-        f"👁 Показы: {clean_text(insight.get('impressions', '0'))}\n"
-        f"🎯 CPM: {clean_text(round(float(insight.get('cpm', 0)), 2))} USD\n"
-        f"🖱 Клики: {clean_text(insight.get('clicks', '0'))}\n"
-        f"💸 CPC: {clean_text(round(float(insight.get('cpc', 0)), 2))} USD\n"
-        f"💵 Затраты: {clean_text(round(float(insight.get('spend', 0)), 2))} USD"
+        f"👁 Показы: {insight.get('impressions', '0')}\n"
+        f"🎯 CPM: {round(float(insight.get('cpm', 0)), 2)} USD\n"
+        f"🖱 Клики: {insight.get('clicks', '0')}\n"
+        f"💸 CPC: {round(float(insight.get('cpc', 0)), 2)} USD\n"
+        f"💵 Затраты: {round(float(insight.get('spend', 0)), 2)} USD"
     )
     return report
 
@@ -68,7 +60,27 @@ def get_facebook_data(account_id, date_preset, date_label=''):
 async def send_report(context, chat_id, period, date_label=''):
     for acc in AD_ACCOUNTS:
         msg = get_facebook_data(acc, period, date_label)
-        await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='MarkdownV2')
+        await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='HTML')
+
+
+async def check_billing(context: ContextTypes.DEFAULT_TYPE):
+    global previous_balances
+    for account_id in AD_ACCOUNTS:
+        account = AdAccount(account_id)
+        billing_info = account.api_get(fields=['name', 'balance'])
+        current_balance = billing_info.get('balance', '0')
+
+        if account_id in previous_balances and previous_balances[account_id] != current_balance:
+            diff = float(current_balance) - float(previous_balances[account_id])
+            message = (
+                f"💳 Изменение биллинга: <b>{billing_info.get('name', 'Неизвестный')}</b>\n"
+                f"💰 Было: {previous_balances[account_id]} USD\n"
+                f"💸 Стало: {current_balance} USD\n"
+                f"🔔 Изменение: {round(diff, 2)} USD"
+            )
+            await context.bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='HTML')
+
+        previous_balances[account_id] = current_balance
 
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -90,27 +102,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_keyboard = [['Сегодня', 'Вчера', 'Прошедшая неделя']]
     await update.message.reply_text('🤖 Выберите отчёт:', reply_markup=ReplyKeyboardMarkup(reply_keyboard, resize_keyboard=True))
-
-
-async def check_billing(context: ContextTypes.DEFAULT_TYPE):
-    global previous_balances
-    for account_id in AD_ACCOUNTS:
-        account = AdAccount(account_id)
-        billing_info = account.api_get(fields=['name', 'balance'])
-        current_balance = billing_info.get('balance', '0')
-
-        if account_id in previous_balances and previous_balances[account_id] != current_balance:
-            diff = float(current_balance) - float(previous_balances[account_id])
-            message = (
-                f"💳 Изменение биллинга: *{clean_text(billing_info.get('name', 'Неизвестный'))}*\n"
-                f"💰 Было: {previous_balances[account_id]} USD\n"
-                f"💸 Стало: {current_balance} USD\n"
-                f"🔔 Изменение: {round(diff, 2)} USD"
-            )
-            await context.bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='MarkdownV2')
-
-        previous_balances[account_id] = current_balance
-
 
 app = Application.builder().token(TELEGRAM_TOKEN).build()
 app.add_handler(CommandHandler("start", start))
