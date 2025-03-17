@@ -36,7 +36,7 @@ def is_account_active(account_id):
 def get_facebook_data(account_id, date_preset):
     account = AdAccount(account_id)
     fields = ['impressions', 'cpm', 'clicks', 'cpc', 'actions', 'cost_per_action_type', 'spend']
-    params = {'date_preset': date_preset, 'level': 'account'}
+    params = {'time_range': date_preset, 'level': 'account'} if isinstance(date_preset, dict) else {'date_preset': date_preset, 'level': 'account'}
 
     try:
         insights = account.get_insights(fields=fields, params=params)
@@ -95,12 +95,12 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == 'Прошедшая неделя':
         until = datetime.now() - timedelta(days=1)
         since = until - timedelta(days=6)
-        custom_period = {'since': since.strftime('%Y-%m-%d'), 'until': until.strftime('%Y-%m-%d')}
-        await send_report(context, update.message.chat_id, custom_period)
+        period = {'since': since.strftime('%Y-%m-%d'), 'until': until.strftime('%Y-%m-%d')}
+        await send_report(context, update.message.chat_id, period)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    reply_keyboard = [['Сегодня', 'Вчера', 'Прошедшая неделя', 'Биллинги']]
+    reply_keyboard = [['Сегодня', 'Вчера', 'Прошедшая неделя']]
     await update.message.reply_text(
         '🤖 Выберите отчёт:',
         reply_markup=ReplyKeyboardMarkup(reply_keyboard, resize_keyboard=True)
@@ -111,7 +111,6 @@ app = Application.builder().token(TELEGRAM_TOKEN).build()
 app.add_handler(CommandHandler("start", start))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 app.add_handler(CommandHandler("billing", billing_report))
-app.add_handler(MessageHandler(filters.Regex('^Биллинги$'), billing_report))
 
 if __name__ == "__main__":
     print("🚀 Бот запущен и ожидает команд.")
