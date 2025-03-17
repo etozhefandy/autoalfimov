@@ -20,7 +20,8 @@ AD_ACCOUNTS = [
 TELEGRAM_TOKEN = "8033028841:AAGud3hSZdR8KQiOSaAcwfbkv8P0p-P3Dt4"
 CHAT_ID = "253181449"
 
-previous_balances = {}
+account_statuses = {}
+
 
 def is_account_active(account_id):
     try:
@@ -28,6 +29,7 @@ def is_account_active(account_id):
         return "🟢" if account_data['account_status'] == 1 else "🔴"
     except Exception:
         return "🔴"
+
 
 def get_facebook_data(account_id, date_preset, date_label=''):
     account = AdAccount(account_id)
@@ -63,24 +65,20 @@ async def send_report(context, chat_id, period, date_label=''):
         await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='HTML')
 
 
-async def check_billing(context: ContextTypes.DEFAULT_TYPE):
-    global previous_balances
+async def check_account_status(context: ContextTypes.DEFAULT_TYPE):
+    global account_statuses
     for account_id in AD_ACCOUNTS:
         account = AdAccount(account_id)
-        billing_info = account.api_get(fields=['name', 'balance'])
-        current_balance = billing_info.get('balance', '0')
+        account_info = account.api_get(fields=['name', 'account_status'])
+        current_status = account_info.get('account_status')
 
-        if account_id in previous_balances and previous_balances[account_id] != current_balance:
-            diff = float(current_balance) - float(previous_balances[account_id])
+        if account_id in account_statuses and account_statuses[account_id] == 1 and current_status != 1:
             message = (
-                f"💳 Изменение биллинга: <b>{billing_info.get('name', 'Неизвестный')}</b>\n"
-                f"💰 Было: {previous_balances[account_id]} USD\n"
-                f"💸 Стало: {current_balance} USD\n"
-                f"🔔 Изменение: {round(diff, 2)} USD"
+                f"🔴 Аккаунт отключён из-за проблем с оплатой: <b>{account_info.get('name', 'Неизвестный аккаунт')}</b>"
             )
             await context.bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='HTML')
 
-        previous_balances[account_id] = current_balance
+        account_statuses[account_id] = current_status
 
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -102,6 +100,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_keyboard = [['Сегодня', 'Вчера', 'Прошедшая неделя']]
     await update.message.reply_text('🤖 Выберите отчёт:', reply_markup=ReplyKeyboardMarkup(reply_keyboard, resize_keyboard=True))
+
 
 app = Application.builder().token(TELEGRAM_TOKEN).build()
 app.add_handler(CommandHandler("start", start))
