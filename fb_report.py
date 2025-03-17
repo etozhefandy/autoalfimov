@@ -2,8 +2,8 @@ import re
 from datetime import datetime, timedelta
 from facebook_business.adobjects.adaccount import AdAccount
 from facebook_business.api import FacebookAdsApi
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, ReplyKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 ACCESS_TOKEN = "EAASZCrBwhoH0BO7xBXr2h2sGTzvWzUyViJjnrXIvmI5w3uRQOszdntxDiFYxXH4hrKTmZBaPKtuthKuNx3rexRev5zAkby2XbrM5UmwzRGz8a2Q4WBDKp3d1ZCZAAhZCeWFBObQayL4XPwrOFQUtuPcGP5XVYubaXjZCsNT467yKBg90O71oVPZCbI0FrWcZAZC4GtgZDZD"
 APP_ID = "1336645834088573"
@@ -28,7 +28,7 @@ def clean_text(text):
 def is_account_active(account_id):
     try:
         account_data = AdAccount(account_id).api_get(fields=['account_status'])
-        return "✅" if account_data['account_status'] == 1 else "🔴"
+        return "🟢" if account_data['account_status'] == 1 else "🔴"
     except Exception:
         return "🔴"
 
@@ -66,6 +66,26 @@ async def send_report(context, chat_id, period):
         await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='MarkdownV2')
 
 
+async def billing_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    for account_id in AD_ACCOUNTS:
+        try:
+            account = AdAccount(account_id)
+            billing_info = account.api_get(fields=['name', 'amount_spent', 'balance'])
+            name = billing_info.get('name', 'Неизвестный аккаунт')
+            amount_spent = billing_info.get('amount_spent', '0')
+            balance = billing_info.get('balance', '0')
+
+            message = (
+                f"💳 Биллинг аккаунта: *{clean_text(name)}* {is_account_active(account_id)}\n"
+                f"🧾 Потрачено: {clean_text(amount_spent)} USD\n"
+                f"💰 Баланс: {clean_text(balance)} USD"
+            )
+
+            await context.bot.send_message(chat_id=update.message.chat_id, text=message, parse_mode='MarkdownV2')
+        except Exception as e:
+            await context.bot.send_message(chat_id=update.message.chat_id, text=f"⚠ Ошибка при загрузке биллинга: {clean_text(str(e))}")
+
+
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     if text == 'Сегодня':
@@ -80,7 +100,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    reply_keyboard = [['Сегодня', 'Вчера', 'Прошедшая неделя']]
+    reply_keyboard = [['Сегодня', 'Вчера', 'Прошедшая неделя', 'Биллинги']]
     await update.message.reply_text(
         '🤖 Выберите отчёт:',
         reply_markup=ReplyKeyboardMarkup(reply_keyboard, resize_keyboard=True)
@@ -90,6 +110,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 app = Application.builder().token(TELEGRAM_TOKEN).build()
 app.add_handler(CommandHandler("start", start))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+app.add_handler(CommandHandler("billing", billing_report))
+app.add_handler(MessageHandler(filters.Regex('^Биллинги$'), billing_report))
 
 if __name__ == "__main__":
     print("🚀 Бот запущен и ожидает команд.")
