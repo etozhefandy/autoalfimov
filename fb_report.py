@@ -2,9 +2,10 @@ import asyncio
 import re
 import hashlib
 import hmac
+from datetime import datetime, timedelta
 from facebook_business.adobjects.adaccount import AdAccount
 from facebook_business.api import FacebookAdsApi
-from telegram import Bot, Update
+from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 ACCESS_TOKEN = "EAASZCrBwhoH0BO6hvTPZBtAX3OFPcJjZARZBZCIllnjc4GkxagyhvvrylPKWdU9jMijZA051BJRRvVuV1nab4k5jtVO5q0TsDIKbXzphumaFIbqKDcJ3JMvQTmORdrNezQPZBP14pq4NKB56wpIiNJSLFa5yXFsDttiZBgUHAmVAJknN7Ig1ZBVU2q0vRyQKtyuXXwZDZD"
@@ -21,17 +22,16 @@ AD_ACCOUNTS = [
 
 TELEGRAM_TOKEN = "8033028841:AAGud3hSZdR8KQiOSaAcwfbkv8P0p-P3Dt4"
 CHAT_ID = "253181449"
-ALLOWED_ACTIONS = {"link_click"}
 
-bot = Bot(token=TELEGRAM_TOKEN)
 
 def clean_text(text):
-    if not isinstance(text, str):
-        return str(text)
-    return re.sub(r'([_*\[\]()~`>#+\-=|{}.!-])', r'\\\1', text)
+    escape_chars = r'_*[]()~`>#+-=|{}.!'
+    return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', str(text))
+
 
 def generate_appsecret_proof():
     return hmac.new(APP_SECRET.encode(), ACCESS_TOKEN.encode(), hashlib.sha256).hexdigest()
+
 
 def is_account_active(account_id):
     try:
@@ -40,76 +40,72 @@ def is_account_active(account_id):
     except Exception:
         return "🔴"
 
+
 def get_facebook_data(account_id, date_preset):
     account = AdAccount(account_id)
     fields = ['impressions', 'cpm', 'clicks', 'cpc', 'actions', 'cost_per_action_type', 'spend']
     params = {'date_preset': date_preset, 'level': 'account', 'appsecret_proof': generate_appsecret_proof()}
-    
+
     try:
-        campaigns = account.get_insights(fields=fields, params=params)
-    except Exception as e:
-        return f"⚠ Ошибка загрузки данных для {account_id}: {clean_text(str(e))}"
-    
-    try:
+        insights = account.get_insights(fields=fields, params=params)
         account_name = account.api_get(fields=['name'])['name']
-    except Exception:
-        account_name = "Неизвестный аккаунт"
-    
-    status_emoji = is_account_active(account_id)
-    report = f"{status_emoji} {clean_text(account_name)}\n"
-    
-    if not campaigns:
-        report += "\n⚠ Данных за выбранный период нет"
-    else:
-        campaign = campaigns[0]  # Учитываем только первую запись, т.к. уровень аккаунта один
-        report += f"\n👁 Показы: {clean_text(campaign.get('impressions', '—'))}"
-        report += f"\n🎯 CPM: {clean_text(str(round(float(campaign.get('cpm', 0)) / 100, 2)))} USD"
-        report += f"\n🖱 Клики: {clean_text(campaign.get('clicks', '—'))}"
-        report += f"\n💸 CPC: {clean_text(str(round(float(campaign.get('cpc', 0)), 2)))} USD"
-        
-        if 'cost_per_action_type' in campaign:
-            for cost in campaign['cost_per_action_type']:
-                if cost.get('action_type') == 'link_click':
-                    report += f"\n💰 Стоимость действия: {clean_text(str(round(float(cost['value']), 2)))} USD"
-        
-        spend = campaign.get('spend', 0)
-        report += f"\n💵 Сумма затрат: {clean_text(str(round(float(spend), 2)))} USD"
+    except Exception as e:
+        return f"⚠ Ошибка: {clean_text(str(e))}"
 
-    return f"{is_account_active(account_id)} {clean_text(account_name)}\n" + report
+    report = f"*{clean_text(account_name)}* {is_account_active(account_id)}\n"
 
-async def send_to_telegram(context: ContextTypes.DEFAULT_TYPE, message: str, chat_id: int):
-    await context.bot.send_message(chat_id=context.job.chat_id, text=message, parse_mode='MarkdownV2')
+    if not insights:
+        return report + "_Нет данных за выбранный период_"
+
+    insight = insights[0]
+    report += (
+        f"👁 Показы: {clean_text(insight.get('impressions', '0'))}\n"
+        f"🎯 CPM: {clean_text(round(float(insight.get('cpm', 0)), 2))} USD\n"
+        f"🖱 Клики: {clean_text(insight.get('clicks', '0'))}\n"
+        f"💸 CPC: {clean_text(round(float(insight.get('cpc', 0)), 2))} USD\n"
+        f"💵 Затраты: {clean_text(round(float(insight.get('spend', 0)), 2))} USD"
+    )
+    return report
+
+
+async def report(update: Update, context: ContextTypes.DEFAULT_TYPE, period: str):
+    await update.message.reply_text(f"📊 Сбор отчета ({period})...")
+    for acc in AD_ACCOUNTS:
+        msg = get_facebook_data(acc, period)
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=msg, parse_mode='MarkdownV2')
+
 
 async def today_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Собираю данные за сегодня...")
-    for account_id in AD_ACCOUNTS:
-        report = get_facebook_data(account_id, 'today')
-        await send_to_telegram_message(context, update.effective_chat.id, report)
+    await report(update, context, 'today')
 
-async def send_to_telegram_message(context: ContextTypes.DEFAULT_TYPE, chat_id, message):
-    await context.bot.send_message(chat_id=chat_id, text=message, parse_mode='MarkdownV2')
 
-async def billing_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Собираю данные по биллингам...")
-    for account_id in AD_ACCOUNTS:
-        account_name = "Неизвестный аккаунт"
-        try:
-            account_name = AdAccount(account_id).api_get(fields=['name'])['name']
-        except:
-            pass
-        await send_to_telegram_message(
-            context,
-            update.effective_chat.id,
-            f"📢 Рекламный аккаунт: *{clean_text(account_name)}* - статус {is_account_active(account_id)}"
-        )
+async def yesterday_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await report(update, context, 'yesterday')
+
+
+async def last_week_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    until = datetime.now() - timedelta(days=1)
+    since = until - timedelta(days=6)
+    period = {'since': since.strftime('%Y-%m-%d'), 'until': until.strftime('%Y-%m-%d')}
+    await update.message.reply_text(f"📊 Сбор отчета с {period['since']} по {period['until']}...")
+    for acc in AD_ACCOUNTS:
+        msg = get_facebook_data(acc, period)
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=msg, parse_mode='MarkdownV2')
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 Бот активен! Используй команды /today и /billing")
+    await update.message.reply_text(
+        "🤖 *Бот активен*\n"
+        "/today — Отчет за сегодня\n"
+        "/yesterday — Отчет за вчера\n"
+        "/week — Отчет за прошедшую неделю"
+    )
+
 
 app = Application.builder().token(TELEGRAM_TOKEN).build()
-
 app.add_handler(CommandHandler("today", today_report))
-app.add_handler(CommandHandler("billing", send_to_telegram_message))
+app.add_handler(CommandHandler("yesterday", yesterday_report))
+app.add_handler(CommandHandler("week", last_week_report))
 app.add_handler(CommandHandler("start", start))
 
 if __name__ == "__main__":
