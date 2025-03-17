@@ -2,8 +2,8 @@ import re
 from datetime import datetime, timedelta
 from facebook_business.adobjects.adaccount import AdAccount
 from facebook_business.api import FacebookAdsApi
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 
 ACCESS_TOKEN = "EAASZCrBwhoH0BO7xBXr2h2sGTzvWzUyViJjnrXIvmI5w3uRQOszdntxDiFYxXH4hrKTmZBaPKtuthKuNx3rexRev5zAkby2XbrM5UmwzRGz8a2Q4WBDKp3d1ZCZAAhZCeWFBObQayL4XPwrOFQUtuPcGP5XVYubaXjZCsNT467yKBg90O71oVPZCbI0FrWcZAZC4GtgZDZD"
 APP_ID = "1336645834088573"
@@ -66,38 +66,30 @@ async def send_report(context, chat_id, period):
         await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='MarkdownV2')
 
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    period = query.data
-
-    if period == 'today':
-        await send_report(context, query.message.chat_id, 'today')
-    elif period == 'yesterday':
-        await send_report(context, query.message.chat_id, 'yesterday')
-    elif period == 'week':
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == 'Сегодня':
+        await send_report(context, update.message.chat_id, 'today')
+    elif text == 'Вчера':
+        await send_report(context, update.message.chat_id, 'yesterday')
+    elif text == 'Прошедшая неделя':
         until = datetime.now() - timedelta(days=1)
         since = until - timedelta(days=6)
         custom_period = {'since': since.strftime('%Y-%m-%d'), 'until': until.strftime('%Y-%m-%d')}
-        await send_report(context, query.message.chat_id, custom_period)
+        await send_report(context, update.message.chat_id, custom_period)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("Сегодня", callback_data='today')],
-        [InlineKeyboardButton("Вчера", callback_data='yesterday')],
-        [InlineKeyboardButton("Прошедшая неделя", callback_data='week')]
-    ]
-
+    reply_keyboard = [['Сегодня', 'Вчера', 'Прошедшая неделя']]
     await update.message.reply_text(
         '🤖 Выберите отчёт:',
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        reply_markup=ReplyKeyboardMarkup(reply_keyboard, resize_keyboard=True)
     )
 
 
 app = Application.builder().token(TELEGRAM_TOKEN).build()
 app.add_handler(CommandHandler("start", start))
-app.add_handler(CallbackQueryHandler(button_handler))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
 if __name__ == "__main__":
     print("🚀 Бот запущен и ожидает команд.")
