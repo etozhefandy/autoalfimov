@@ -1,7 +1,5 @@
 import asyncio
 import re
-import hashlib
-import hmac
 from datetime import datetime, timedelta
 from facebook_business.adobjects.adaccount import AdAccount
 from facebook_business.api import FacebookAdsApi
@@ -29,10 +27,6 @@ def clean_text(text):
     return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', str(text))
 
 
-def generate_appsecret_proof():
-    return hmac.new(APP_SECRET.encode(), ACCESS_TOKEN.encode(), hashlib.sha256).hexdigest()
-
-
 def is_account_active(account_id):
     try:
         account_data = AdAccount(account_id).api_get(fields=['account_status'])
@@ -44,7 +38,7 @@ def is_account_active(account_id):
 def get_facebook_data(account_id, date_preset):
     account = AdAccount(account_id)
     fields = ['impressions', 'cpm', 'clicks', 'cpc', 'actions', 'cost_per_action_type', 'spend']
-    params = {'date_preset': date_preset, 'level': 'account', 'appsecret_proof': generate_appsecret_proof()}
+    params = {'date_preset': date_preset, 'level': 'account'}
 
     try:
         insights = account.get_insights(fields=fields, params=params)
