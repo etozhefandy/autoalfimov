@@ -37,7 +37,7 @@ def is_account_active(account_id):
         return "🔴"
 
 
-def get_facebook_data(account_id, date_preset):
+def get_facebook_data(account_id, date_preset, date_label=''):
     account = AdAccount(account_id)
     fields = ['impressions', 'cpm', 'clicks', 'cpc', 'actions', 'cost_per_action_type', 'spend']
     params = {'time_range': date_preset, 'level': 'account'} if isinstance(date_preset, dict) else {'date_preset': date_preset, 'level': 'account'}
@@ -48,7 +48,8 @@ def get_facebook_data(account_id, date_preset):
     except Exception as e:
         return f"⚠ Ошибка: {clean_text(str(e))}"
 
-    report = f"*{clean_text(account_name)}* {is_account_active(account_id)}\n"
+    date_info = f" ({date_label})" if date_label else ""
+    report = f"*{clean_text(account_name)}*{date_info} {is_account_active(account_id)}\n"
 
     if not insights:
         return report + "_Нет данных за выбранный период_"
@@ -64,10 +65,31 @@ def get_facebook_data(account_id, date_preset):
     return report
 
 
-async def send_report(context, chat_id, period):
+async def send_report(context, chat_id, period, date_label=''):
     for acc in AD_ACCOUNTS:
-        msg = get_facebook_data(acc, period)
+        msg = get_facebook_data(acc, period, date_label)
         await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='MarkdownV2')
+
+
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == 'Сегодня':
+        date_label = datetime.now().strftime('%d.%m.%Y')
+        await send_report(context, update.message.chat_id, 'today', date_label)
+    elif text == 'Вчера':
+        date_label = (datetime.now() - timedelta(days=1)).strftime('%d.%m.%Y')
+        await send_report(context, update.message.chat_id, 'yesterday', date_label)
+    elif text == 'Прошедшая неделя':
+        until = datetime.now() - timedelta(days=1)
+        since = until - timedelta(days=6)
+        period = {'since': since.strftime('%Y-%m-%d'), 'until': until.strftime('%Y-%m-%d')}
+        date_label = f"{since.strftime('%d.%m')}-{until.strftime('%d.%m')}"
+        await send_report(context, update.message.chat_id, period, date_label)
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    reply_keyboard = [['Сегодня', 'Вчера', 'Прошедшая неделя']]
+    await update.message.reply_text('🤖 Выберите отчёт:', reply_markup=ReplyKeyboardMarkup(reply_keyboard, resize_keyboard=True))
 
 
 async def check_billing(context: ContextTypes.DEFAULT_TYPE):
@@ -88,24 +110,6 @@ async def check_billing(context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='MarkdownV2')
 
         previous_balances[account_id] = current_balance
-
-
-async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    if text == 'Сегодня':
-        await send_report(context, update.message.chat_id, 'today')
-    elif text == 'Вчера':
-        await send_report(context, update.message.chat_id, 'yesterday')
-    elif text == 'Прошедшая неделя':
-        until = datetime.now() - timedelta(days=1)
-        since = until - timedelta(days=6)
-        period = {'since': since.strftime('%Y-%m-%d'), 'until': until.strftime('%Y-%m-%d')}
-        await send_report(context, update.message.chat_id, period)
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    reply_keyboard = [['Сегодня', 'Вчера', 'Прошедшая неделя']]
-    await update.message.reply_text('🤖 Выберите отчёт:', reply_markup=ReplyKeyboardMarkup(reply_keyboard, resize_keyboard=True))
 
 
 app = Application.builder().token(TELEGRAM_TOKEN).build()
