@@ -65,7 +65,7 @@ async def send_report(context, chat_id, period, date_label=''):
         await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='HTML')
 
 
-async def check_account_status(context: ContextTypes.DEFAULT_TYPE):
+async def check_billing(context: ContextTypes.DEFAULT_TYPE):
     global account_statuses
     for account_id in AD_ACCOUNTS:
         account = AdAccount(account_id)
@@ -74,7 +74,7 @@ async def check_account_status(context: ContextTypes.DEFAULT_TYPE):
 
         if account_id in account_statuses and account_statuses[account_id] == 1 and current_status != 1:
             message = (
-                f"🔴 Аккаунт отключён из-за проблем с оплатой: <b>{account_info.get('name', 'Неизвестный аккаунт')}</b>"
+                f"⚠️ Аккаунт <b>{account_info.get('name', 'Неизвестный аккаунт')}</b> был отключён (проблемы с биллингом)."
             )
             await context.bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='HTML')
 
