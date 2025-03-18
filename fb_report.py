@@ -1,6 +1,7 @@
 import asyncio
 import re
 from datetime import datetime, timedelta, time
+from pytz import timezone
 from facebook_business.adobjects.adaccount import AdAccount
 from facebook_business.api import FacebookAdsApi
 from telegram import Update, ReplyKeyboardMarkup
@@ -30,6 +31,9 @@ def is_account_active(account_id):
     except:
         return "🔴"
 
+def format_number(num):
+    return f"{int(num):,}".replace(",", " ")
+
 def get_facebook_data(account_id, date_preset, date_label=''):
     account = AdAccount(account_id)
     fields = ['impressions', 'cpm', 'clicks', 'cpc', 'spend']
@@ -42,18 +46,18 @@ def get_facebook_data(account_id, date_preset, date_label=''):
         return f"⚠ Ошибка: {str(e)}"
 
     date_info = f" ({date_label})" if date_label else ""
-    report = f"<b>{account_name}</b>{date_info} {is_account_active(account_id)}\n"
+    report = f"{is_account_active(account_id)} <b>{account_name}</b>{date_info}\n"
 
     if not insights:
         return report + "Нет данных за выбранный период"
 
     insight = insights[0]
     report += (
-        f"👁 Показы: {insight.get('impressions', '0')}\n"
-        f"🎯 CPM: {round(float(insight.get('cpm', 0)), 2)} USD\n"
-        f"🖱 Клики: {insight.get('clicks', '0')}\n"
-        f"💸 CPC: {round(float(insight.get('cpc', 0)), 2)} USD\n"
-        f"💵 Затраты: {round(float(insight.get('spend', 0)), 2)} USD"
+        f"👁 Показы: {format_number(insight.get('impressions', '0'))}\n"
+        f"🎯 CPM: {round(float(insight.get('cpm', 0)), 2)} $\n"
+        f"🖱 Клики: {format_number(insight.get('clicks', '0'))}\n"
+        f"💸 CPC: {round(float(insight.get('cpc', 0)), 2)} $\n"
+        f"💵 Затраты: {round(float(insight.get('spend', 0)), 2)} $"
     )
     return report
 
@@ -76,7 +80,7 @@ async def check_billing(context: ContextTypes.DEFAULT_TYPE):
         account_statuses[account_id] = current_status
 
 async def daily_report(context: ContextTypes.DEFAULT_TYPE):
-    date_label = (datetime.now() - timedelta(days=1)).strftime('%d.%m.%Y')
+    date_label = (datetime.now(timezone('Asia/Almaty')) - timedelta(days=1)).strftime('%d.%m.%Y')
     await send_report(context, CHAT_ID, 'yesterday', date_label)
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -102,7 +106,7 @@ app = Application.builder().token(TELEGRAM_TOKEN).build()
 app.add_handler(CommandHandler("start", start))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 app.job_queue.run_repeating(check_billing, interval=600, first=10)
-app.job_queue.run_daily(daily_report, time=time(hour=9, minute=30))
+app.job_queue.run_daily(daily_report, time=time(hour=9, minute=30, tzinfo=timezone('Asia/Almaty')))
 
 if __name__ == "__main__":
     print("🚀 Бот запущен и ожидает команд.")
