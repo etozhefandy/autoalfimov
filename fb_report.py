@@ -70,11 +70,13 @@ async def check_billing(context: ContextTypes.DEFAULT_TYPE):
     global account_statuses
     for account_id in AD_ACCOUNTS:
         account = AdAccount(account_id)
-        account_info = account.api_get(fields=['name', 'account_status'])
+        account_info = account.api_get(fields=['name', 'account_status', 'balance'])
         current_status = account_info.get('account_status')
 
         if account_id in account_statuses and account_statuses[account_id] == 1 and current_status != 1:
-            message = f"⚠️ Аккаунт <b>{account_info.get('name')}</b> был отключён (проблемы с биллингом)."
+            account_name = account_info.get('name')
+            balance = float(account_info.get('balance', 0)) / 100
+            message = f"⚠️ ⚠️ ⚠️ Ахтунг! {account_name}! у нас биллинг - {balance:.2f} $"
             await context.bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='HTML')
 
         account_statuses[account_id] = current_status
