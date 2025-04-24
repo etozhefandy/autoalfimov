@@ -16,7 +16,7 @@ AD_ACCOUNTS = [
     "act_1206987573792913", "act_1415004142524014", "act_1333550570916716",
     "act_798205335840576", "act_844229314275496", "act_1108417930211002",
     "act_2342025859327675", "act_508239018969999", "act_1513759385846431",
-    "act_1042955424178074", "act_4030694587199998", "act_953784649195560"
+    "act_1042955424178074"
 ]
 
 TELEGRAM_TOKEN = "8033028841:AAGud3hSZdR8KQiOSaAcwfbkv8P0p-P3Dt4"
@@ -64,11 +64,7 @@ def get_facebook_data(account_id, date_preset, date_label=''):
 async def send_report(context, chat_id, period, date_label=''):
     for acc in AD_ACCOUNTS:
         msg = get_facebook_data(acc, period, date_label)
-        try:
-            await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='HTML')
-        except Exception as e:
-            print(f"Ошибка при отправке отчета: {e}")
-        await asyncio.sleep(1)  # Добавлена пауза между сообщениями
+        await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='HTML')
 
 async def check_billing(context: ContextTypes.DEFAULT_TYPE):
     global account_statuses
@@ -108,7 +104,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_keyboard = [['Сегодня', 'Вчера', 'Прошедшая неделя']]
     await update.message.reply_text('🤖 Выберите отчёт:', reply_markup=ReplyKeyboardMarkup(reply_keyboard, resize_keyboard=True))
 
-app = Application.builder().token(TELEGRAM_TOKEN).request_timeout(60).build()
+app = Application.builder().token(TELEGRAM_TOKEN).build()
 app.add_handler(CommandHandler("start", start))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 app.job_queue.run_repeating(check_billing, interval=600, first=10)
