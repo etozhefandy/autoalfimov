@@ -16,13 +16,24 @@ AD_ACCOUNTS = [
     "act_1206987573792913", "act_1415004142524014", "act_1333550570916716",
     "act_798205335840576", "act_844229314275496", "act_1108417930211002",
     "act_2342025859327675", "act_508239018969999", "act_1513759385846431",
-    "act_1042955424178074"
+    "act_1042955424178074", "act_195526110289107", "act_2145160982589338",
+    "act_4030694587199998"
 ]
 
 TELEGRAM_TOKEN = "8033028841:AAGud3hSZdR8KQiOSaAcwfbkv8P0p-P3Dt4"
 CHAT_ID = "253181449"
 
 account_statuses = {}
+
+message_accounts = {
+    "1415004142524014", "1108417930211002", "2342025859327675",
+    "1333550570916716", "844229314275496", "1206987573792913",
+    "195526110289107", "2145160982589338"
+}
+
+lead_accounts = {
+    "1042955424178074", "4030694587199998", "798205335840576"
+}
 
 def is_account_active(account_id):
     try:
@@ -32,11 +43,11 @@ def is_account_active(account_id):
         return "🔴"
 
 def format_number(num):
-    return f"{int(num):,}".replace(",", " ")
+    return f"{int(float(num)):,}".replace(",", " ")
 
 def get_facebook_data(account_id, date_preset, date_label=''):
     account = AdAccount(account_id)
-    fields = ['impressions', 'cpm', 'clicks', 'cpc', 'spend']
+    fields = ['impressions', 'cpm', 'clicks', 'cpc', 'spend', 'actions']
     params = {'time_range': date_preset, 'level': 'account'} if isinstance(date_preset, dict) else {'date_preset': date_preset, 'level': 'account'}
 
     try:
@@ -59,6 +70,21 @@ def get_facebook_data(account_id, date_preset, date_label=''):
         f"💸 CPC: {round(float(insight.get('cpc', 0)), 2)} $\n"
         f"💵 Затраты: {round(float(insight.get('spend', 0)), 2)} $"
     )
+
+    actions = {action['action_type']: float(action['value']) for action in insight.get('actions', [])}
+
+    if account_id.split("_")[-1] in message_accounts:
+        started = actions.get('onsite_conversion.messaging_conversation_started_7d', 0)
+        cost = round(float(insight.get('spend', 0)) / started, 2) if started else 0
+        report += f"\n✉️ Начата переписка: {int(started)}"
+        report += f"\n💬💲 Цена переписки: {cost} $"
+
+    if account_id.split("_")[-1] in lead_accounts:
+        leads = sum(value for key, value in actions.items() if 'заяв' in key.lower())
+        cost = round(float(insight.get('spend', 0)) / leads, 2) if leads else 0
+        report += f"\n📩 Заявки: {int(leads)}"
+        report += f"\n📩💲 Цена заявки: {cost} $"
+
     return report
 
 async def send_report(context, chat_id, period, date_label=''):
