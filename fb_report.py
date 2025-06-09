@@ -1,5 +1,4 @@
 import asyncio
-import re
 from datetime import datetime, timedelta, time
 from pytz import timezone
 from facebook_business.adobjects.adaccount import AdAccount
@@ -32,15 +31,14 @@ LEAD_FORM_ACCOUNTS = {
 
 TELEGRAM_TOKEN = "8033028841:AAGud3hSZdR8KQiOSaAcwfbkv8P0p-P3Dt4"
 CHAT_ID = "253181449"
-
 account_statuses = {}
 
 def is_account_active(account_id):
     try:
         status = AdAccount(account_id).api_get(fields=['account_status'])['account_status']
-        return "🟢" if status == 1 else "🔴"
+        return "\U0001F7E2" if status == 1 else "\U0001F534"
     except:
-        return "🔴"
+        return "\U0001F534"
 
 def format_number(num):
     return f"{int(float(num)):,}".replace(",", " ")
@@ -103,20 +101,24 @@ async def check_billing(context: ContextTypes.DEFAULT_TYPE):
             account = AdAccount(account_id)
             account_info = account.api_get(fields=['name', 'account_status', 'balance'])
             current_status = account_info.get('account_status')
+
             if account_id in account_statuses and account_statuses[account_id] == 1 and current_status != 1:
                 account_name = account_info.get('name')
                 balance = float(account_info.get('balance', 0)) / 100
                 message = f"⚠️ ⚠️ ⚠️ Ахтунг! {account_name}! у нас биллинг - {balance:.2f} $"
                 await context.bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='HTML')
+
             account_statuses[account_id] = current_status
-        except Exception as e:
-            await context.bot.send_message(chat_id=CHAT_ID, text=f"⚠ Ошибка: {str(e)}")
+        except:
+            await context.bot.send_message(chat_id=CHAT_ID, text=f"⚠ Ошибка: 'account_status'")
 
 async def daily_report(context: ContextTypes.DEFAULT_TYPE):
     date_label = (datetime.now(timezone('Asia/Almaty')) - timedelta(days=1)).strftime('%d.%m.%Y')
     await send_report(context, CHAT_ID, 'yesterday', date_label)
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None:
+        return
     text = update.message.text
     if text == 'Сегодня':
         date_label = datetime.now().strftime('%d.%m.%Y')
@@ -142,5 +144,5 @@ app.job_queue.run_repeating(check_billing, interval=600, first=10)
 app.job_queue.run_daily(daily_report, time=time(hour=9, minute=30, tzinfo=timezone('Asia/Almaty')))
 
 if __name__ == "__main__":
-    print("🚀 Бот запущен и ожидает команд.")
+    print("Бот запущен и ожидает команд.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
