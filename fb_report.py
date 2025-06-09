@@ -92,3 +92,7 @@ def get_facebook_data(account_id, date_preset, date_label=''):
     return report
 
 # Остальная часть кода не менялась
+if __name__ == "__main__":
+    print("Bot started successfully.")
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app.run_polling()
