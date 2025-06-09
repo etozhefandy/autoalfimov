@@ -77,11 +77,12 @@ def get_facebook_data(account_id, date_preset, date_label=''):
         if conv > 0:
             report += f"\n💬💲 Цена переписки: {round(float(insight.get('spend', 0)) / conv, 2)} $"
 
-    if account_id in LEAD_FORM_ACCOUNTS:
-        if account_id == 'act_4030694587199998':
-            leads = actions.get('website_submit_application', 0)
-        else:
-            leads = actions.get('offsite_conversion.fb_pixel_lead', 0) or actions.get('lead', 0) or actions.get('offsite_conversion.fb_pixel_submit_application', 0)
+   if account_id in LEAD_FORM_ACCOUNTS:
+    leads = (
+        actions.get('offsite_conversion.fb_pixel_submit_application', 0) or
+        actions.get('offsite_conversion.fb_pixel_lead', 0) or
+        actions.get('lead', 0)
+    )
 
         report += f"\n📩 Заявки: {int(leads)}"
         if leads > 0:
