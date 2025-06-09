@@ -30,10 +30,6 @@ LEAD_FORM_ACCOUNTS = {
     "act_1042955424178074", "act_4030694587199998", "act_798205335840576"
 }
 
-LEAD_ACTION_NAMES = {
-    "act_4030694587199998": "website_submit_application"
-}
-
 TELEGRAM_TOKEN = "8033028841:AAGud3hSZdR8KQiOSaAcwfbkv8P0p-P3Dt4"
 CHAT_ID = "253181449"
 
@@ -41,10 +37,10 @@ account_statuses = {}
 
 def is_account_active(account_id):
     try:
-        status = AdAccount(account_id).api_get(fields=['account_status'])['account_status']
-        return "\U0001F7E2" if status == 1 else "\U0001F534"
+        status = AdAccount(account_id).api_get(fields=['account_status']).get('account_status')
+        return "🟢" if status == 1 else "🔴"
     except Exception:
-        return "\U0001F534"
+        return "🔴"
 
 def format_number(num):
     return f"{int(float(num)):,}".replace(",", " ")
@@ -58,37 +54,38 @@ def get_facebook_data(account_id, date_preset, date_label=''):
         insights = account.get_insights(fields=fields, params=params)
         account_name = account.api_get(fields=['name'])['name']
     except Exception as e:
-        return f"\u26a0\ufe0f \u041e\u0448\u0438\u0431\u043a\u0430: {str(e)}"
+        return f"⚠ Ошибка: {str(e)}"
 
     date_info = f" ({date_label})" if date_label else ""
-    report = f"{is_account_active(account_id)} <b>{account_name}</b> ({account_id}){date_info}\n"
+    report = f"{is_account_active(account_id)} <b>{account_name}</b>{date_info}\n"
 
     if not insights:
-        return report + "\u041d\u0435\u0442 \u0434\u0430\u043d\u043d\u044b\u0445 \u0437\u0430 \u0432\u044b\u0431\u0440\u0430\u043d\u043d\u044b\u0439 \u043f\u0435\u0440\u0438\u043e\u0434"
+        return report + "Нет данных за выбранный период"
 
     insight = insights[0]
     report += (
-        f"\U0001F441 \u041f\u043e\u043a\u0430\u0437\u044b: {format_number(insight.get('impressions', '0'))}\n"
-        f"\U0001F3AF CPM: {round(float(insight.get('cpm', 0)), 2)} $\n"
-        f"\U0001F5B1 \u041a\u043b\u0438\u043a\u0438: {format_number(insight.get('clicks', '0'))}\n"
-        f"\U0001F4B2 CPC: {round(float(insight.get('cpc', 0)), 2)} $\n"
-        f"\U0001F4B5 \u0417\u0430\u0442\u0440\u0430\u0442\u044b: {round(float(insight.get('spend', 0)), 2)} $"
+        f"👁 Показы: {format_number(insight.get('impressions', '0'))}\n"
+        f"🎯 CPM: {round(float(insight.get('cpm', 0)), 2)} $\n"
+        f"🖱 Клики: {format_number(insight.get('clicks', '0'))}\n"
+        f"💸 CPC: {round(float(insight.get('cpc', 0)), 2)} $\n"
+        f"💵 Затраты: {round(float(insight.get('spend', 0)), 2)} $"
     )
 
     actions = {a['action_type']: float(a['value']) for a in insight.get('actions', [])}
 
     if account_id in MESSAGING_ACCOUNTS:
         conv = actions.get('onsite_conversion.messaging_conversation_started_7d', 0)
-        report += f"\n\u2709\ufe0f \u041d\u0430\u0447\u0430\u0442\u0430 \u043f\u0435\u0440\u0435\u043f\u0438\u0441\u043a\u0430: {int(conv)}"
+        report += f"\n✉️ Начата переписка: {int(conv)}"
         if conv > 0:
-            report += f"\n\U0001F4AC\U0001F4B2 \u0426\u0435\u043d\u0430 \u043f\u0435\u0440\u0435\u043f\u0438\u0441\u043a\u0438: {round(float(insight.get('spend', 0)) / conv, 2)} $"
+            report += f"\n💬💲 Цена переписки: {round(float(insight.get('spend', 0)) / conv, 2)} $"
 
     if account_id in LEAD_FORM_ACCOUNTS:
-        lead_action = LEAD_ACTION_NAMES.get(account_id, 'offsite_conversion.fb_pixel_lead')
-        leads = actions.get(lead_action, 0)
-        report += f"\n\U0001F4E9 \u0417\u0430\u044f\u0432\u043a\u0438: {int(leads)}"
+        leads = actions.get('offsite_conversion.fb_pixel_submit_application', 0) or \
+                actions.get('offsite_conversion.fb_pixel_lead', 0) or \
+                actions.get('lead', 0)
+        report += f"\n📩 Заявки: {int(leads)}"
         if leads > 0:
-            report += f"\n\U0001F4E9\U0001F4B2 \u0426\u0435\u043d\u0430 \u0437\u0430\u044f\u0432\u043a\u0438: {round(float(insight.get('spend', 0)) / leads, 2)} $"
+            report += f"\n📩💲 Цена заявки: {round(float(insight.get('spend', 0)) / leads, 2)} $"
 
     return report
 
@@ -102,25 +99,24 @@ async def check_billing(context: ContextTypes.DEFAULT_TYPE):
     for account_id in AD_ACCOUNTS:
         try:
             account = AdAccount(account_id)
-            account_info = account.api_get(fields=['name', 'account_status', 'balance'])
-            current_status = account_info.get('account_status')
-
-            if account_id in account_statuses and account_statuses[account_id] == 1 and current_status != 1:
-                account_name = account_info.get('name')
-                balance = float(account_info.get('balance', 0)) / 100
-                message = f"\u26a0\ufe0f \u26a0\ufe0f \u26a0\ufe0f \u0410\u0445\u0442\u0443\u043d\u0433! {account_name}! \u0443 \u043d\u0430\u0441 \u0431\u0438\u043b\u043b\u0438\u043d\u0433 - {balance:.2f} $"
-                await context.bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='HTML')
-
-            account_statuses[account_id] = current_status
-        except Exception as e:
-            await context.bot.send_message(chat_id=CHAT_ID, text=f"\u26a0\ufe0f \u041e\u0448\u0438\u0431\u043a\u0430: 'account_status'", parse_mode='HTML')
+            info = account.api_get(fields=['name', 'account_status', 'balance'])
+            status = info.get('account_status')
+            if account_id in account_statuses and account_statuses[account_id] == 1 and status != 1:
+                balance = float(info.get('balance', 0)) / 100
+                name = info.get('name')
+                await context.bot.send_message(chat_id=CHAT_ID, text=f"⚠️ ⚠️ ⚠️ Ахтунг! {name}! у нас биллинг - {balance:.2f} $", parse_mode='HTML')
+            account_statuses[account_id] = status
+        except Exception:
+            await context.bot.send_message(chat_id=CHAT_ID, text=f"⚠ Ошибка: 'account_status'", parse_mode='HTML')
 
 async def daily_report(context: ContextTypes.DEFAULT_TYPE):
     date_label = (datetime.now(timezone('Asia/Almaty')) - timedelta(days=1)).strftime('%d.%m.%Y')
     await send_report(context, CHAT_ID, 'yesterday', date_label)
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text if update.message else ''
+    if not update.message:
+        return
+    text = update.message.text
     if text == 'Сегодня':
         date_label = datetime.now().strftime('%d.%m.%Y')
         await send_report(context, update.message.chat_id, 'today', date_label)
@@ -131,12 +127,12 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         until = datetime.now() - timedelta(days=1)
         since = until - timedelta(days=6)
         period = {'since': since.strftime('%Y-%m-%d'), 'until': until.strftime('%Y-%m-%d')}
-        date_label = f"{since.strftime('%d.%m')}-{until.strftime('%d.%m')}"
-        await send_report(context, update.message.chat_id, period, date_label)
+        label = f"{since.strftime('%d.%m')}-{until.strftime('%d.%m')}"
+        await send_report(context, update.message.chat_id, period, label)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    reply_keyboard = [['Сегодня', 'Вчера', 'Прошедшая неделя']]
-    await update.message.reply_text('🤖 Выберите отчёт:', reply_markup=ReplyKeyboardMarkup(reply_keyboard, resize_keyboard=True))
+    kb = [['Сегодня', 'Вчера', 'Прошедшая неделя']]
+    await update.message.reply_text('🤖 Выберите отчёт:', reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
 
 app = Application.builder().token(TELEGRAM_TOKEN).build()
 app.add_handler(CommandHandler("start", start))
@@ -145,5 +141,5 @@ app.job_queue.run_repeating(check_billing, interval=600, first=10)
 app.job_queue.run_daily(daily_report, time=time(hour=9, minute=30, tzinfo=timezone('Asia/Almaty')))
 
 if __name__ == "__main__":
-    print("\ud83d\ude80 \u0411\u043e\u0442 \u0437\u0430\u043f\u0443\u0449\u0435\u043d \u0438 \u043e\u0436\u0438\u0434\u0430\u0435\u0442 \u043a\u043e\u043c\u0430\u043d\u0434.")
+    print("Бот запущен и ожидает команд.")
     app.run_polling()
