@@ -92,6 +92,12 @@ def get_facebook_data(account_id, date_preset, date_label=''):
     return report
 
 # Остальная часть кода не менялась
+app = Application.builder().token(TELEGRAM_TOKEN).build()
+app.add_handler(CommandHandler("start", start))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+app.job_queue.run_repeating(check_billing, interval=600, first=10)
+app.job_queue.run_daily(daily_report, time=time(hour=9, minute=30, tzinfo=timezone('Asia/Almaty')))
+
 if __name__ == "__main__":
     print("🚀 Бот запущен и ожидает команд.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
