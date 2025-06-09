@@ -1,4 +1,5 @@
 import asyncio
+import re
 from datetime import datetime, timedelta, time
 from pytz import timezone
 from facebook_business.adobjects.adaccount import AdAccount
@@ -31,14 +32,15 @@ LEAD_FORM_ACCOUNTS = {
 
 TELEGRAM_TOKEN = "8033028841:AAGud3hSZdR8KQiOSaAcwfbkv8P0p-P3Dt4"
 CHAT_ID = "253181449"
+
 account_statuses = {}
 
 def is_account_active(account_id):
     try:
         status = AdAccount(account_id).api_get(fields=['account_status'])['account_status']
-        return "\U0001F7E2" if status == 1 else "\U0001F534"
+        return "🟢" if status == 1 else "🔴"
     except:
-        return "\U0001F534"
+        return "🔴"
 
 def format_number(num):
     return f"{int(float(num)):,}".replace(",", " ")
@@ -77,13 +79,12 @@ def get_facebook_data(account_id, date_preset, date_label=''):
         if conv > 0:
             report += f"\n💬💲 Цена переписки: {round(float(insight.get('spend', 0)) / conv, 2)} $"
 
-   if account_id in LEAD_FORM_ACCOUNTS:
-    leads = (
-        actions.get('offsite_conversion.fb_pixel_submit_application', 0) or
-        actions.get('offsite_conversion.fb_pixel_lead', 0) or
-        actions.get('lead', 0)
-    )
-
+    if account_id in LEAD_FORM_ACCOUNTS:
+        leads = (
+            actions.get('offsite_conversion.fb_pixel_submit_application', 0) or
+            actions.get('offsite_conversion.fb_pixel_lead', 0) or
+            actions.get('lead', 0)
+        )
         report += f"\n📩 Заявки: {int(leads)}"
         if leads > 0:
             report += f"\n📩💲 Цена заявки: {round(float(insight.get('spend', 0)) / leads, 2)} $"
@@ -110,16 +111,14 @@ async def check_billing(context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='HTML')
 
             account_statuses[account_id] = current_status
-        except:
-            await context.bot.send_message(chat_id=CHAT_ID, text=f"⚠ Ошибка: 'account_status'")
+        except Exception as e:
+            await context.bot.send_message(chat_id=CHAT_ID, text=f"⚠ Ошибка: {e}", parse_mode='HTML')
 
 async def daily_report(context: ContextTypes.DEFAULT_TYPE):
     date_label = (datetime.now(timezone('Asia/Almaty')) - timedelta(days=1)).strftime('%d.%m.%Y')
     await send_report(context, CHAT_ID, 'yesterday', date_label)
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message is None:
-        return
     text = update.message.text
     if text == 'Сегодня':
         date_label = datetime.now().strftime('%d.%m.%Y')
@@ -131,7 +130,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         until = datetime.now() - timedelta(days=1)
         since = until - timedelta(days=6)
         period = {'since': since.strftime('%Y-%m-%d'), 'until': until.strftime('%Y-%m-%d')}
-        date_label = f"{since.strftime('%d.%m')}-{until.strftime('%d.%m')}"
+        date_label = f"{since.strftime('%d.%m')}-{until.strftime('%d.%m') }"
         await send_report(context, update.message.chat_id, period, date_label)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -145,5 +144,5 @@ app.job_queue.run_repeating(check_billing, interval=600, first=10)
 app.job_queue.run_daily(daily_report, time=time(hour=9, minute=30, tzinfo=timezone('Asia/Almaty')))
 
 if __name__ == "__main__":
-    print("Бот запущен и ожидает команд.")
+    print("\U0001F680 Бот запущен и ожидает команд.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
