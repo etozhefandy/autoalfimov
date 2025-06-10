@@ -166,68 +166,90 @@ app.job_queue.run_daily(check_billing_forecast, time=time(hour=9, minute=0, tzin
 
 
 import json
-import os
 from math import ceil
 
-def load_json(path):
-    if os.path.exists(path):
-        with open(path, 'r') as f:
-            return json.load(f)
-    return {}
+# Путь к кэшу с датами последних отправок
+FORECAST_CACHE_FILE = "forecast_cache.json"
 
-def save_json(path, data):
-    with open(path, 'w') as f:
-        json.dump(data, f)
+# Человекочитаемые названия аккаунтов (для отчёта)
+ACCOUNT_NAMES = {
+    "act_1415004142524014": "ЖС Астана",
+    "act_719853653795521": "ЖС Караганда",
+    "act_1206987573792913": "ЖС Павлодар",
+    "act_1108417930211002": "ЖС Актау",
+    "act_2342025859327675": "ЖС Атырау",
+    "act_844229314275496": "ЖС Актобе",
+    "act_1333550570916716": "ЖС Юг (Алматы)",
+    "act_195526110289107": "ЖС Тараз",
+    "act_2145160982589338": "ЖС Шымкент",
+    "act_1042955424178074": "кенсе 1",
+    "act_4030694587199998": "кенсе 2",
+    "act_508239018969999": "Фитнес Поинт",
+    "act_1357165995492721": "Ария Степи",
+    "act_123456789012345": "Инвестиции"  # заменишь ID, если он другой
+}
+
+def load_forecast_cache():
+    try:
+        with open(FORECAST_CACHE_FILE, "r") as f:
+            return json.load(f)
+    except:
+        return {}
+
+def save_forecast_cache(cache):
+    with open(FORECAST_CACHE_FILE, "w") as f:
+        json.dump(cache, f)
 
 async def check_billing_forecast(context: ContextTypes.DEFAULT_TYPE):
-    ad_accounts = load_json("ad_accounts.json")
-    previous_forecasts = load_json("billing_forecast.json")
-    today = datetime.now(timezone('Asia/Almaty')).date()
-    updated_forecasts = {}
+    cache = load_forecast_cache()
+    today = datetime.now(timezone("Asia/Almaty")).date()
 
-    for acc_id, acc_name in ad_accounts.items():
+    for acc_id in AD_ACCOUNTS:
         try:
-            acc = AdAccount(acc_id)
-            acc_info = acc.api_get(fields=["spend_cap", "amount_spent", "name"])
-            campaigns = acc.get_campaigns(fields=["name", "effective_status", "daily_budget"])
-            
-            spend_cap = float(acc_info.get("spend_cap", 0)) / 100
-            amount_spent = float(acc_info.get("amount_spent", 0)) / 100
-            available = max(spend_cap - amount_spent, 0)
+            account = AdAccount(acc_id)
+            data = account.api_get(fields=["name", "spend_cap", "amount_spent"])
+            spend_cap = float(data.get("spend_cap", 0)) / 100  # cents to dollars
+            amount_spent = float(data.get("amount_spent", 0)) / 100
+            available_to_spend = spend_cap - amount_spent
 
+            # Получаем активные кампании и складываем их бюджеты
+            campaigns = account.get_campaigns(fields=["name", "effective_status", "daily_budget"])
             daily_budget = sum(
-                float(c.get("daily_budget", 0)) / 100
+                int(c.get("daily_budget", 0)) / 100
                 for c in campaigns
-                if c.get("effective_status") == "ACTIVE"
+                if c["effective_status"] == "ACTIVE"
             )
 
             if daily_budget == 0:
-                continue
+                continue  # нечего прогнозировать
 
-            days_left = ceil(available / daily_budget)
-            forecast_date = today + timedelta(days=days_left)
+            days_left = ceil(available_to_spend / daily_budget)
+            billing_date = today + timedelta(days=days_left)
 
-            updated_forecasts[acc_id] = forecast_date.isoformat()
+            # Отправить за 3 дня до предполагаемого списания
+            if (billing_date - today).days == 3:
+                cached_date_str = cache.get(acc_id)
+                if cached_date_str == billing_date.isoformat():
+                    continue  # уже отправляли на эту дату
 
-            if (acc_id not in previous_forecasts or
-                previous_forecasts[acc_id] != forecast_date.isoformat()) and \
-                (forecast_date - today).days == 3:
-
-                text = (
+                acc_name = ACCOUNT_NAMES.get(acc_id, acc_id.replace("act_", ""))
+                message = (
                     f"⚠️ <b>{acc_name}</b>\n\n"
-                    f"Предполагаемое списание: ${spend_cap:.2f}\n"
-                    f"Дата: {forecast_date.strftime('%d.%m.%Y')}\n"
-                    f"До порога осталось: ${available:.2f}\n"
-                    f"Суммарный дневной бюджет: ${daily_budget:.2f}\n"
-                    f"Осталось дней: {days_left}"
+                    f"Предполагаемое списание: <b>{spend_cap:.2f} $</b>\n"
+                    f"Дата: <b>{billing_date.strftime('%d.%m.%Y')}</b>\n"
+                    f"До порога осталось: <b>{available_to_spend:.2f} $</b>\n"
+                    f"Суммарный дневной бюджет: <b>{daily_budget:.2f} $</b>\n"
+                    f"Осталось дней: <b>{days_left}</b>"
                 )
 
-                await context.bot.send_message(chat_id=CHAT_ID, text=text, parse_mode="HTML")
+                await context.bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='HTML')
+                cache[acc_id] = billing_date.isoformat()
 
         except Exception as e:
-            await context.bot.send_message(chat_id=CHAT_ID, text=f"⚠ Ошибка прогноза {acc_name}: {e}")
+            print(f"Ошибка прогноза по {acc_id}: {e}")
 
-    save_json("billing_forecast.json", updated_forecasts)
+    save_forecast_cache(cache)
+
 
 
 if __name__ == "__main__":
