@@ -162,6 +162,73 @@ app.add_handler(CommandHandler("start", start))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 app.job_queue.run_repeating(check_billing, interval=600, first=10)
 app.job_queue.run_daily(daily_report, time=time(hour=9, minute=30, tzinfo=timezone('Asia/Almaty')))
+app.job_queue.run_daily(check_billing_forecast, time=time(hour=9, minute=0, tzinfo=timezone('Asia/Almaty')))
+
+
+import json
+import os
+from math import ceil
+
+def load_json(path):
+    if os.path.exists(path):
+        with open(path, 'r') as f:
+            return json.load(f)
+    return {}
+
+def save_json(path, data):
+    with open(path, 'w') as f:
+        json.dump(data, f)
+
+async def check_billing_forecast(context: ContextTypes.DEFAULT_TYPE):
+    ad_accounts = load_json("ad_accounts.json")
+    previous_forecasts = load_json("billing_forecast.json")
+    today = datetime.now(timezone('Asia/Almaty')).date()
+    updated_forecasts = {}
+
+    for acc_id, acc_name in ad_accounts.items():
+        try:
+            acc = AdAccount(acc_id)
+            acc_info = acc.api_get(fields=["spend_cap", "amount_spent", "name"])
+            campaigns = acc.get_campaigns(fields=["name", "effective_status", "daily_budget"])
+            
+            spend_cap = float(acc_info.get("spend_cap", 0)) / 100
+            amount_spent = float(acc_info.get("amount_spent", 0)) / 100
+            available = max(spend_cap - amount_spent, 0)
+
+            daily_budget = sum(
+                float(c.get("daily_budget", 0)) / 100
+                for c in campaigns
+                if c.get("effective_status") == "ACTIVE"
+            )
+
+            if daily_budget == 0:
+                continue
+
+            days_left = ceil(available / daily_budget)
+            forecast_date = today + timedelta(days=days_left)
+
+            updated_forecasts[acc_id] = forecast_date.isoformat()
+
+            if (acc_id not in previous_forecasts or
+                previous_forecasts[acc_id] != forecast_date.isoformat()) and \
+                (forecast_date - today).days == 3:
+
+                text = (
+                    f"⚠️ <b>{acc_name}</b>\n\n"
+                    f"Предполагаемое списание: ${spend_cap:.2f}\n"
+                    f"Дата: {forecast_date.strftime('%d.%m.%Y')}\n"
+                    f"До порога осталось: ${available:.2f}\n"
+                    f"Суммарный дневной бюджет: ${daily_budget:.2f}\n"
+                    f"Осталось дней: {days_left}"
+                )
+
+                await context.bot.send_message(chat_id=CHAT_ID, text=text, parse_mode="HTML")
+
+        except Exception as e:
+            await context.bot.send_message(chat_id=CHAT_ID, text=f"⚠ Ошибка прогноза {acc_name}: {e}")
+
+    save_json("billing_forecast.json", updated_forecasts)
+
 
 if __name__ == "__main__":
     print("\U0001F680 Бот запущен и ожидает команд.")
