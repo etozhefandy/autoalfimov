@@ -4,8 +4,8 @@ from datetime import datetime, timedelta, time
 from pytz import timezone
 from facebook_business.adobjects.adaccount import AdAccount
 from facebook_business.api import FacebookAdsApi
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+from telegram import Update, ReplyKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 ACCESS_TOKEN = "EAASZCrBwhoH0BO7xBXr2h2sGTzvWzUyViJjnrXIvmI5w3uRQOszdntxDiFYxXH4hrKTmZBaPKtuthKuNx3rexRev5zAkby2XbrM5UmwzRGz8a2Q4WBDKp3d1ZCZAAhZCeWFBObQayL4XPwrOFQUtuPcGP5XVYubaXjZCsNT467yKBg90O71oVPZCbI0FrWcZAZC4GtgZDZD"
 APP_ID = "1336645834088573"
@@ -25,7 +25,8 @@ AD_ACCOUNTS = [
     "act_1042955424178074",  # кенсе 1
     "act_4030694587199998",  # кенсе 2
     "act_508239018969999",   # фитнес поинт
-    "act_1357165995492721"    # Ария степи
+    "act_1357165995492721",  # Ария степи
+    "act_798205335840576"     # инвестиции
 ]
 
 MESSAGING_ACCOUNTS = {
@@ -36,7 +37,8 @@ MESSAGING_ACCOUNTS = {
     "act_844229314275496",
     "act_1206987573792913",
     "act_195526110289107",
-    "act_2145160982589338"
+    "act_2145160982589338",
+    "act_719853653795521"  # ЖС Караганда теперь с переписками
 }
 
 LEAD_FORM_ACCOUNTS = {
@@ -95,12 +97,14 @@ def get_facebook_data(account_id, date_preset, date_label=''):
             report += f"\n💬💲 Цена переписки: {round(float(insight.get('spend', 0)) / conv, 2)} $"
 
     if account_id in LEAD_FORM_ACCOUNTS:
-        leads = (
-            actions.get('Website Submit Applications', 0) if account_id == 'act_4030694587199998'
-            else actions.get('offsite_conversion.fb_pixel_submit_application', 0) or
-                 actions.get('offsite_conversion.fb_pixel_lead', 0) or
-                 actions.get('lead', 0)
-        )
+        if account_id == 'act_4030694587199998':
+            leads = actions.get('Website Submit Applications', 0)
+        else:
+            leads = (
+                actions.get('offsite_conversion.fb_pixel_submit_application', 0) or
+                actions.get('offsite_conversion.fb_pixel_lead', 0) or
+                actions.get('lead', 0)
+            )
         report += f"\n📩 Заявки: {int(leads)}"
         if leads > 0:
             report += f"\n📩💲 Цена заявки: {round(float(insight.get('spend', 0)) / leads, 2)} $"
@@ -134,37 +138,31 @@ async def daily_report(context: ContextTypes.DEFAULT_TYPE):
     date_label = (datetime.now(timezone('Asia/Almaty')) - timedelta(days=1)).strftime('%d.%m.%Y')
     await send_report(context, CHAT_ID, 'yesterday', date_label)
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("Сегодня", callback_data='today')],
-        [InlineKeyboardButton("Вчера", callback_data='yesterday')],
-        [InlineKeyboardButton("Прошедшая неделя", callback_data='last_week')],
-    ]
-    await update.message.reply_text('🤖 Выберите отчёт:', reply_markup=InlineKeyboardMarkup(keyboard))
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    if query.data == 'today':
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == 'Сегодня':
         date_label = datetime.now().strftime('%d.%m.%Y')
-        await send_report(context, query.message.chat.id, 'today', date_label)
-    elif query.data == 'yesterday':
+        await send_report(context, update.message.chat_id, 'today', date_label)
+    elif text == 'Вчера':
         date_label = (datetime.now() - timedelta(days=1)).strftime('%d.%m.%Y')
-        await send_report(context, query.message.chat.id, 'yesterday', date_label)
-    elif query.data == 'last_week':
+        await send_report(context, update.message.chat_id, 'yesterday', date_label)
+    elif text == 'Прошедшая неделя':
         until = datetime.now() - timedelta(days=1)
         since = until - timedelta(days=6)
         period = {'since': since.strftime('%Y-%m-%d'), 'until': until.strftime('%Y-%m-%d')}
         date_label = f"{since.strftime('%d.%m')}-{until.strftime('%d.%m')}"
-        await send_report(context, query.message.chat.id, period, date_label)
+        await send_report(context, update.message.chat_id, period, date_label)
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    reply_keyboard = [['Сегодня', 'Вчера', 'Прошедшая неделя']]
+    await update.message.reply_text('🤖 Выберите отчёт:', reply_markup=ReplyKeyboardMarkup(reply_keyboard, resize_keyboard=True))
 
 app = Application.builder().token(TELEGRAM_TOKEN).build()
 app.add_handler(CommandHandler("start", start))
-app.add_handler(CallbackQueryHandler(button_handler))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 app.job_queue.run_repeating(check_billing, interval=600, first=10)
 app.job_queue.run_daily(daily_report, time=time(hour=9, minute=30, tzinfo=timezone('Asia/Almaty')))
 
 if __name__ == "__main__":
-    print("🚀 Бот запущен и ожидает команд.")
+    print("\U0001F680 Бот запущен и ожидает команд.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
