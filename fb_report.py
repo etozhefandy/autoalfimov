@@ -2,7 +2,6 @@
 import os
 import asyncio
 import json
-import re
 from math import ceil
 from datetime import datetime, timedelta, time
 from pytz import timezone
@@ -13,21 +12,29 @@ from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # ========= НАСТРОЙКИ =========
-# Токен из переменной окружения (так безопаснее и не ломается при копипасте)
-ACCESS_TOKEN = (os.getenv("EAASZCrBwhoH0BPdPmD8GLCxCSDZBFJDAP9C2VJjbQl3W9ZBsNiRMyKHK8fvZATnBVKDxtcJizibfMBta2wr7MRjHgj6Hv9uXDz619r9WKMBmaSqwE6mmgNDkkx3ZC7Qp80PvYHbKCUAp9sbIUdxjk0UFfVYTgs1zs0mbLz3VvkulI4RrbuUTzLsloFI4ExQZDZD") or "").strip()
 APP_ID = "1336645834088573"
 APP_SECRET = "01bf23c5f726c59da318daa82dd0e9dc"
 
-def _assert_token_ok(tok: str):
-    if not tok or len(tok) < 50:
-        raise ValueError("EAASZCrBwhoH0BPdPmD8GLCxCSDZBFJDAP9C2VJjbQl3W9ZBsNiRMyKHK8fvZATnBVKDxtcJizibfMBta2wr7MRjHgj6Hv9uXDz619r9WKMBmaSqwE6mmgNDkkx3ZC7Qp80PvYHbKCUAp9sbIUdxjk0UFfVYTgs1zs0mbLz3VvkulI4RrbuUTzLsloFI4ExQZDZD")
+def _read_access_token() -> str:
+    tok = (os.getenv("EAASZCrBwhoH0BPdPmD8GLCxCSDZBFJDAP9C2VJjbQl3W9ZBsNiRMyKHK8fvZATnBVKDxtcJizibfMBta2wr7MRjHgj6Hv9uXDz619r9WKMBmaSqwE6mmgNDkkx3ZC7Qp80PvYHbKCUAp9sbIUdxjk0UFfVYTgs1zs0mbLz3VvkulI4RrbuUTzLsloFI4ExQZDZD") or "").strip()
+    if not tok:
+        print("⚠ FB_ACCESS_TOKEN не задан. Бот запустится, но запросы к Facebook будут падать.")
+        return tok
+    if len(tok) < 50:
+        print("⚠ FB_ACCESS_TOKEN выглядит коротким. Проверьте, что подставили Long-Lived токен.")
+    # Предупредим, но не упадём, если есть лишние символы
     try:
         tok.encode("ascii")
     except UnicodeEncodeError:
-        raise ValueError("EAASZCrBwhoH0BPdPmD8GLCxCSDZBFJDAP9C2VJjbQl3W9ZBsNiRMyKHK8fvZATnBVKDxtcJizibfMBta2wr7MRjHgj6Hv9uXDz619r9WKMBmaSqwE6mmgNDkkx3ZC7Qp80PvYHbKCUAp9sbIUdxjk0UFfVYTgs1zs0mbLz3VvkulI4RrbuUTzLsloFI4ExQZDZD")
+        print("⚠ Похоже, в FB_ACCESS_TOKEN затесились не-ASCII символы (возможно, кириллица). Проверьте копипаст.")
+    return tok
 
-_assert_token_ok(ACCESS_TOKEN)
-FacebookAdsApi.init(APP_ID, APP_SECRET, ACCESS_TOKEN)
+ACCESS_TOKEN = _read_access_token()
+if ACCESS_TOKEN:
+    try:
+        FacebookAdsApi.init(APP_ID, APP_SECRET, ACCESS_TOKEN)
+    except Exception as e:
+        print(f"⚠ Не удалось инициализировать Facebook API: {e}")
 
 # Порядок отчётов:
 AD_ACCOUNTS = [
@@ -60,13 +67,11 @@ MESSAGING_ACCOUNTS = {
     "act_195526110289107",   # ЖС Тараз
     "act_2145160982589338",  # ЖС Шымкент
     "act_719853653795521",   # ЖС Караганда
-    # при необходимости сюда можно добавить ещё
 }
 
 # Аккаунты, где считаем заявки с сайта (submit application / lead pixel)
 LEAD_FORM_ACCOUNTS = {
     "act_798205335840576",   # Инвестиции
-    # Кенсе удалены по твоей просьбе
 }
 
 ACCOUNT_NAMES = {
@@ -89,7 +94,7 @@ ACCOUNT_NAMES = {
 }
 
 TELEGRAM_TOKEN = "8033028841:AAGud3hSZdR8KQiOSaAcwfbkv8P0p-P3Dt4"
-CHAT_ID = "-1002679045097"  # группа
+CHAT_ID = "-1002679045097"
 FORECAST_CACHE_FILE = "forecast_cache.json"
 
 account_statuses = {}
@@ -98,8 +103,7 @@ def is_account_active(account_id):
     try:
         status = AdAccount(account_id).api_get(fields=['account_status'])['account_status']
         return "🟢" if status == 1 else "🔴"
-    except FacebookRequestError as e:
-        # если нет прав/токен плохой — считаем как недоступный, не валим всё
+    except FacebookRequestError:
         return "🔴"
     except Exception:
         return "🔴"
@@ -117,11 +121,10 @@ def get_facebook_data(account_id, date_preset, date_label=''):
         insights = account.get_insights(fields=fields, params=params)
         account_name = account.api_get(fields=['name'])['name']
     except FacebookRequestError as e:
-        # code 190 — токен битый/просрочен
-        if getattr(e, "api_error_code", None) == 190:
+        code = getattr(e, "api_error_code", None)
+        if code == 190:
             return "⚠ Токен Facebook невалиден (code 190). Обновите FB_ACCESS_TOKEN."
-        # code 200/403 — нет прав/удалили партнёра
-        return f"⚠ Нет доступа к аккаунту {account_id.replace('act_','')} ({e.api_error_code}). Пропускаю."
+        return f"⚠ Нет доступа к аккаунту {account_id.replace('act_','')} ({code}). Пропускаю."
     except Exception as e:
         return f"⚠ Ошибка: {str(e)}"
 
@@ -140,7 +143,6 @@ def get_facebook_data(account_id, date_preset, date_label=''):
         f"💵 Затраты: {round(float(insight.get('spend', 0)), 2)} $"
     )
 
-    # Actions для доп.метрик
     actions_list = insight.get('actions', []) or []
     actions = {a.get('action_type'): float(a.get('value', 0)) for a in actions_list if a.get('action_type')}
 
@@ -152,7 +154,7 @@ def get_facebook_data(account_id, date_preset, date_label=''):
             spend = float(insight.get('spend', 0))
             report += f"\n💬💲 Цена переписки: {round(spend / conv, 2)} $"
 
-    # Заявки с сайта (только для отмеченных аккаунтов)
+    # Заявки с сайта (только отмеченные аккаунты)
     if account_id in LEAD_FORM_ACCOUNTS:
         leads = (
             actions.get('offsite_conversion.fb_pixel_submit_application', 0) or
@@ -178,7 +180,6 @@ async def check_billing(context: ContextTypes.DEFAULT_TYPE):
             account = AdAccount(account_id)
             info = account.api_get(fields=['name', 'account_status', 'balance'])
             status = info.get('account_status')
-            # сменился с 1 (OK) на другой — тревога
             if account_id in account_statuses and account_statuses[account_id] == 1 and status != 1:
                 name = info.get('name')
                 balance = float(info.get('balance', 0)) / 100
@@ -189,9 +190,7 @@ async def check_billing(context: ContextTypes.DEFAULT_TYPE):
                 )
             account_statuses[account_id] = status
         except FacebookRequestError as e:
-            if getattr(e, "api_error_code", None) == 190:
-                await context.bot.send_message(chat_id=CHAT_ID, text="⚠ Токен Facebook невалиден (code 190). Обновите FB_ACCESS_TOKEN.", parse_mode='HTML')
-            # нет прав/удалили партнёра — просто пропускаем
+            # нет прав/удалили партнёра/битый токен — молча пропускаем
             continue
         except Exception:
             continue
@@ -217,7 +216,6 @@ async def check_billing_forecast(context: ContextTypes.DEFAULT_TYPE):
             spent = float(info.get("amount_spent", 0)) / 100
             available = spend_cap - spent
 
-            # суммарный дневной бюджет активных кампаний
             daily_budget = 0.0
             for c in acc.get_campaigns(fields=["name", "effective_status", "daily_budget"]):
                 if c.get("effective_status") == "ACTIVE":
@@ -229,10 +227,9 @@ async def check_billing_forecast(context: ContextTypes.DEFAULT_TYPE):
             days_left = ceil(max(0.0, available) / daily_budget)
             billing_date = today + timedelta(days=days_left)
 
-            # шлём за 3 дня до даты
             if (billing_date - today).days == 3:
                 if cache.get(acc_id) == billing_date.isoformat():
-                    continue  # уже отправляли
+                    continue
                 name = ACCOUNT_NAMES.get(acc_id, acc_id.replace("act_", ""))
                 msg = (
                     f"⚠️ <b>{name}</b>\n\n"
@@ -245,8 +242,7 @@ async def check_billing_forecast(context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode='HTML')
                 cache[acc_id] = billing_date.isoformat()
 
-        except FacebookRequestError as e:
-            # токен/доступ — молча пропустим, чтобы не шуметь ежедневно
+        except FacebookRequestError:
             continue
         except Exception:
             continue
@@ -259,7 +255,6 @@ async def check_billing_forecast(context: ContextTypes.DEFAULT_TYPE):
 
 # ===== Хэндлеры =====
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # защита от service updates, где нет message.text
     if not update.message or not update.message.text:
         return
     text = update.message.text.strip()
@@ -267,7 +262,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         label = datetime.now().strftime('%d.%m.%Y')
         await send_report(context, update.message.chat_id, 'today', label)
     elif text == 'Вчера':
-        label = (datetime.now() - timedelta(days=1)).strftime('%d.%м.%Y')
+        label = (datetime.now() - timedelta(days=1)).strftime('%d.%m.%Y')
         await send_report(context, update.message.chat_id, 'yesterday', label)
     elif text == 'Прошедшая неделя':
         until = datetime.now() - timedelta(days=1)
@@ -285,11 +280,8 @@ app = Application.builder().token(TELEGRAM_TOKEN).build()
 app.add_handler(CommandHandler("start", start))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
-# раз в 10 минут проверка статусов/биллинга
 app.job_queue.run_repeating(check_billing, interval=600, first=10)
-# ежедневный отчёт вчерашнего дня в 09:30 (+5)
 app.job_queue.run_daily(daily_report, time=time(hour=9, minute=30, tzinfo=timezone('Asia/Almaty')))
-# прогноз списаний в 09:00 (+5)
 app.job_queue.run_daily(check_billing_forecast, time=time(hour=9, minute=0, tzinfo=timezone('Asia/Almaty')))
 
 if __name__ == "__main__":
