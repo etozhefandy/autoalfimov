@@ -208,7 +208,6 @@ async def check_billing_forecast(context: ContextTypes.DEFAULT_TYPE):
 # ================== ХЭНДЛЕРЫ ТЕЛЕГРАМ ==================
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обрабатывает обычный текст (кнопки 'Сегодня'/'Вчера'/ 'Прошедшая неделя')."""
-    print("Update:", update)
     msg = getattr(update, "message", None)
     if not msg or not msg.text:
         return  # не текст — выходим
@@ -216,7 +215,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = msg.text.strip().lower()
 
     if text in ("сегодня", "today"):
-        date_label = datetime.now().strftime('%d.%m.%Y')
+        date_label = datetime.now().strftime('%d.%м.%Y')
         await send_report(context, msg.chat_id, 'today', date_label)
     elif text in ("вчера", "yesterday"):
         date_label = (datetime.now() - timedelta(days=1)).strftime('%d.%m.%Y')
@@ -235,7 +234,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [['Сегодня', 'Вчера', 'Прошедшая неделя']]
     await update.message.reply_text('🤖 Выберите отчёт:', reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
 
-# Слэш-команды на всякий случай
+# Слэш-команды — только латиницей!
 async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     date_label = datetime.now().strftime('%d.%m.%Y')
     await send_report(context, update.message.chat_id, 'today', date_label)
@@ -261,11 +260,11 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ================== APP & JOBS ==================
 app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-# Команды
+# Команды (Только латиница)
 app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler(["today", "сегодня"], cmd_today))
-app.add_handler(CommandHandler(["yesterday", "вчера"], cmd_yesterday))
-app.add_handler(CommandHandler(["week", "неделя"], cmd_week))
+app.add_handler(CommandHandler("today", cmd_today))
+app.add_handler(CommandHandler("yesterday", cmd_yesterday))
+app.add_handler(CommandHandler("week", cmd_week))
 
 # Кнопки (текст)
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
