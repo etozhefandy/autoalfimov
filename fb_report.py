@@ -15,31 +15,69 @@ APP_ID = "1336645834088573"
 APP_SECRET = "01bf23c5f726c59da318daa82dd0e9dc"
 FacebookAdsApi.init(APP_ID, APP_SECRET, ACCESS_TOKEN)
 
+# Порядок отчёта (вставил Шымкент 2 сразу после первого Шымкента)
 AD_ACCOUNTS = [
-    "act_1415004142524014", "act_719853653795521", "act_1206987573792913", "act_1108417930211002",
-    "act_2342025859327675", "act_844229314275496", "act_1333550570916716", "act_195526110289107",
-    "act_2145160982589338", "act_1042955424178074", "act_4030694587199998", "act_508239018969999",
-    "act_1357165995492721", "act_798205335840576"
+    "act_1415004142524014",  # ЖС Астана
+    "act_719853653795521",   # ЖС Караганда
+    "act_1206987573792913",  # ЖС Павлодар
+    "act_1108417930211002",  # ЖС Актау
+    "act_2342025859327675",  # ЖС Атырау
+    "act_844229314275496",   # ЖС Актобе
+    "act_1333550570916716",  # ЖС Юг (Алматы)
+    "act_195526110289107",   # ЖС Тараз
+    "act_2145160982589338",  # ЖС Шымкент
+    "act_2183299115451405",  # ЖС Шымкент 2  ← добавлен рядом
+    # далее прочие
+    "act_1042955424178074",  # кенсе 1
+    "act_4030694587199998",  # кенсе 2
+    "act_508239018969999",   # Фитнес Поинт
+    "act_1357165995492721",  # Ария Степи
+    "act_798205335840576",   # Инвестиции
+    "act_2310940436006402",  # Тепло Алматы  ← новый
+    "act_776865548258700",   # Шанхай Ташкент ← новый
+    "act_1104357140269368",  # Тепло Ташкент  ← новый
 ]
 
+# Аккаунты, для которых показываем переписки
 MESSAGING_ACCOUNTS = {
-    "act_1415004142524014", "act_1108417930211002", "act_2342025859327675", "act_1333550570916716",
-    "act_844229314275496", "act_1206987573792913", "act_195526110289107", "act_2145160982589338",
-    "act_719853653795521"
+    "act_1415004142524014",
+    "act_1108417930211002",
+    "act_2342025859327675",
+    "act_1333550570916716",
+    "act_844229314275496",
+    "act_1206987573792913",
+    "act_195526110289107",
+    "act_2145160982589338",
+    "act_719853653795521",
+    "act_2183299115451405",  # ЖС Шымкент 2 ← добавлен
 }
 
+# Аккаунты, для которых считаем заявки
 LEAD_FORM_ACCOUNTS = {
-    "act_1042955424178074", "act_4030694587199998", "act_798205335840576"
+    "act_1042955424178074",
+    "act_4030694587199998",
+    "act_798205335840576"
 }
 
 ACCOUNT_NAMES = {
-    "act_1415004142524014": "ЖС Астана", "act_719853653795521": "ЖС Караганда",
-    "act_1206987573792913": "ЖС Павлодар", "act_1108417930211002": "ЖС Актау",
-    "act_2342025859327675": "ЖС Атырау", "act_844229314275496": "ЖС Актобе",
-    "act_1333550570916716": "ЖС Юг (Алматы)", "act_195526110289107": "ЖС Тараз",
-    "act_2145160982589338": "ЖС Шымкент", "act_1042955424178074": "кенсе 1",
-    "act_4030694587199998": "кенсе 2", "act_508239018969999": "Фитнес Поинт",
-    "act_1357165995492721": "Ария Степи", "act_798205335840576": "Инвестиции"
+    "act_1415004142524014": "ЖС Астана",
+    "act_719853653795521": "ЖС Караганда",
+    "act_1206987573792913": "ЖС Павлодар",
+    "act_1108417930211002": "ЖС Актау",
+    "act_2342025859327675": "ЖС Атырау",
+    "act_844229314275496": "ЖС Актобе",
+    "act_1333550570916716": "ЖС Юг (Алматы)",
+    "act_195526110289107": "ЖС Тараз",
+    "act_2145160982589338": "ЖС Шымкент",
+    "act_2183299115451405": "ЖС Шымкент 2",        # ← новый
+    "act_1042955424178074": "кенсе 1",
+    "act_4030694587199998": "кенсе 2",
+    "act_508239018969999": "Фитнес Поинт",
+    "act_1357165995492721": "Ария Степи",
+    "act_798205335840576": "Инвестиции",
+    "act_2310940436006402": "Тепло Алматы",        # ← новый
+    "act_776865548258700":  "Шанхай Ташкент",      # ← новый
+    "act_1104357140269368": "Тепло Ташкент",       # ← новый
 }
 
 TELEGRAM_TOKEN = "8033028841:AAGud3hSZdR8KQiOSaAcwfbkv8P0p-P3Dt4"
@@ -54,7 +92,6 @@ def is_account_active(account_id):
         status = AdAccount(account_id).api_get(fields=['account_status'])['account_status']
         return "🟢" if status == 1 else "🔴"
     except Exception:
-        # Тихо игнорируем недоступные аккаунты
         return "🔴"
 
 def format_number(num):
@@ -71,7 +108,7 @@ def get_facebook_data(account_id, date_preset, date_label=''):
 
     try:
         insights = account.get_insights(fields=fields, params=params)
-        account_name = account.api_get(fields=['name'])['name']
+        account_name = ACCOUNT_NAMES.get(account_id, account.api_get(fields=['name'])['name'])
     except Exception:
         # Недоступен/нет прав — полностью пропускаем этот аккаунт
         return ""
@@ -125,7 +162,7 @@ async def send_report(context, chat_id, period, date_label=''):
         if not msg:
             continue  # тихо пропускаем недоступные аккаунты
         await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='HTML')
-        await asyncio.sleep(0.2)  # чуть замедлим, чтобы не упереться в лимиты
+        await asyncio.sleep(0.2)
 
 # ================== БИЛЛИНГ И ПРОГНОЗ ==================
 async def check_billing(context: ContextTypes.DEFAULT_TYPE):
@@ -135,9 +172,8 @@ async def check_billing(context: ContextTypes.DEFAULT_TYPE):
             account = AdAccount(account_id)
             info = account.api_get(fields=['name', 'account_status', 'balance'])
             status = info.get('account_status')
-            # уведомление только при переходе из активного (1) в неактивный
             if account_id in account_statuses and account_statuses[account_id] == 1 and status != 1:
-                name = info.get('name')
+                name = ACCOUNT_NAMES.get(account_id, info.get('name'))
                 balance = float(info.get('balance', 0)) / 100
                 await context.bot.send_message(
                     chat_id=CHAT_ID,
@@ -146,7 +182,6 @@ async def check_billing(context: ContextTypes.DEFAULT_TYPE):
                 )
             account_statuses[account_id] = status
         except Exception:
-            # нет доступа/ошибка — молча пропускаем
             continue
 
 async def daily_report(context: ContextTypes.DEFAULT_TYPE):
@@ -169,7 +204,6 @@ async def check_billing_forecast(context: ContextTypes.DEFAULT_TYPE):
             spent = float(info.get("amount_spent", 0)) / 100
             available = spend_cap - spent
 
-            # суммарный дневной бюджет активных кампаний
             daily_budget = 0.0
             for c in acc.get_campaigns(fields=["name", "effective_status", "daily_budget"]):
                 if c.get("effective_status") == "ACTIVE":
@@ -183,7 +217,7 @@ async def check_billing_forecast(context: ContextTypes.DEFAULT_TYPE):
 
             if (billing_date - today).days == 3:
                 if cache.get(acc_id) == billing_date.isoformat():
-                    continue  # уже отправляли для этой даты
+                    continue
                 name = ACCOUNT_NAMES.get(acc_id, acc_id)
                 msg = (
                     f"⚠️ <b>{name}</b>\n\n"
@@ -196,7 +230,6 @@ async def check_billing_forecast(context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode='HTML')
                 cache[acc_id] = billing_date.isoformat()
         except Exception:
-            # нет прав/ошибка — просто пропускаем
             continue
 
     try:
@@ -207,15 +240,13 @@ async def check_billing_forecast(context: ContextTypes.DEFAULT_TYPE):
 
 # ================== ХЭНДЛЕРЫ ТЕЛЕГРАМ ==================
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает обычный текст (кнопки 'Сегодня'/'Вчера'/ 'Прошедшая неделя')."""
     msg = getattr(update, "message", None)
     if not msg or not msg.text:
-        return  # не текст — выходим
-
+        return
     text = msg.text.strip().lower()
 
     if text in ("сегодня", "today"):
-        date_label = datetime.now().strftime('%d.%м.%Y')
+        date_label = datetime.now().strftime('%d.%m.%Y')
         await send_report(context, msg.chat_id, 'today', date_label)
     elif text in ("вчера", "yesterday"):
         date_label = (datetime.now() - timedelta(days=1)).strftime('%d.%m.%Y')
@@ -234,13 +265,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [['Сегодня', 'Вчера', 'Прошедшая неделя']]
     await update.message.reply_text('🤖 Выберите отчёт:', reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
 
-# Слэш-команды — только латиницей!
 async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     date_label = datetime.now().strftime('%d.%m.%Y')
     await send_report(context, update.message.chat_id, 'today', date_label)
 
 async def cmd_yesterday(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    date_label = (datetime.now() - timedelta(days=1)).strftime('%d.%m.%Y')
+    date_label = (datetime.now() - timedelta(days=1)).strftime('%d.%м.%Y')
     await send_report(context, update.message.chat_id, 'yesterday', date_label)
 
 async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -251,7 +281,6 @@ async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_report(context, update.message.chat_id, period, date_label)
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Логируем, но не спамим в чат
     try:
         print(f"⚠ Ошибка: {context.error}")
     except Exception:
@@ -260,19 +289,13 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ================== APP & JOBS ==================
 app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-# Команды (Только латиница)
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("today", cmd_today))
 app.add_handler(CommandHandler("yesterday", cmd_yesterday))
 app.add_handler(CommandHandler("week", cmd_week))
-
-# Кнопки (текст)
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
-
-# Ошибки
 app.add_error_handler(on_error)
 
-# Джобы
 app.job_queue.run_repeating(check_billing, interval=600, first=10)
 app.job_queue.run_daily(daily_report, time=time(hour=9, minute=30, tzinfo=timezone('Asia/Almaty')))
 app.job_queue.run_daily(check_billing_forecast, time=time(hour=9, minute=0, tzinfo=timezone('Asia/Almaty')))
