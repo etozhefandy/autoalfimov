@@ -12,15 +12,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 ACCESS_TOKEN = "EAASZCrBwhoH0BO7xBXr2h2sGTzvWzUyViJjnrXIvmI5w3uRQOszdntxDiFYxXH4hrKTmZBaPKtuthKuNx3rexRev5zAkby2XbrM5UmwzRGz8a2Q4WBDKp3d1ZCZAAhZCeWFBObQayL4XPwrOFQUtuPcGP5XVYubaXjZCsNT467yKBg90O71oVPZCbI0FrWcZAZC4GtgZDZD"
 APP_ID = "1336645834088573"
 APP_SECRET = "01bf23c5f726c59da318daa82dd0e9dc"
-
-# ── важное: безопасная инициализация SDK перед любым API-вызовом
-def ensure_fb_api():
-    try:
-        api = FacebookAdsApi.get_default_api()
-    except Exception:
-        api = None
-    if api is None:
-        FacebookAdsApi.init(APP_ID, APP_SECRET, ACCESS_TOKEN)
+FacebookAdsApi.init(APP_ID, APP_SECRET, ACCESS_TOKEN)
 
 AD_ACCOUNTS = [
     "act_1415004142524014", "act_719853653795521", "act_1206987573792913", "act_1108417930211002",
@@ -55,19 +47,29 @@ FORECAST_CACHE_FILE = "forecast_cache.json"
 
 account_statuses = {}
 
+# --------- утилиты ---------
+
+def _is_permission_error(err: Exception) -> bool:
+    """Возвращает True, если ошибка — отсутствие прав на ад-аккаунт (403 / code 200)."""
+    s = str(err)
+    return ("Ad account owner has NOT grant" in s) or ('"code": 200' in s) or "Permissions" in s
+
 def is_account_active(account_id):
     try:
-        ensure_fb_api()
         status = AdAccount(account_id).api_get(fields=['account_status'])['account_status']
         return "🟢" if status == 1 else "🔴"
-    except:
+    except Exception as e:
+        # если нет прав — считаем как «не активен», но молча
+        if _is_permission_error(e):
+            return "🔴"
         return "🔴"
 
 def format_number(num):
     return f"{int(float(num)):,}".replace(",", " ")
 
+# --------- отчёт по аккаунту ---------
+
 def get_facebook_data(account_id, date_preset, date_label=''):
-    ensure_fb_api()
     account = AdAccount(account_id)
     fields = ['impressions', 'cpm', 'clicks', 'cpc', 'spend', 'actions']
     params = {'time_range': date_preset, 'level': 'account'} if isinstance(date_preset, dict) else {'date_preset': date_preset, 'level': 'account'}
@@ -75,6 +77,10 @@ def get_facebook_data(account_id, date_preset, date_label=''):
         insights = account.get_insights(fields=fields, params=params)
         account_name = account.api_get(fields=['name'])['name']
     except Exception as e:
+        # 🚫 нет доступа — тихо пропускаем этот аккаунт
+        if _is_permission_error(e):
+            return None
+        # прочие ошибки всё ещё покажем, чтобы заметить проблему
         return f"⚠ Ошибка: {str(e)}"
 
     date_info = f" ({date_label})" if date_label else ""
@@ -115,16 +121,22 @@ def get_facebook_data(account_id, date_preset, date_label=''):
 
     return report
 
+# --------- отправка отчётов ---------
+
 async def send_report(context, chat_id, period, date_label=''):
     for acc in AD_ACCOUNTS:
         msg = get_facebook_data(acc, period, date_label)
+        if not msg:
+            # None -> нет доступа, пропускаем без сообщений
+            continue
         await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='HTML')
+
+# --------- мониторинг биллинга ---------
 
 async def check_billing(context: ContextTypes.DEFAULT_TYPE):
     global account_statuses
     for account_id in AD_ACCOUNTS:
         try:
-            ensure_fb_api()
             account = AdAccount(account_id)
             info = account.api_get(fields=['name', 'account_status', 'balance'])
             status = info.get('account_status')
@@ -134,11 +146,17 @@ async def check_billing(context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(chat_id=CHAT_ID, text=f"⚠️ ⚠️ ⚠️ Ахтунг! {name}! у нас биллинг - {balance:.2f} $", parse_mode='HTML')
             account_statuses[account_id] = status
         except Exception as e:
+            # нет прав — молча пропустили
+            if _is_permission_error(e):
+                continue
+            # прочее — покажем
             await context.bot.send_message(chat_id=CHAT_ID, text=f"⚠ Ошибка: {e}", parse_mode='HTML')
 
 async def daily_report(context: ContextTypes.DEFAULT_TYPE):
     label = (datetime.now(timezone('Asia/Almaty')) - timedelta(days=1)).strftime('%d.%m.%Y')
     await send_report(context, CHAT_ID, 'yesterday', label)
+
+# --------- прогноз списаний ---------
 
 async def check_billing_forecast(context: ContextTypes.DEFAULT_TYPE):
     today = datetime.now(timezone("Asia/Almaty")).date()
@@ -150,7 +168,6 @@ async def check_billing_forecast(context: ContextTypes.DEFAULT_TYPE):
 
     for acc_id in AD_ACCOUNTS:
         try:
-            ensure_fb_api()
             acc = AdAccount(acc_id)
             info = acc.api_get(fields=["name", "spend_cap", "amount_spent"])
             spend_cap = float(info.get("spend_cap", 0)) / 100
@@ -180,22 +197,26 @@ async def check_billing_forecast(context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode='HTML')
                 cache[acc_id] = billing_date.isoformat()
         except Exception as e:
+            # нет прав — просто пропустили
+            if _is_permission_error(e):
+                continue
+            # остальное — в логи контейнера
             print(f"Ошибка прогноза по {acc_id}: {e}")
 
     with open(FORECAST_CACHE_FILE, "w") as f:
         json.dump(cache, f)
 
+# --------- handlers ---------
+
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # защита от пустых/не-текстовых апдейтов
     if not update.message or not update.message.text:
         return
-
-    text = update.message.text.strip()
+    text = update.message.text
     if text == 'Сегодня':
-        label = datetime.now().strftime('%d.%м.%Y')
+        label = datetime.now().strftime('%d.%m.%Y')
         await send_report(context, update.message.chat_id, 'today', label)
     elif text == 'Вчера':
-        label = (datetime.now() - timedelta(days=1)).strftime('%d.%м.%Y')
+        label = (datetime.now() - timedelta(days=1)).strftime('%d.%m.%Y')
         await send_report(context, update.message.chat_id, 'yesterday', label)
     elif text == 'Прошедшая неделя':
         until = datetime.now() - timedelta(days=1)
@@ -207,6 +228,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [['Сегодня', 'Вчера', 'Прошедшая неделя']]
     await update.message.reply_text('🤖 Выберите отчёт:', reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
+
+# --------- app ---------
 
 app = Application.builder().token(TELEGRAM_TOKEN).build()
 app.add_handler(CommandHandler("start", start))
