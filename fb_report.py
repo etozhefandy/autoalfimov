@@ -1,40 +1,37 @@
 import asyncio
 import json
+import re
 from math import ceil
 from datetime import datetime, timedelta, time
 from pytz import timezone
+
+import requests  # ⬅️ для автокурса USD→KZT
 
 from facebook_business.adobjects.adaccount import AdAccount
 from facebook_business.api import FacebookAdsApi
 
 from telegram import (
     Update,
+    ReplyKeyboardMarkup,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
-    ReplyKeyboardMarkup,   # оставлю: вдруг ты захочешь вернуть старые кнопки
 )
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
-    ContextTypes,
     filters,
+    ContextTypes,
 )
 
-# ==== Твои креды ====
+# ====== Твои креды (как было) ======
 ACCESS_TOKEN = "EAASZCrBwhoH0BO7xBXr2h2sGTzvWzUyViJjnrXIvmI5w3uRQOszdntxDiFYxXH4hrKTmZBaPKtuthKuNx3rexRev5zAkby2XbrM5UmwzRGz8a2Q4WBDKp3d1ZCZAAhZCeWFBObQayL4XPwrOFQUtuPcGP5XVYubaXjZCsNT467yKBg90O71oVPZCbI0FrWcZAZC4GtgZDZD"
 APP_ID = "1336645834088573"
 APP_SECRET = "01bf23c5f726c59da318daa82dd0e9dc"
 FacebookAdsApi.init(APP_ID, APP_SECRET, ACCESS_TOKEN)
 
-# ==== Настройки бота ====
-TELEGRAM_TOKEN = "8033028841:AAGud3hSZdR8KQiOSaAcwfbkv8P0p-P3Dt4"
-CHAT_ID = "-1002679045097"
-
-FORECAST_CACHE_FILE = "forecast_cache.json"
-
-# ==== Твои аккаунты (оставил как у тебя) ====
+# ====== Наборы аккаунтов (как было) ======
 AD_ACCOUNTS = [
     "act_1415004142524014", "act_719853653795521", "act_1206987573792913", "act_1108417930211002",
     "act_2342025859327675", "act_844229314275496", "act_1333550570916716", "act_195526110289107",
@@ -62,75 +59,103 @@ ACCOUNT_NAMES = {
     "act_1357165995492721": "Ария Степи", "act_798205335840576": "Инвестиции"
 }
 
+TELEGRAM_TOKEN = "8033028841:AAGud3hSZdR8KQiOSaAcwfbkv8P0p-P3Dt4"
+CHAT_ID = "-1002679045097"  # твоя группа
+FORECAST_CACHE_FILE = "forecast_cache.json"
+FX_CACHE_FILE = "fx_cache.json"
+
 account_statuses = {}
 
-# ---------- Утилиты ----------
-
-def is_permission_error(err: Exception) -> bool:
-    """Вернёт True, если ошибка — отсутствие прав (403 / OAuthException code 200)."""
-    s = str(err)
-    return "code\": 200" in s or "OAuthException" in s or "has NOT grant ads_management" in s
+# ========= ВСПОМОГАТЕЛЬНОЕ =========
 
 def is_account_active(account_id):
     try:
         status = AdAccount(account_id).api_get(fields=['account_status'])['account_status']
         return "🟢" if status == 1 else "🔴"
-    except Exception:
-        # Если нет прав — считаем как неактивный индикатор, но молча
+    except:
         return "🔴"
 
 def format_number(num):
     return f"{int(float(num)):,}".replace(",", " ")
 
-# ---------- Данные по аккаунту ----------
+def get_usd_kzt_rate(spread_tenge: float = 5.0) -> float:
+    """
+    Возвращает курс USD→KZT (exchangerate.host), кэш ~6ч, +5₸ сверху.
+    Фолбеки: кэш -> дефолт 490.
+    """
+    now = datetime.utcnow()
+    try:
+        with open(FX_CACHE_FILE, "r") as f:
+            fx = json.load(f)
+        ts = datetime.fromisoformat(fx.get("ts"))
+        if (now - ts) < timedelta(hours=6) and fx.get("usd_kzt"):
+            return float(fx["usd_kzt"]) + spread_tenge
+    except Exception:
+        pass
+
+    try:
+        resp = requests.get(
+            "https://api.exchangerate.host/latest",
+            params={"base": "USD", "symbols": "KZT"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        rate = float(resp.json()["rates"]["KZT"])
+        with open(FX_CACHE_FILE, "w") as f:
+            json.dump({"ts": now.isoformat(), "usd_kzt": rate}, f)
+        return rate + spread_tenge
+    except Exception:
+        try:
+            with open(FX_CACHE_FILE, "r") as f:
+                fx = json.load(f)
+            return float(fx["usd_kzt"]) + spread_tenge
+        except Exception:
+            return 490.0 + spread_tenge
+
+# ========= ОСНОВНОЙ ОТЧЁТ =========
 
 def get_facebook_data(account_id, date_preset, date_label=''):
     account = AdAccount(account_id)
     fields = ['impressions', 'cpm', 'clicks', 'cpc', 'spend', 'actions']
-    params = (
-        {'time_range': date_preset, 'level': 'account'}
-        if isinstance(date_preset, dict)
-        else {'date_preset': date_preset, 'level': 'account'}
-    )
+    params = {'time_range': date_preset, 'level': 'account'} if isinstance(date_preset, dict) else {'date_preset': date_preset, 'level': 'account'}
     try:
         insights = account.get_insights(fields=fields, params=params)
         account_name = account.api_get(fields=['name'])['name']
     except Exception as e:
-        # Тихо игнорируем аккаунты без доступа (ничего не возвращаем)
-        if is_permission_error(e):
-            return ""
-        # Иначе присылаем свёрнутый текст ошибки
+        # 🔇 Если нет доступа — просто ничего не шлём по этому аккаунту
+        err = str(e)
+        if "(#200)" in err or "code\": 200" in err or "403" in err:
+            return None
         return (
-            "⚠ Ошибка:\n\n"
-            f"  Message: Call was not successful\n"
-            f"  Method:  GET\n"
-            f"  Path:    https://graph.facebook.com/v23.0/{account_id}/insights\n"
-            f"  Params:  {params}\n\n"
-            f"  {e}"
+            "⚠ <b>Ошибка:</b>\n\n"
+            f"<pre>Message: {e}</pre>"
         )
 
     date_info = f" ({date_label})" if date_label else ""
-    report = f"{is_account_active(account_id)} <b>{account_name}</b>{date_info}\n"
+    header = f"{is_account_active(account_id)} <b>{account_name}</b>{date_info}\n"
 
     if not insights:
-        return report + "Нет данных за выбранный период"
+        return header + "Нет данных за выбранный период"
 
     insight = insights[0]
-    report += (
-        f"👁 Показы: {format_number(insight.get('impressions', '0'))}\n"
-        f"🎯 CPM: {round(float(insight.get('cpm', 0)), 2)} $\n"
-        f"🖱 Клики: {format_number(insight.get('clicks', '0'))}\n"
-        f"💸 CPC: {round(float(insight.get('cpc', 0)), 2)} $\n"
-        f"💵 Затраты: {round(float(insight.get('spend', 0)), 2)} $"
+    core = (
+        f"👁 Показы: <b>{format_number(insight.get('impressions', '0'))}</b>\n"
+        f"🎯 CPM: <b>{round(float(insight.get('cpm', 0)), 2)} $</b>\n"
+        f"🖱 Клики: <b>{format_number(insight.get('clicks', '0'))}</b>\n"
+        f"💸 CPC: <b>{round(float(insight.get('cpc', 0)), 2)} $</b>\n"
+        f"💵 Затраты: <b>{round(float(insight.get('spend', 0)), 2)} $</b>"
     )
 
     actions = {a['action_type']: float(a['value']) for a in insight.get('actions', [])}
 
+    extra_parts = []
+
     if account_id in MESSAGING_ACCOUNTS:
         conv = actions.get('onsite_conversion.messaging_conversation_started_7d', 0)
-        report += f"\n✉️ Начата переписка: {int(conv)}"
+        line = f"✉️ Начата переписка: <b>{int(conv)}</b>"
         if conv > 0:
-            report += f"\n💬💲 Цена переписки: {round(float(insight.get('spend', 0)) / conv, 2)} $"
+            line += f"\n💬💲 Цена переписки: <b>{round(float(insight.get('spend', 0)) / conv, 2)} $</b>"
+        extra_parts.append(line)
 
     if account_id in LEAD_FORM_ACCOUNTS:
         if account_id == 'act_4030694587199998':
@@ -141,19 +166,21 @@ def get_facebook_data(account_id, date_preset, date_label=''):
                 actions.get('offsite_conversion.fb_pixel_lead', 0) or
                 actions.get('lead', 0)
             )
-        report += f"\n📩 Заявки: {int(leads)}"
+        line = f"📩 Заявки: <b>{int(leads)}</b>"
         if leads > 0:
-            report += f"\n📩💲 Цена заявки: {round(float(insight.get('spend', 0)) / leads, 2)} $"
+            line += f"\n📩💲 Цена заявки: <b>{round(float(insight.get('spend', 0)) / leads, 2)} $</b>"
+        extra_parts.append(line)
 
-    return report
+    tail = ("\n" + "\n".join(extra_parts)) if extra_parts else ""
+    return header + core + tail
 
 async def send_report(context, chat_id, period, date_label=''):
     for acc in AD_ACCOUNTS:
         msg = get_facebook_data(acc, period, date_label)
-        if msg:  # пустые (из-за 403) не отправляем
+        if msg:
             await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='HTML')
 
-# ---------- Биллинг ----------
+# ========= БИЛЛИНГИ =========
 
 async def check_billing(context: ContextTypes.DEFAULT_TYPE):
     global account_statuses
@@ -162,47 +189,62 @@ async def check_billing(context: ContextTypes.DEFAULT_TYPE):
             account = AdAccount(account_id)
             info = account.api_get(fields=['name', 'account_status', 'balance'])
             status = info.get('account_status')
-
             if account_id in account_statuses and account_statuses[account_id] == 1 and status != 1:
                 name = info.get('name')
                 balance = float(info.get('balance', 0)) / 100
                 await context.bot.send_message(
                     chat_id=CHAT_ID,
-                    text=f"⚠️ ⚠️ ⚠️ Ахтунг! {name}! у нас биллинг - {balance:.2f} $",
+                    text=f"⚠️⚠️⚠️ <b>Ахтунг!</b> {name}\nБиллинг: <b>{balance:.2f} $</b>",
                     parse_mode='HTML'
                 )
             account_statuses[account_id] = status
         except Exception as e:
-            if is_permission_error(e):
+            # игнорим 403/нет доступа
+            err = str(e)
+            if "(#200)" in err or "code\": 200" in err or "403" in err:
                 continue
             await context.bot.send_message(chat_id=CHAT_ID, text=f"⚠ Ошибка: {e}", parse_mode='HTML')
 
-async def show_billing_now(chat_id: str, context: ContextTypes.DEFAULT_TYPE):
-    """Кнопка 'Биллинг': показать все аккаунты со статусом != 1 (или с балансом полем, если нужно)."""
-    lines = []
-    for acc_id in AD_ACCOUNTS:
+async def send_billing_list(context: ContextTypes.DEFAULT_TYPE, chat_id: str):
+    """
+    По одному сообщению на аккаунт: имя, $ и ₸ (по автокурсу +5₸).
+    """
+    usd_kzt = get_usd_kzt_rate(spread_tenge=5.0)
+    rate_str = f"{usd_kzt:.2f} ₸"
+
+    for account_id in AD_ACCOUNTS:
         try:
-            acc = AdAccount(acc_id).api_get(fields=['name', 'account_status', 'balance'])
-            if acc.get('account_status') != 1:
-                name = acc.get('name', acc_id)
-                bal = float(acc.get('balance', 0)) / 100
-                lines.append(f"🔴 <b>{name}</b> — {bal:.2f} $")
+            acc = AdAccount(account_id)
+            info = acc.api_get(fields=['name', 'account_status', 'balance'])
+            name = info.get('name', ACCOUNT_NAMES.get(account_id, account_id))
+            status = info.get('account_status', 0)
+            balance_usd = float(info.get('balance', 0)) / 100.0
+            balance_kzt = round(balance_usd * usd_kzt, 2)
+            mark = "🟢" if status == 1 else "🔴"
+
+            msg = (
+                f"{mark} <b>{name}</b>\n"
+                f"💵 <b>{balance_usd:.2f} $</b>  |  🇰🇿 <b>{balance_kzt:.2f} ₸</b>\n"
+                f"<i>Курс: 1 $ = {rate_str}</i>"
+            )
+            await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
         except Exception as e:
-            if is_permission_error(e):
+            # молча игнорим нет доступа
+            err = str(e)
+            if "(#200)" in err or "code\": 200" in err or "403" in err:
                 continue
-            lines.append(f"⚠ Ошибка по {acc_id}: {e}")
+            # иначе можно подсказать что сломалось
+            # await context.bot.send_message(chat_id=chat_id, text=f"⚠ Ошибка по {account_id}: {e}")
+            continue
 
-    text = "✅ Все аккаунты активны" if not lines else "Сейчас в биллингах:\n" + "\n".join(lines)
-    await context.bot.send_message(chat_id=chat_id, text=text, parse_mode='HTML')
-
-# ---------- Прогноз списаний (как было у тебя) ----------
+# ========= ПРОГНОЗ БИЛЛИНГА (как было) =========
 
 async def check_billing_forecast(context: ContextTypes.DEFAULT_TYPE):
     today = datetime.now(timezone("Asia/Almaty")).date()
     try:
         with open(FORECAST_CACHE_FILE, "r") as f:
             cache = json.load(f)
-    except Exception:
+    except:
         cache = {}
 
     for acc_id in AD_ACCOUNTS:
@@ -212,17 +254,13 @@ async def check_billing_forecast(context: ContextTypes.DEFAULT_TYPE):
             spend_cap = float(info.get("spend_cap", 0)) / 100
             spent = float(info.get("amount_spent", 0)) / 100
             available = spend_cap - spent
-
-            # daily budgets
-            campaigns = acc.get_campaigns(fields=["name", "effective_status", "daily_budget"])
             daily_budget = sum(
                 int(c.get("daily_budget", 0)) / 100
-                for c in campaigns
+                for c in acc.get_campaigns(fields=["name", "effective_status", "daily_budget"])
                 if c.get("effective_status") == "ACTIVE"
             )
             if daily_budget == 0:
                 continue
-
             days_left = ceil(available / daily_budget)
             billing_date = today + timedelta(days=days_left)
             if (billing_date - today).days == 3:
@@ -239,115 +277,117 @@ async def check_billing_forecast(context: ContextTypes.DEFAULT_TYPE):
                 )
                 await context.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode='HTML')
                 cache[acc_id] = billing_date.isoformat()
-
         except Exception as e:
-            if is_permission_error(e):
-                continue
-            # в логи контейнера:
+            # тихий лог
             print(f"Ошибка прогноза по {acc_id}: {e}")
 
     with open(FORECAST_CACHE_FILE, "w") as f:
         json.dump(cache, f)
 
-# ---------- Кнопки (inline) для групп/лички ----------
-
-def main_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Сегодня", callback_data="today")],
-        [InlineKeyboardButton("Вчера", callback_data="yesterday")],
-        [InlineKeyboardButton("Прошедшая неделя", callback_data="week")],
-        [InlineKeyboardButton("Биллинг", callback_data="billing")]
-    ])
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # в группах кнопки окажутся ПОД сообщением бота (inline)
-    if update.effective_chat:
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text="🤖 Выберите отчёт:",
-            reply_markup=main_keyboard()
-        )
-
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "Доступные команды:\n"
-        "/start — показать кнопки\n"
-        "/help — это сообщение\n\n"
-        "Кнопки:\n"
-        "• Сегодня — отчёт за сегодня\n"
-        "• Вчера — отчёт за вчера\n"
-        "• Прошедшая неделя — отчёт за последние 7 дней\n"
-        "• Биллинг — список биллингов по аккаунтам ($)\n"
-    )
-    if update.effective_chat:
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=text)
-
-async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка нажатий inline-кнопок в группе/личке."""
-    q = update.callback_query
-    if not q:
-        return
-    await q.answer()
-    chat_id = q.message.chat_id
-
-    if q.data == "today":
-        label = datetime.now().strftime('%d.%m.%Y')
-        await send_report(context, chat_id, 'today', label)
-    elif q.data == "yesterday":
-        label = (datetime.now() - timedelta(days=1)).strftime('%d.%m.%Y')
-        await send_report(context, chat_id, 'yesterday', label)
-    elif q.data == "week":
-        until = datetime.now() - timedelta(days=1)
-        since = until - timedelta(days=6)
-        period = {'since': since.strftime('%Y-%m-%d'), 'until': until.strftime('%Y-%m-%d')}
-        label = f"{since.strftime('%d.%m')}-{until.strftime('%d.%m')}"
-        await send_report(context, chat_id, period, label)
-    elif q.data == "billing":
-        await show_billing_now(chat_id, context)
-
-# ---------- Старые текстовые кнопки (оставил совместимость) ----------
-
-async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # иногда в группах прилетает апдейт без текстового сообщения
-    if not update.message or not update.message.text:
-        return
-
-    text = update.message.text.strip()
-    if text == 'Сегодня':
-        label = datetime.now().strftime('%d.%м.%Y')
-        await send_report(context, update.message.chat_id, 'today', label)
-    elif text == 'Вчера':
-        label = (datetime.now() - timedelta(days=1)).strftime('%d.%м.%Y')
-        await send_report(context, update.message.chat_id, 'yesterday', label)
-    elif text == 'Прошедшая неделя':
-        until = datetime.now() - timedelta(days=1)
-        since = until - timedelta(days=6)
-        period = {'since': since.strftime('%Y-%m-%d'), 'until': until.strftime('%Y-%m-%d')}
-        label = f"{since.strftime('%d.%м')}-{until.strftime('%d.%м')}"
-        await send_report(context, update.message.chat_id, period, label)
-
-# ---------- Планировщик ----------
+# ========= ПЛАНОВЫЕ ДЖОБЫ =========
 
 async def daily_report(context: ContextTypes.DEFAULT_TYPE):
     label = (datetime.now(timezone('Asia/Almaty')) - timedelta(days=1)).strftime('%d.%m.%Y')
     await send_report(context, CHAT_ID, 'yesterday', label)
-    # после отчётов — одним сообщением состояние биллингов
-    await show_billing_now(CHAT_ID, context)
+    # Следом — список биллингов отдельными сообщениями (с автокурсом)
+    await send_billing_list(context, CHAT_ID)
 
-# ---------- Запуск ----------
+# ========= ХЭНДЛЕРЫ КОМАНД И КНОПОК =========
+
+async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    label = datetime.now().strftime('%d.%m.%Y')
+    await send_report(context, update.effective_chat.id, 'today', label)
+
+async def cmd_yesterday(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    label = (datetime.now() - timedelta(days=1)).strftime('%d.%m.%Y')
+    await send_report(context, update.effective_chat.id, 'yesterday', label)
+
+async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    until = datetime.now() - timedelta(days=1)
+    since = until - timedelta(days=6)
+    period = {'since': since.strftime('%Y-%m-%d'), 'until': until.strftime('%Y-%m-%d')}
+    label = f"{since.strftime('%d.%m')}-{until.strftime('%d.%m')}"
+    await send_report(context, update.effective_chat.id, period, label)
+
+async def cmd_billing(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_billing_list(context, update.effective_chat.id)
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "🆘 <b>Доступные команды</b>\n\n"
+        "• <code>/today</code> — отчёт за сегодня\n"
+        "• <code>/yesterday</code> — отчёт за вчера\n"
+        "• <code>/week</code> — отчёт за прошедшую неделю\n"
+        "• <code>/billing</code> — список биллингов по аккаунтам (в $ и ₸)\n\n"
+        "В группах доступны инлайн-кнопки под сообщением /start."
+    )
+    await update.message.reply_text(text, parse_mode="HTML")
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Инлайн для групп
+    ikb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Сегодня", callback_data="today"),
+            InlineKeyboardButton("Вчера", callback_data="yesterday"),
+        ],
+        [
+            InlineKeyboardButton("Прошедшая неделя", callback_data="week"),
+        ],
+        [
+            InlineKeyboardButton("Биллинг", callback_data="billing_list"),
+        ],
+    ])
+    # Реплай для лички (оставим и его)
+    rkb = ReplyKeyboardMarkup([['Сегодня', 'Вчера', 'Прошедшая неделя']], resize_keyboard=True)
+
+    if update.effective_chat.type in ("group", "supergroup"):
+        await update.message.reply_text("🤖 Выберите отчёт:", reply_markup=ikb)
+    else:
+        await update.message.reply_text("🤖 Выберите отчёт:", reply_markup=rkb)
+
+async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = q.data
+
+    if data == "today":
+        await cmd_today(update, context)
+    elif data == "yesterday":
+        await cmd_yesterday(update, context)
+    elif data == "week":
+        await cmd_week(update, context)
+    elif data == "billing_list":
+        await send_billing_list(context, q.message.chat_id)
+
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # старое поведение кнопок-реплаев в личке
+    if not update.message or not update.message.text:
+        return
+    text = update.message.text.strip().lower()
+    if text == 'сегодня':
+        await cmd_today(update, context)
+    elif text == 'вчера':
+        await cmd_yesterday(update, context)
+    elif text == 'прошедшая неделя':
+        await cmd_week(update, context)
+
+# ========= APP =========
 
 app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-app.add_handler(CommandHandler("start", cmd_start))
+app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("help", cmd_help))
-app.add_handler(CallbackQueryHandler(callback_router))
+app.add_handler(CommandHandler("today", cmd_today))
+app.add_handler(CommandHandler("yesterday", cmd_yesterday))
+app.add_handler(CommandHandler("week", cmd_week))
+app.add_handler(CommandHandler("billing", cmd_billing))
+app.add_handler(CallbackQueryHandler(on_button))
+
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
-# мониторинг биллингов каждые 10 минут (как было)
+# джобы как были
 app.job_queue.run_repeating(check_billing, interval=600, first=10)
-# ежедневный отчёт + список биллингов
 app.job_queue.run_daily(daily_report, time=time(hour=9, minute=30, tzinfo=timezone('Asia/Almaty')))
-# ежедневная проверка прогнозов списаний (за 3 дня)
 app.job_queue.run_daily(check_billing_forecast, time=time(hour=9, minute=0, tzinfo=timezone('Asia/Almaty')))
 
 if __name__ == "__main__":
