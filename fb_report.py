@@ -273,3 +273,5 @@ app.job_queue.run_daily(check_billing_forecast, time=time(hour=9, minute=0, tzin
 if __name__ == "__main__":
     print("\U0001F680 Бот запущен и ожидает команд.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+    
