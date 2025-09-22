@@ -1,23 +1,22 @@
 import asyncio
 import json
-import re
 from math import ceil
 from datetime import datetime, timedelta, time
 from pytz import timezone
+
 from facebook_business.adobjects.adaccount import AdAccount
 from facebook_business.api import FacebookAdsApi
+
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# ⬇️ НОВОЕ: будем тянуть курс из открытого API
-import requests
-
-# ====== ТВОИ КОНСТАНТЫ ======
+# === ТВОИ КЛЮЧИ (оставил без изменений) ===
 ACCESS_TOKEN = "EAASZCrBwhoH0BO7xBXr2h2sGTzvWzUyViJjnrXIvmI5w3uRQOszdntxDiFYxXH4hrKTmZBaPKtuthKuNx3rexRev5zAkby2XbrM5UmwzRGz8a2Q4WBDKp3d1ZCZAAhZCeWFBObQayL4XPwrOFQUtuPcGP5XVYubaXjZCsNT467yKBg90O71oVPZCbI0FrWcZAZC4GtgZDZD"
 APP_ID = "1336645834088573"
 APP_SECRET = "01bf23c5f726c59da318daa82dd0e9dc"
 FacebookAdsApi.init(APP_ID, APP_SECRET, ACCESS_TOKEN)
 
+# === ТВОИ СПИСКИ (оставил как в последней рабочей версии) ===
 AD_ACCOUNTS = [
     "act_1415004142524014", "act_719853653795521", "act_1206987573792913", "act_1108417930211002",
     "act_2342025859327675", "act_844229314275496", "act_1333550570916716", "act_195526110289107",
@@ -47,66 +46,43 @@ ACCOUNT_NAMES = {
 
 TELEGRAM_TOKEN = "8033028841:AAGud3hSZdR8KQiOSaAcwfbkv8P0p-P3Dt4"
 CHAT_ID = "-1002679045097"
+
 FORECAST_CACHE_FILE = "forecast_cache.json"
 
-# Удобный TZ
-TZ = timezone("Asia/Almaty")
+# === Служебные ===
+account_statuses: dict[str, int] = {}
 
-# ====== НОВОЕ: хранение курса USD/KZT (+5₸) ======
-CURRENT_USD_KZT = 490.0
-CURRENT_USD_KZT_PLUS5 = CURRENT_USD_KZT + 5.0
-
-async def update_fx_rate(context: ContextTypes.DEFAULT_TYPE = None):
-    """
-    Обновляет CURRENT_USD_KZT и CURRENT_USD_KZT_PLUS5 из открытого API.
-    Источники: exchangerate.host (основной) и open.er-api.com (резерв).
-    """
-    global CURRENT_USD_KZT, CURRENT_USD_KZT_PLUS5
-    try:
-        r = requests.get(
-            "https://api.exchangerate.host/latest",
-            params={"base": "USD", "symbols": "KZT"},
-            timeout=8
-        )
-        if r.ok:
-            rate = float(r.json()["rates"]["KZT"])
-            if rate > 0:
-                CURRENT_USD_KZT = rate
-                CURRENT_USD_KZT_PLUS5 = CURRENT_USD_KZT + 5.0
-                return
-        # резерв
-        r2 = requests.get("https://open.er-api.com/v6/latest/USD", timeout=8)
-        if r2.ok:
-            rate2 = float(r2.json()["rates"]["KZT"])
-            if rate2 > 0:
-                CURRENT_USD_KZT = rate2
-                CURRENT_USD_KZT_PLUS5 = CURRENT_USD_KZT + 5.0
-                return
-    except Exception:
-        # Тихо игнорируем — останется предыдущее значение
-        pass
-
-account_statuses = {}
-
-def is_account_active(account_id):
+def is_account_active(account_id: str) -> str:
     try:
         status = AdAccount(account_id).api_get(fields=['account_status'])['account_status']
         return "🟢" if status == 1 else "🔴"
-    except:
+    except Exception as e:
+        # Нет доступа/ошибка — считаем неактивным, но не падаем
+        print(f"[status_skip] {account_id}: {e}")
         return "🔴"
 
-def format_number(num):
+def format_number(num) -> str:
     return f"{int(float(num)):,}".replace(",", " ")
 
-def get_facebook_data(account_id, date_preset, date_label=''):
+def get_facebook_data(account_id: str, date_preset, date_label: str = '') -> str | None:
+    """
+    Формирует текстовый отчёт по аккаунту.
+    Возвращает None, если нет доступа/ошибка — чтобы молча пропустить.
+    """
     account = AdAccount(account_id)
     fields = ['impressions', 'cpm', 'clicks', 'cpc', 'spend', 'actions']
-    params = {'time_range': date_preset, 'level': 'account'} if isinstance(date_preset, dict) else {'date_preset': date_preset, 'level': 'account'}
+    params = (
+        {'time_range': date_preset, 'level': 'account'}
+        if isinstance(date_preset, dict)
+        else {'date_preset': date_preset, 'level': 'account'}
+    )
+
     try:
         insights = account.get_insights(fields=fields, params=params)
         account_name = account.api_get(fields=['name'])['name']
     except Exception as e:
-        return f"⚠ Ошибка: {str(e)}"
+        print(f"[skip] {account_id}: {e}")  # только в лог
+        return None
 
     date_info = f" ({date_label})" if date_label else ""
     report = f"{is_account_active(account_id)} <b>{account_name}</b>{date_info}\n"
@@ -125,20 +101,22 @@ def get_facebook_data(account_id, date_preset, date_label=''):
 
     actions = {a['action_type']: float(a['value']) for a in insight.get('actions', [])}
 
+    # Переписки
     if account_id in MESSAGING_ACCOUNTS:
         conv = actions.get('onsite_conversion.messaging_conversation_started_7d', 0)
         report += f"\n✉️ Начата переписка: {int(conv)}"
         if conv > 0:
             report += f"\n💬💲 Цена переписки: {round(float(insight.get('spend', 0)) / conv, 2)} $"
 
+    # Лиды
     if account_id in LEAD_FORM_ACCOUNTS:
         if account_id == 'act_4030694587199998':
             leads = actions.get('Website Submit Applications', 0)
         else:
             leads = (
-                actions.get('offsite_conversion.fb_pixel_submit_application', 0) or
-                actions.get('offsite_conversion.fb_pixel_lead', 0) or
-                actions.get('lead', 0)
+                actions.get('offsite_conversion.fb_pixel_submit_application', 0)
+                or actions.get('offsite_conversion.fb_pixel_lead', 0)
+                or actions.get('lead', 0)
             )
         report += f"\n📩 Заявки: {int(leads)}"
         if leads > 0:
@@ -146,10 +124,15 @@ def get_facebook_data(account_id, date_preset, date_label=''):
 
     return report
 
-async def send_report(context, chat_id, period, date_label=''):
+async def send_report(context, chat_id: str, period, date_label: str = ''):
     for acc in AD_ACCOUNTS:
         msg = get_facebook_data(acc, period, date_label)
-        await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='HTML')
+        if not msg:
+            continue  # нет доступа/ошибка — молча пропускаем
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='HTML')
+        except Exception as e:
+            print(f"[send_skip] {acc}: {e}")
 
 async def check_billing(context: ContextTypes.DEFAULT_TYPE):
     global account_statuses
@@ -158,25 +141,32 @@ async def check_billing(context: ContextTypes.DEFAULT_TYPE):
             account = AdAccount(account_id)
             info = account.api_get(fields=['name', 'account_status', 'balance'])
             status = info.get('account_status')
+
             if account_id in account_statuses and account_statuses[account_id] == 1 and status != 1:
                 name = info.get('name')
                 balance = float(info.get('balance', 0)) / 100
-                await context.bot.send_message(chat_id=CHAT_ID, text=f"⚠️ ⚠️ ⚠️ Ахтунг! {name}! у нас биллинг - {balance:.2f} $", parse_mode='HTML')
+                await context.bot.send_message(
+                    chat_id=CHAT_ID,
+                    text=f"⚠️ ⚠️ ⚠️ Ахтунг! {name}! у нас биллинг - {balance:.2f} $",
+                    parse_mode='HTML'
+                )
+
             account_statuses[account_id] = status
         except Exception as e:
-            # Игнорируем недоступные аккаунты, просто пишем в чат об ошибке один раз
-            await context.bot.send_message(chat_id=CHAT_ID, text=f"⚠ Ошибка: {e}", parse_mode='HTML')
+            print(f"[billing_skip] {account_id}: {e}")
+            continue
 
 async def daily_report(context: ContextTypes.DEFAULT_TYPE):
-    label = (datetime.now(TZ) - timedelta(days=1)).strftime('%d.%m.%Y')
+    label = (datetime.now(timezone('Asia/Almaty')) - timedelta(days=1)).strftime('%d.%m.%Y')
     await send_report(context, CHAT_ID, 'yesterday', label)
 
+# ===== Прогноз биллинга (с кэшем), тихо пропускаем без доступа =====
 async def check_billing_forecast(context: ContextTypes.DEFAULT_TYPE):
-    today = datetime.now(TZ).date()
+    today = datetime.now(timezone("Asia/Almaty")).date()
     try:
         with open(FORECAST_CACHE_FILE, "r") as f:
             cache = json.load(f)
-    except:
+    except Exception:
         cache = {}
 
     for acc_id in AD_ACCOUNTS:
@@ -186,18 +176,22 @@ async def check_billing_forecast(context: ContextTypes.DEFAULT_TYPE):
             spend_cap = float(info.get("spend_cap", 0)) / 100
             spent = float(info.get("amount_spent", 0)) / 100
             available = spend_cap - spent
+
+            # Суммарный дневной бюджет активных кампаний
             daily_budget = sum(
                 int(c.get("daily_budget", 0)) / 100
                 for c in acc.get_campaigns(fields=["name", "effective_status", "daily_budget"])
                 if c.get("effective_status") == "ACTIVE"
             )
-            if daily_budget == 0:
+
+            if daily_budget <= 0:
                 continue
-            days_left = ceil(available / daily_budget)
+
+            days_left = ceil(available / daily_budget) if daily_budget > 0 else 0
             billing_date = today + timedelta(days=days_left)
-            if (billing_date - today).days == 3:
-                if cache.get(acc_id) == billing_date.isoformat():
-                    continue
+
+            # Шлём предупреждение ровно за 3 дня, и не дублируем если уже слали на эту дату
+            if (billing_date - today).days == 3 and cache.get(acc_id) != billing_date.isoformat():
                 name = ACCOUNT_NAMES.get(acc_id, acc_id)
                 msg = (
                     f"⚠️ <b>{name}</b>\n\n"
@@ -209,22 +203,24 @@ async def check_billing_forecast(context: ContextTypes.DEFAULT_TYPE):
                 )
                 await context.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode='HTML')
                 cache[acc_id] = billing_date.isoformat()
+
         except Exception as e:
-            print(f"Ошибка прогноза по {acc_id}: {e}")
+            print(f"[forecast_skip] {acc_id}: {e}")
+            continue
 
-    with open(FORECAST_CACHE_FILE, "w") as f:
-        json.dump(cache, f)
+    try:
+        with open(FORECAST_CACHE_FILE, "w") as f:
+            json.dump(cache, f)
+    except Exception as e:
+        print(f"[forecast_cache_write] {e}")
 
-# ====== НОВОЕ: команда /fx — показать текущий курс ======
-async def cmd_fx(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_chat.send_message(
-        f"Текущий курс USD/KZT: <b>{CURRENT_USD_KZT:.2f}</b>\n"
-        f"С учётом +5₸: <b>{CURRENT_USD_KZT_PLUS5:.2f}</b>",
-        parse_mode="HTML"
-    )
-
+# ===== Обработчики команд/сообщений =====
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
+    # Защита от не-текстовых апдейтов (редактирование, join, и т.п.)
+    if not update.message or not update.message.text:
+        return
+
+    text = update.message.text.strip()
     if text == 'Сегодня':
         label = datetime.now().strftime('%d.%m.%Y')
         await send_report(context, update.message.chat_id, 'today', label)
@@ -235,27 +231,22 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         until = datetime.now() - timedelta(days=1)
         since = until - timedelta(days=6)
         period = {'since': since.strftime('%Y-%m-%d'), 'until': until.strftime('%Y-%m-%d')}
-        label = f"{since.strftime('%d.%м')}-{until.strftime('%d.%м')}"
+        label = f"{since.strftime('%d.%m')}-{until.strftime('%d.%m')}"
         await send_report(context, update.message.chat_id, period, label)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [['Сегодня', 'Вчера', 'Прошедшая неделя']]
     await update.message.reply_text('🤖 Выберите отчёт:', reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
 
+# === Приложение ===
 app = Application.builder().token(TELEGRAM_TOKEN).build()
-
-# Команды
 app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("fx", cmd_fx))  # ⬅️ новая команда
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
-# Планировщики
-app.job_queue.run_repeating(update_fx_rate, interval=3600, first=5)  # курс раз в час
-app.job_queue.run_daily(update_fx_rate, time=time(hour=8, minute=55, tzinfo=TZ))  # перед утренним отчётом
-
+# jobs
 app.job_queue.run_repeating(check_billing, interval=600, first=10)
-app.job_queue.run_daily(daily_report, time=time(hour=9, minute=30, tzinfo=TZ))
-app.job_queue.run_daily(check_billing_forecast, time=time(hour=9, minute=0, tzinfo=TZ))
+app.job_queue.run_daily(daily_report, time=time(hour=9, minute=30, tzinfo=timezone('Asia/Almaty')))
+app.job_queue.run_daily(check_billing_forecast, time=time(hour=9, minute=0, tzinfo=timezone('Asia/Almaty')))
 
 if __name__ == "__main__":
     print("\U0001F680 Бот запущен и ожидает команд.")
