@@ -1,0 +1,77 @@
+{
+  "act_1415004142524014": {
+    "name": "ЖС Астана",
+    "enabled": true,
+    "metrics": { "messaging": true, "leads": false }
+  },
+  "act_719853653795521": {
+    "name": "ЖС Караганда",
+    "enabled": true,
+    "metrics": { "messaging": true, "leads": false }
+  },
+  "act_1206987573792913": {
+    "name": "ЖС Павлодар",
+    "enabled": true,
+    "metrics": { "messaging": true, "leads": false }
+  },
+  "act_1108417930211002": {
+    "name": "ЖС Актау",
+    "enabled": true,
+    "metrics": { "messaging": true, "leads": false }
+  },
+  "act_2342025859327675": {
+    "name": "ЖС Атырау",
+    "enabled": true,
+    "metrics": { "messaging": true, "leads": false }
+  },
+  "act_844229314275496": {
+    "name": "ЖС Актобе",
+    "enabled": true,
+    "metrics": { "messaging": true, "leads": false }
+  },
+  "act_1333550570916716": {
+    "name": "ЖС Юг (Алматы)",
+    "enabled": true,
+    "metrics": { "messaging": true, "leads": false }
+  },
+  "act_195526110289107": {
+    "name": "ЖС Тараз",
+    "enabled": true,
+    "metrics": { "messaging": true, "leads": false }
+  },
+  "act_2145160982589338": {
+    "name": "ЖС Шымкент",
+    "enabled": true,
+    "metrics": { "messaging": true, "leads": false }
+  },
+  "act_1042955424178074": {
+    "name": "Кенсе 1",
+    "enabled": true,
+    "metrics": { "messaging": false, "leads": true }
+  },
+  "act_4030694587199998": {
+    "name": "Кенсе 2",
+    "enabled": true,
+    "metrics": { "messaging": false, "leads": true }
+  },
+  "act_508239018969999": {
+    "name": "Фитнес Пойнт",
+    "enabled": true,
+    "metrics": { "messaging": false, "leads": false }
+  },
+  "act_1357165995492721": {
+    "name": "Ария степи",
+    "enabled": true,
+    "metrics": { "messaging": false, "leads": false }
+  },
+  "act_798205335840576": {
+    "name": "Инвестиции",
+    "enabled": true,
+    "metrics": { "messaging": false, "leads": true }
+  },
+  "act_806046635254439": {
+    "name": "WonderStage",
+    "enabled": true,
+    "metrics": { "messaging": true, "leads": true }
+  }
+}
