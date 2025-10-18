@@ -23,7 +23,7 @@ from telegram.ext import (
 )
 
 # ==== Креды ====
-ACCESS_TOKEN = "EAASZCrBwhoH0BO7xBXr2h2sGTзаполни_своим_валидным_токеном"
+ACCESS_TOKEN = "EAASZCrBwhoH0BPdPmD8GLCxCSDZBFJDAP9C2VJjbQl3W9ZBsNiRMyKHK8fvZATnBVKDxtcJizibfMBta2wr7MRjHgj6Hv9uXDz619r9WKMBmaSqwE6mmgNDkkx3ZC7Qp80PvYHbKCUAp9sbIUdxjk0UFfVYTgs1zs0mbLz3VvkulI4RrbuUTzLsloFI4ExQZDZD"
 APP_ID = "1336645834088573"
 APP_SECRET = "01bf23c5f726c59da318daa82dd0e9dc"
 FacebookAdsApi.init(APP_ID, APP_SECRET, ACCESS_TOKEN)
