@@ -12,14 +12,14 @@ from facebook_business.adobjects.user import User
 from facebook_business.api import FacebookAdsApi
 
 from telegram import (
-    Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
+    Update, InlineKeyboardButton, InlineKeyboardMarkup
 )
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     filters, ContextTypes
 )
 
-# ==== КРЕДЫ (как было) ====
+# ==== КРЕДЫ ====
 ACCESS_TOKEN = "EAASZCrBwhoH0BO7xBXr2h2sGTzvWzUyViJjnrXIvmI5w3uRQOszdntxDiFYxXH4hrKTmZBaPKtuthKuNx3rexRev5zAkby2XbrM5UmwzRGz8a2Q4WBDKp3d1ZCZAAhZCeWFBObQayL4XPwrOFQUtuPcGP5XVYubaXjZCsNT467yKBg90O71oVPZCbI0FrWcZAZC4GtgZDZD"
 APP_ID = "1336645834088573"
 APP_SECRET = "01bf23c5f726c59da318daa82dd0e9dc"
@@ -28,23 +28,23 @@ FacebookAdsApi.init(APP_ID, APP_SECRET, ACCESS_TOKEN)
 TELEGRAM_TOKEN = "8033028841:AAGud3hSZdR8KQiOSaAcwfbkv8P0p-P3Dt4"
 CHAT_ID = "-1002679045097"
 
-# ===== ФАЙЛЫ-КОНФИГИ =====
+# ===== ФАЙЛЫ =====
 ACCOUNTS_JSON = "accounts.json"
 FORECAST_CACHE_FILE = "forecast_cache.json"
 
-# ==== ЗАПАСНОЙ СПИСОК (если нет accounts.json) ====
+# ==== Фоллбек, если нет accounts.json ====
 AD_ACCOUNTS_FALLBACK = [
     "act_1415004142524014", "act_719853653795521", "act_1206987573792913", "act_1108417930211002",
     "act_2342025859327675", "act_844229314275496", "act_1333550570916716", "act_195526110289107",
     "act_2145160982589338", "act_1042955424178074", "act_4030694587199998", "act_508239018969999",
-    "act_1357165995492721", "act_798205335840576"
+    "act_1357165995492721", "act_798205335840576", "act_806046635254439"
 ]
 
 # Исключаем «кенсе»
 EXCLUDED_AD_ACCOUNT_IDS = {"act_1042955424178074", "act_4030694587199998"}
 EXCLUDED_NAME_KEYWORDS = {"kense", "кенсе"}
 
-# ====== Резервная карта имён (если в accounts.json нет name) ======
+# Человеческие названия (резерв)
 ACCOUNT_NAMES: Dict[str, str] = {
     "act_1415004142524014": "ЖС Астана",
     "act_719853653795521": "ЖС Караганда",
@@ -55,8 +55,6 @@ ACCOUNT_NAMES: Dict[str, str] = {
     "act_1333550570916716": "ЖС Юг (Алматы)",
     "act_195526110289107": "ЖС Тараз",
     "act_2145160982589338": "ЖС Шымкент",
-    "act_1042955424178074": "Кенсе 1",
-    "act_4030694587199998": "Кенсе 2",
     "act_508239018969999": "Фитнес Пойнт",
     "act_1357165995492721": "Ария Степи",
     "act_798205335840576": "Инвестиции",
@@ -83,10 +81,24 @@ def _looks_excluded_by_name(name: str) -> bool:
     n = (name or "").lower()
     return any(k in n for k in EXCLUDED_NAME_KEYWORDS)
 
+def ensure_account_row(acc_id: str):
+    store = load_accounts()
+    if acc_id not in store:
+        store[acc_id] = {
+            "name": ACCOUNT_NAMES.get(acc_id, acc_id),
+            "enabled": True,
+            "metrics": {"messaging": False, "leads": False},
+            "alerts": {"enabled": False, "targets": {"messaging": None, "leads": None}}
+        }
+        save_accounts(store)
+
 def upsert_accounts_from_fb() -> dict:
     """
     Тянем me/adaccounts, исключаем кенсе, мержим в accounts.json.
-    Новым добавляем: enabled=True, metrics.messaging/leads = False.
+    Новые получают:
+      enabled=True
+      metrics.messaging/leads=False
+      alerts.enabled=False; targets None
     """
     data = load_accounts()
     me = User(fbid="me")
@@ -109,7 +121,8 @@ def upsert_accounts_from_fb() -> dict:
             data[acc_id] = {
                 "name": name,
                 "enabled": True,
-                "metrics": {"messaging": False, "leads": False}
+                "metrics": {"messaging": False, "leads": False},
+                "alerts": {"enabled": False, "targets": {"messaging": None, "leads": None}}
             }
             added += 1
 
@@ -122,8 +135,13 @@ def get_enabled_accounts_in_order() -> List[str]:
     data = load_accounts()
     if not data:
         return AD_ACCOUNTS_FALLBACK
-    ordered = [acc_id for acc_id, row in data.items() if row.get("enabled", True)]
-    return ordered or AD_ACCOUNTS_FALLBACK
+    return [acc_id for acc_id, row in data.items() if row.get("enabled", True)]
+
+def get_all_accounts_in_order() -> List[str]:
+    data = load_accounts()
+    if not data:
+        return AD_ACCOUNTS_FALLBACK
+    return list(data.keys())
 
 def get_account_name(acc_id: str) -> str:
     data = load_accounts()
@@ -147,7 +165,7 @@ def format_number(num):
     except:
         return "0"
 
-def _get_insight_actions_dict(insight: Dict[str, Any]) -> Dict[str, float]:
+def _get_actions_map(insight: Dict[str, Any]) -> Dict[str, float]:
     actions = insight.get('actions', []) or []
     out = {}
     for a in actions:
@@ -157,17 +175,23 @@ def _get_insight_actions_dict(insight: Dict[str, Any]) -> Dict[str, float]:
             continue
     return out
 
-def _account_metrics_flags(acc_id: str) -> Dict[str, bool]:
-    data = load_accounts()
-    metrics = (data.get(acc_id, {}).get("metrics") or {})
-    # по умолчанию False, если в файле нет
-    return {
-        "messaging": bool(metrics.get("messaging", False)),
-        "leads": bool(metrics.get("leads", False)),
-    }
+def _get_cpat_map(insight: Dict[str, Any]) -> Dict[str, float]:
+    # cost_per_action_type -> CPA по каждому action_type
+    arr = insight.get('cost_per_action_type', []) or []
+    out = {}
+    for a in arr:
+        try:
+            out[a['action_type']] = float(a['value'])
+        except:
+            continue
+    return out
+
+def _flags_metrics(acc_id: str) -> Dict[str, bool]:
+    store = load_accounts()
+    m = (store.get(acc_id, {}).get("metrics") or {})
+    return {"messaging": bool(m.get("messaging")), "leads": bool(m.get("leads"))}
 
 def build_report_for_account(acc_id: str, period_param, date_label='') -> Optional[str]:
-    # period_param: либо 'today'/'yesterday', либо {'since': 'YYYY-mm-dd', 'until':'YYYY-mm-dd'}
     account = AdAccount(acc_id)
     fields = ['impressions', 'cpm', 'clicks', 'cpc', 'spend', 'actions']
     params = {'level': 'account'}
@@ -178,50 +202,44 @@ def build_report_for_account(acc_id: str, period_param, date_label='') -> Option
         account_name = get_account_name(acc_id)
     except Exception as e:
         err = str(e)
-        # игнорим недоступные аккаунты
         if "code: 200" in err or "403" in err or "permissions" in err.lower():
             return None
         return f"⚠ Ошибка по {get_account_name(acc_id)}:\n\n{e}"
 
     date_info = f" ({date_label})" if date_label else ""
     header = f"{is_account_active(acc_id)} <b>{account_name}</b>{date_info}\n"
-
     if not insights:
         return header + "Нет данных за выбранный период"
 
-    insight = insights[0]
+    i = insights[0]
     report = (
         f"{header}"
-        f"👁 Показы: {format_number(insight.get('impressions', '0'))}\n"
-        f"🎯 CPM: {round(float(insight.get('cpm', 0) or 0), 2)} $\n"
-        f"🖱 Клики: {format_number(insight.get('clicks', '0'))}\n"
-        f"💸 CPC: {round(float(insight.get('cpc', 0) or 0), 2)} $\n"
-        f"💵 Затраты: {round(float(insight.get('spend', 0) or 0), 2)} $"
+        f"👁 Показы: {format_number(i.get('impressions', '0'))}\n"
+        f"🎯 CPM: {round(float(i.get('cpm', 0) or 0), 2)} $\n"
+        f"🖱 Клики: {format_number(i.get('clicks', '0'))}\n"
+        f"💸 CPC: {round(float(i.get('cpc', 0) or 0), 2)} $\n"
+        f"💵 Затраты: {round(float(i.get('spend', 0) or 0), 2)} $"
     )
 
-    actions = _get_insight_actions_dict(insight)
-    flags = _account_metrics_flags(acc_id)
+    actions = _get_actions_map(i)
+    flags = _flags_metrics(acc_id)
 
     if flags["messaging"]:
         conv = actions.get('onsite_conversion.messaging_conversation_started_7d', 0.0)
         report += f"\n✉️ Начата переписка: {int(conv)}"
         if conv > 0:
-            spend = float(insight.get('spend', 0) or 0)
+            spend = float(i.get('spend', 0) or 0)
             report += f"\n💬💲 Цена переписки: {round(spend / conv, 2)} $"
 
     if flags["leads"]:
-        # твоя логика + особый кейс для 403069…
-        if acc_id == 'act_4030694587199998':
-            leads = actions.get('Website Submit Applications', 0.0)
-        else:
-            leads = (
-                actions.get('offsite_conversion.fb_pixel_submit_application', 0.0)
-                or actions.get('offsite_conversion.fb_pixel_lead', 0.0)
-                or actions.get('lead', 0.0)
-            )
+        leads = (
+            actions.get('lead', 0.0)
+            or actions.get('offsite_conversion.fb_pixel_lead', 0.0)
+            or actions.get('offsite_conversion.fb_pixel_submit_application', 0.0)
+        )
         report += f"\n📩 Заявки: {int(leads)}"
         if leads > 0:
-            spend = float(insight.get('spend', 0) or 0)
+            spend = float(i.get('spend', 0) or 0)
             report += f"\n📩💲 Цена заявки: {round(spend / leads, 2)} $"
 
     return report
@@ -232,7 +250,7 @@ async def send_report_all(context: ContextTypes.DEFAULT_TYPE, chat_id, period, l
         if msg:
             await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='HTML')
 
-# ====== Плановые задачи (как было) ======
+# ====== Плановые задачи (старое) ======
 async def check_billing(context: ContextTypes.DEFAULT_TYPE):
     global account_statuses
     for account_id in get_enabled_accounts_in_order():
@@ -300,6 +318,104 @@ async def check_billing_forecast(context: ContextTypes.DEFAULT_TYPE):
     with open(FORECAST_CACHE_FILE, "w") as f:
         json.dump(cache, f)
 
+# ====== Оповещения по целевой цене (CPA) ======
+
+ALERT_TIMES = [
+    time(hour=11, minute=0, tzinfo=timezone('Asia/Almaty')),
+    time(hour=14, minute=0, tzinfo=timezone('Asia/Almaty')),
+    time(hour=17, minute=0, tzinfo=timezone('Asia/Almaty')),
+    time(hour=19, minute=0, tzinfo=timezone('Asia/Almaty')),
+]
+
+# action keys
+A_MSG = 'onsite_conversion.messaging_conversation_started_7d'
+A_LEAD_PRI = 'lead'
+A_LEAD_PX = 'offsite_conversion.fb_pixel_lead'
+A_LEAD_PX_SUBMIT = 'offsite_conversion.fb_pixel_submit_application'
+
+def _get_target_config(acc_id: str) -> Dict[str, Any]:
+    store = load_accounts()
+    row = store.get(acc_id, {})
+    alerts = row.get("alerts", {}) or {}
+    targets = alerts.get("targets", {}) or {}
+    return {
+        "enabled": bool(alerts.get("enabled", False)),
+        "t_msg": targets.get("messaging"),  # float | None
+        "t_lead": targets.get("leads"),     # float | None
+    }
+
+def _first_present(keys: List[str], mapping: Dict[str, float]) -> Optional[float]:
+    for k in keys:
+        if k in mapping:
+            return mapping[k]
+    return None
+
+async def check_cpa_alerts(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Проверяем сегодня (date_preset='today') на уровне adset:
+      - cost_per_action_type для нужных action_type
+      - если CPA > целевого — шлём алерт по каждому проблемному адсету
+    """
+    for acc_id in get_enabled_accounts_in_order():
+        cfg = _get_target_config(acc_id)
+        flags = _flags_metrics(acc_id)
+        if not cfg["enabled"]:
+            continue
+        # если ни одна метрика не включена и/или нет целей — пропускаем
+        need_msg = flags["messaging"] and isinstance(cfg["t_msg"], (int, float))
+        need_lead = flags["leads"] and isinstance(cfg["t_lead"], (int, float))
+        if not (need_msg or need_lead):
+            continue
+
+        try:
+            acc = AdAccount(acc_id)
+            fields = [
+                'campaign_name', 'adset_name',
+                'actions', 'cost_per_action_type'
+            ]
+            params = {'level': 'adset', 'date_preset': 'today'}
+            insights = list(acc.get_insights(fields=fields, params=params))
+        except Exception as e:
+            # нет прав — игнорим
+            continue
+
+        if not insights:
+            continue
+
+        acc_name = get_account_name(acc_id)
+        chunks = []
+        for ins in insights:
+            actions = _get_actions_map(ins)
+            cpat = _get_cpat_map(ins)
+
+            # переписки
+            if need_msg:
+                cpa_msg = cpat.get(A_MSG)
+                conv = actions.get(A_MSG, 0.0)
+                if cpa_msg is not None and conv and cpa_msg > float(cfg["t_msg"]):
+                    chunks.append(
+                        f"🔔 <b>{acc_name}</b>\n"
+                        f"📣 {ins.get('campaign_name','')}\n"
+                        f"📦 {ins.get('adset_name','')}\n"
+                        f"💬 CPA переписки: <b>{cpa_msg:.2f}$</b> (цель {cfg['t_msg']:.2f}$), кол-во {int(conv)}"
+                    )
+
+            # лиды
+            if need_lead:
+                # берём первый из известных
+                cpa_lead = _first_present([A_LEAD_PRI, A_LEAD_PX, A_LEAD_PX_SUBMIT], cpat)
+                conv_lead = _first_present([A_LEAD_PRI, A_LEAD_PX, A_LEAD_PX_SUBMIT], actions) or 0.0
+                if cpa_lead is not None and conv_lead and cpa_lead > float(cfg["t_lead"]):
+                    chunks.append(
+                        f"🔔 <b>{acc_name}</b>\n"
+                        f"📣 {ins.get('campaign_name','')}\n"
+                        f"📦 {ins.get('adset_name','')}\n"
+                        f"📩 CPA лида: <b>{cpa_lead:.2f}$</b> (цель {cfg['t_lead']:.2f}$), кол-во {int(conv_lead)}"
+                    )
+
+        for m in chunks:
+            await context.bot.send_message(chat_id=CHAT_ID, text=m, parse_mode='HTML')
+
 # ====== Меню/кнопки ======
 def main_menu_kb() -> InlineKeyboardMarkup:
     rows = [
@@ -308,7 +424,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton("📊 Отчёт по аккаунту", callback_data="menu_report_by")
         ],
         [
-            InlineKeyboardButton("⚙️ Настройки (метрики)", callback_data="menu_settings"),
+            InlineKeyboardButton("⚙️ Настройки (метрики/кабинеты/опов.)", callback_data="menu_settings"),
         ],
         [
             InlineKeyboardButton("🔁 Синхронизация аккаунтов", callback_data="menu_sync"),
@@ -330,43 +446,60 @@ def period_menu_kb(acc_id: str) -> InlineKeyboardMarkup:
     ])
 
 def accounts_list_kb(prefix: str) -> InlineKeyboardMarkup:
-    # prefix: "choose_acc_for_report" или "choose_acc_for_settings"
+    """
+    prefix: choose_acc_for_report | choose_acc_for_settings
+    показываем ВСЕ известные аккаунты (не только enabled),
+    чтобы можно было включать/выключать.
+    """
     buttons = []
-    for acc_id in get_enabled_accounts_in_order():
+    for acc_id in get_all_accounts_in_order():
         name = get_account_name(acc_id)
         buttons.append([InlineKeyboardButton(name, callback_data=f"{prefix}|{acc_id}")])
     buttons.append([InlineKeyboardButton("⬅️ В меню", callback_data="menu_back")])
     return InlineKeyboardMarkup(buttons)
 
 def settings_kb(acc_id: str) -> InlineKeyboardMarkup:
-    data = load_accounts()
-    row = data.get(acc_id, {})
-    metrics = row.get("metrics", {})
+    store = load_accounts()
+    row = store.get(acc_id, {})
+    enabled = bool(row.get("enabled", True))
+    metrics = row.get("metrics", {}) or {}
+    alerts = row.get("alerts", {}) or {}
     m_on = "✅" if metrics.get("messaging") else "❌"
     l_on = "✅" if metrics.get("leads") else "❌"
+    al_on = "✅" if alerts.get("enabled") else "❌"
+    t_msg = alerts.get("targets", {}).get("messaging")
+    t_lead = alerts.get("targets", {}).get("leads")
+    t_msg_txt = f"{t_msg:.2f}$" if isinstance(t_msg, (int, float)) else "не задано"
+    t_lead_txt = f"{t_lead:.2f}$" if isinstance(t_lead, (int, float)) else "не задано"
+
+    en_btn = "🔴 Выключить кабинет" if enabled else "🟢 Включить кабинет"
+
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton(en_btn, callback_data=f"set_toggle_enabled|{acc_id}")],
         [InlineKeyboardButton(f"💬 Переписки: {m_on}", callback_data=f"set_toggle|{acc_id}|messaging")],
         [InlineKeyboardButton(f"♿️ Лид с сайта: {l_on}", callback_data=f"set_toggle|{acc_id}|leads")],
+        [InlineKeyboardButton(f"⚠️ Оповещения: {al_on}", callback_data=f"alerts_toggle|{acc_id}")],
+        [InlineKeyboardButton(f"🎯 Цель переписки: {t_msg_txt}", callback_data=f"alerts_set|{acc_id}|messaging")],
+        [InlineKeyboardButton(f"🎯 Цель лида: {t_lead_txt}", callback_data=f"alerts_set|{acc_id}|leads")],
         [InlineKeyboardButton("⬅️ Выбор аккаунта", callback_data="menu_settings")]
     ])
 
-# ====== Хендлеры команд ======
+# ====== Команды ======
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Главное меню:", reply_markup=main_menu_kb())
 
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Главное меню:", reply_markup=main_menu_kb())
 
-# ====== Хендлер текстовых сообщений (кнопки-ReplyKeyboard, если ими пользуешься) ======
+# ====== Текстовые сообщения (для «свой период» и ввода целей) ======
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Защита от сервис-апдейтов
     if not update.message or not update.message.text:
         return
-
-    # Обработка шагов «свой период» (ожидание дат)
+    text = update.message.text.strip()
     ud = context.user_data
+
+    # Шаги: запрос дат для «свой период»
     if ud.get("await_custom_from"):
-        text = update.message.text.strip()
         m = re.match(r"^(\d{2})\.(\d{2})\.(\d{4})$", text)
         if not m:
             await update.message.reply_text("Формат даты должен быть ДД.ММ.ГГГГ. Попробуйте ещё раз:")
@@ -382,7 +515,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if ud.get("await_custom_to"):
-        text = update.message.text.strip()
         m = re.match(r"^(\d{2})\.(\d{2})\.(\d{4})$", text)
         if not m:
             await update.message.reply_text("Формат даты должен быть ДД.ММ.ГГГГ. Попробуйте ещё раз:")
@@ -393,10 +525,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             from_dt = ud.get("custom_from")
             acc_id = ud.get("custom_acc")
             if not (from_dt and acc_id):
-                await update.message.reply_text("Что-то пошло не так, начните заново через меню.")
+                await update.message.reply_text("Что-то пошло не так, откройте меню заново.")
             else:
                 if to_dt < from_dt:
-                    await update.message.reply_text("Дата «по» не может быть раньше даты «с». Начните заново через меню.")
+                    await update.message.reply_text("Дата «по» раньше «с». Начните заново.")
                 else:
                     since = from_dt.strftime("%Y-%m-%d")
                     until = to_dt.strftime("%Y-%m-%d")
@@ -405,35 +537,43 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     msg = build_report_for_account(acc_id, period, label)
                     if msg:
                         await update.message.reply_text(msg, parse_mode='HTML')
-            # очистим шаги
             for k in ("await_custom_to", "custom_from", "custom_acc"):
                 ud.pop(k, None)
         except:
             await update.message.reply_text("Неверная дата. Попробуйте ещё раз:")
         return
 
-    # старые текстовые кнопки — оставим совместимость
-    text = update.message.text
-    if text == 'Сегодня':
-        label = datetime.now().strftime('%d.%m.%Y')
-        await send_report_all(context, update.message.chat_id, 'today', label)
-    elif text == 'Вчера':
-        label = (datetime.now() - timedelta(days=1)).strftime('%d.%m.%Y')
-        await send_report_all(context, update.message.chat_id, 'yesterday', label)
-    elif text == 'Прошедшая неделя':
-        until = datetime.now() - timedelta(days=1)
-        since = until - timedelta(days=6)
-        period = {'since': since.strftime('%Y-%m-%d'), 'until': until.strftime('%Y-%m-%d')}
-        label = f"{since.strftime('%d.%m')}-{until.strftime('%d.%m')}"
-        await send_report_all(context, update.message.chat_id, period, label)
+    # Шаги: ввод целевой цены для алертов
+    if ud.get("await_target_for"):
+        acc_id = ud.get("await_target_acc")
+        metric = ud.get("await_target_for")
+        if not re.match(r"^\d+(\.\d+)?$", text.replace(",", ".")):
+            await update.message.reply_text("Введите число, например 1.5")
+            return
+        val = float(text.replace(",", "."))
+        store = load_accounts()
+        row = store.get(acc_id, {})
+        alerts = row.get("alerts", {}) or {"enabled": False, "targets": {"messaging": None, "leads": None}}
+        targets = alerts.get("targets", {})
+        if metric == "messaging":
+            targets["messaging"] = val
+        else:
+            targets["leads"] = val
+        alerts["targets"] = targets
+        row["alerts"] = alerts
+        store[acc_id] = row
+        save_accounts(store)
+        ud.pop("await_target_for", None)
+        ud.pop("await_target_acc", None)
+        await update.message.reply_text("Целевая стоимость обновлена.")
+        return
 
-# ====== Хендлер callback-кнопок ======
+# ====== Callback-кнопки ======
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     data = q.data or ""
 
-    # главное меню навигация
     if data == "menu_back" or data == "menu":
         await q.edit_message_text("Главное меню:", reply_markup=main_menu_kb())
         return
@@ -450,6 +590,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("choose_acc_for_report|"):
         acc_id = data.split("|", 1)[1]
+        ensure_account_row(acc_id)
         await q.edit_message_text(f"Аккаунт: {get_account_name(acc_id)}\nВыберите период:",
                                   reply_markup=period_menu_kb(acc_id))
         return
@@ -459,18 +600,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if kind == "today":
             label = datetime.now().strftime('%d.%m.%Y')
             msg = build_report_for_account(acc_id, 'today', label)
-            if msg:
-                await q.edit_message_text(msg, parse_mode='HTML')
-            else:
-                await q.edit_message_text("Нет данных или нет доступа.")
+            await q.edit_message_text(msg or "Нет данных или доступа.", parse_mode='HTML' if msg else None)
             return
         if kind == "yesterday":
             label = (datetime.now() - timedelta(days=1)).strftime('%d.%m.%Y')
             msg = build_report_for_account(acc_id, 'yesterday', label)
-            if msg:
-                await q.edit_message_text(msg, parse_mode='HTML')
-            else:
-                await q.edit_message_text("Нет данных или нет доступа.")
+            await q.edit_message_text(msg or "Нет данных или доступа.", parse_mode='HTML' if msg else None)
             return
         if kind == "last7":
             until = datetime.now() - timedelta(days=1)
@@ -478,13 +613,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             period = {'since': since.strftime('%Y-%m-%d'), 'until': until.strftime('%Y-%m-%d')}
             label = f"{since.strftime('%d.%m')}-{until.strftime('%d.%m')}"
             msg = build_report_for_account(acc_id, period, label)
-            if msg:
-                await q.edit_message_text(msg, parse_mode='HTML')
-            else:
-                await q.edit_message_text("Нет данных или нет доступа.")
+            await q.edit_message_text(msg or "Нет данных или доступа.", parse_mode='HTML' if msg else None)
             return
         if kind == "custom":
-            # просим ввести даты по шагам в личке/группе
             context.user_data["await_custom_from"] = True
             context.user_data["custom_acc"] = acc_id
             await q.edit_message_text(
@@ -492,23 +623,34 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-    # ===== Настройки (метрики) =====
+    # ===== Настройки =====
     if data == "menu_settings":
-        await q.edit_message_text("Выберите аккаунт для настройки метрик:",
+        await q.edit_message_text("Выберите аккаунт для настройки:",
                                   reply_markup=accounts_list_kb("choose_acc_for_settings"))
         return
 
     if data.startswith("choose_acc_for_settings|"):
         acc_id = data.split("|", 1)[1]
+        ensure_account_row(acc_id)
         await q.edit_message_text(f"Настройки: {get_account_name(acc_id)}",
                                   reply_markup=settings_kb(acc_id))
+        return
+
+    if data.startswith("set_toggle_enabled|"):
+        _, acc_id = data.split("|", 1)
+        store = load_accounts()
+        row = store.get(acc_id, {})
+        row["enabled"] = not bool(row.get("enabled", True))
+        store[acc_id] = row
+        save_accounts(store)
+        await q.edit_message_text(f"Настройки: {get_account_name(acc_id)}", reply_markup=settings_kb(acc_id))
         return
 
     if data.startswith("set_toggle|"):
         _, acc_id, metric = data.split("|", 2)
         store = load_accounts()
-        row = store.get(acc_id, {"name": get_account_name(acc_id), "enabled": True, "metrics": {}})
-        m = row.get("metrics", {})
+        row = store.get(acc_id, {})
+        m = row.get("metrics", {}) or {}
         if metric not in ("messaging", "leads"):
             await q.answer("Неизвестная метрика")
             return
@@ -516,9 +658,28 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         row["metrics"] = m
         store[acc_id] = row
         save_accounts(store)
-        # показ обновлённого статуса
-        await q.edit_message_text(f"Настройки: {get_account_name(acc_id)}",
-                                  reply_markup=settings_kb(acc_id))
+        await q.edit_message_text(f"Настройки: {get_account_name(acc_id)}", reply_markup=settings_kb(acc_id))
+        return
+
+    if data.startswith("alerts_toggle|"):
+        _, acc_id = data.split("|", 1)
+        store = load_accounts()
+        row = store.get(acc_id, {})
+        al = row.get("alerts", {}) or {"enabled": False, "targets": {"messaging": None, "leads": None}}
+        al["enabled"] = not bool(al.get("enabled", False))
+        row["alerts"] = al
+        store[acc_id] = row
+        save_accounts(store)
+        await q.edit_message_text(f"Настройки: {get_account_name(acc_id)}", reply_markup=settings_kb(acc_id))
+        return
+
+    if data.startswith("alerts_set|"):
+        _, acc_id, metric = data.split("|", 2)
+        # просим ввести число
+        context.user_data["await_target_for"] = metric
+        context.user_data["await_target_acc"] = acc_id
+        pretty = "переписки" if metric == "messaging" else "лида"
+        await q.edit_message_text(f"Введите целевую стоимость {pretty} в $ (например 1.5):")
         return
 
     # ===== Синхронизация =====
@@ -547,13 +708,17 @@ app.add_handler(CommandHandler("menu", cmd_menu))
 # Кнопки-инлайн
 app.add_handler(CallbackQueryHandler(on_callback))
 
-# Текст (в т.ч. шаги «свой период»)
+# Текст (ввод дат и целевых значений)
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
 # Планировщики
 app.job_queue.run_repeating(check_billing, interval=600, first=10)
 app.job_queue.run_daily(daily_report, time=time(hour=9, minute=30, tzinfo=timezone('Asia/Almaty')))
 app.job_queue.run_daily(check_billing_forecast, time=time(hour=9, minute=0, tzinfo=timezone('Asia/Almaty')))
+
+# Оповещения CPA по расписанию
+for t in ALERT_TIMES:
+    app.job_queue.run_daily(check_cpa_alerts, time=t)
 
 if __name__ == "__main__":
     print("\U0001F680 Бот запущен и ожидает команд.")
