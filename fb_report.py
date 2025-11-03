@@ -1,97 +1,97 @@
+# fb_report.py
 import os
 import json
+import math
+import asyncio
 from math import ceil
 from datetime import datetime, timedelta, time
-from typing import Dict, Any, List
 
+import requests
 from pytz import timezone
 
-# --- Facebook SDK
 from facebook_business.adobjects.adaccount import AdAccount
 from facebook_business.adobjects.user import User
 from facebook_business.api import FacebookAdsApi
 
-# --- Telegram
 from telegram import (
     Update,
-    ReplyKeyboardMarkup,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    ReplyKeyboardMarkup,
 )
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
-    filters,
     ContextTypes,
+    filters,
 )
 
+# ========= КРЕДЫ (ENV с фолбэком на твои значения) =========
+ACCESS_TOKEN = os.getenv(
+    "FB_ACCESS_TOKEN",
+    "EAASZCrBwhoH0BO7xBXr2h2sGTzvWzUyViJjnrXIvmI5w3uRQOszdntxDiFYxXH4hrKTmZBaPKtuthKuNx3rexRev5zAkby2XbrM5UmwzRGz8a2Q4WBDKp3d1ZCZAAhZCeWFBObQayL4XPwrOFQUtuPcGP5XVYubaXjZCsNT467yKBg90O71oVPZCbI0FrWcZAZC4GtgZDZD"
+)
+APP_ID = os.getenv("FB_APP_ID", "1336645834088573")
+APP_SECRET = os.getenv("FB_APP_SECRET", "01bf23c5f726c59da318daa82dd0e9dc")
+FacebookAdsApi.init(APP_ID, APP_SECRET, ACCESS_TOKEN)
 
-# ==========================
-#   ENV / CONFIG
-# ==========================
+TELEGRAM_TOKEN = os.getenv(
+    "TG_BOT_TOKEN",
+    "8033028841:AAGud3hSZdR8KQiOSaAcwfbkv8P0p-P3Dt4"
+)
+CHAT_ID = os.getenv("TG_CHAT_ID", "-1002679045097")  # канал/группа по умолчанию
 
-def _getenv_required(name: str) -> str:
-    val = os.getenv(name, "").strip()
-    if not val or val.startswith("PASTE_"):
-        raise RuntimeError(f"Missing or placeholder env var: {name}")
-    return val
+# ========= ФАЙЛЫ / КОНСТАНТЫ =========
+ACCOUNTS_JSON = "accounts.json"        # «база» кабинетов (enabled/метрики/алерты)
+FORECAST_CACHE_FILE = "forecast_cache.json"
+FX_CACHE_FILE = "fx_cache.json"        # кеш курса USD→KZT на 12 часов
+ALMATY_TZ = timezone("Asia/Almaty")
 
-TELEGRAM_TOKEN = _getenv_required("TELEGRAM_TOKEN")
-FB_ACCESS_TOKEN = _getenv_required("FB_ACCESS_TOKEN")
-FB_APP_ID = _getenv_required("FB_APP_ID")
-FB_APP_SECRET = _getenv_required("FB_APP_SECRET")
+# API для курса (apilayer). Ключ можно задать в ENV FX_API_KEY
+FX_API_KEY = os.getenv("FX_API_KEY", "LYr6odX08iC6PXKqQSTT4QtKouCFcWeF")
+FX_CACHE_HOURS = 12
 
-# Где хранить файлы (должен указывать на смонтированный Volume)
-DATA_DIR = os.getenv("DATA_DIR", "/data").strip() or "/data"
-os.makedirs(DATA_DIR, exist_ok=True)
-
-def _path(name: str) -> str:
-    return os.path.join(DATA_DIR, name)
-
-FORECAST_CACHE_FILE = _path("forecast_cache.json")
-ACCOUNTS_JSON = _path("accounts.json")
-
-# Инициализация FB API
-FacebookAdsApi.init(FB_APP_ID, FB_APP_SECRET, FB_ACCESS_TOKEN)
-
-
-# ==========================
-#   ФОЛЛБЕК / ИМЕНА / EXCLUDE
-# ==========================
-
+# ========= Фолбэки (если нет accounts.json) =========
 AD_ACCOUNTS_FALLBACK = [
-    "act_1415004142524014", "act_719853653795521", "act_1206987573792913", "act_1108417930211002",
-    "act_2342025859327675", "act_844229314275496", "act_1333550570916716", "act_195526110289107",
-    "act_2145160982589338", "act_508239018969999", "act_1357165995492721", "act_798205335840576",
+    "act_1415004142524014", "act_719853653795521", "act_1206987573792913",
+    "act_1108417930211002", "act_2342025859327675", "act_844229314275496",
+    "act_1333550570916716", "act_195526110289107", "act_2145160982589338",
+    "act_508239018969999", "act_1357165995492721", "act_798205335840576",
+    "act_806046635254439"
 ]
 
-ACCOUNT_NAMES: Dict[str, str] = {
-    "act_1415004142524014": "ЖС Астана", "act_719853653795521": "ЖС Караганда",
-    "act_1206987573792913": "ЖС Павлодар", "act_1108417930211002": "ЖС Актау",
-    "act_2342025859327675": "ЖС Атырау", "act_844229314275496": "ЖС Актобе",
-    "act_1333550570916716": "ЖС Юг (Алматы)", "act_195526110289107": "ЖС Тараз",
-    "act_2145160982589338": "ЖС Шымкент", "act_508239018969999": "Фитнес Поинт",
-    "act_1357165995492721": "Ария Степи", "act_798205335840576": "Инвестиции",
+# Человекочитаемые имена (дополняются динамически)
+ACCOUNT_NAMES = {
+    "act_1415004142524014": "JanymSoul - Астана",
+    "act_719853653795521": "JanymSoul - Караганда",
+    "act_1206987573792913": "Janym Soul – Павлодар",
+    "act_1108417930211002": "Janym Soul – Актау (janymsoul/1)",
+    "act_2342025859327675": "Janym Soul – Атырау (janymsoul_guw)",
+    "act_844229314275496": "Janym Soul – Актобе",
+    "act_1333550570916716": "Janym Soul – Алматы",
+    "act_195526110289107": "JanymSoul - Тараз",
+    "act_2145160982589338": "JanymSoul - Шымкент",
+    "act_508239018969999": "fitness point",
+    "act_1357165995492721": "Aria Stepi / Ария степи",
+    "act_798205335840576": "JanymSoul – Инвестиции и франшиза",
+    "act_806046635254439": "WonderStage WS",
 }
 
-EXCLUDED_AD_ACCOUNT_IDS = {"act_1042955424178074", "act_4030694587199998"}  # «Кенсе»
+# Исключения при синхронизации из BM (пример: «кенсе»)
+EXCLUDED_AD_ACCOUNT_IDS = {"act_1042955424178074", "act_4030694587199998"}
 EXCLUDED_NAME_KEYWORDS = {"kense", "кенсе"}
 
-
-# ==========================
-#   WORK WITH accounts.json
-# ==========================
-
-def load_accounts() -> Dict[str, Any]:
+# ========= ВСПОМОГАТЕЛЬНЫЕ =========
+def load_accounts() -> dict:
     try:
         with open(ACCOUNTS_JSON, "r", encoding="utf-8") as f:
             return json.load(f)
-    except Exception:
+    except:
         return {}
 
-def save_accounts(data: Dict[str, Any]) -> None:
+def save_accounts(data: dict):
     with open(ACCOUNTS_JSON, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
@@ -103,439 +103,436 @@ def _looks_excluded_by_name(name: str) -> bool:
     n = (name or "").lower()
     return any(k in n for k in EXCLUDED_NAME_KEYWORDS)
 
-def upsert_accounts_from_fb() -> Dict[str, int]:
-    """
-    Тянем me/adaccounts, отбрасываем исключения, объединяем в accounts.json.
-    ВАЖНО: НЕ меняем существующие настройки enabled/metrics — только
-    добавляем новые аккаунты и обновляем name.
-    """
+def get_account_name(acc_id: str) -> str:
+    store = load_accounts()
+    if acc_id in store and store[acc_id].get("name"):
+        return store[acc_id]["name"]
+    return ACCOUNT_NAMES.get(acc_id, acc_id)
+
+def get_enabled_accounts_in_order() -> list[str]:
+    data = load_accounts()
+    if not data:
+        return AD_ACCOUNTS_FALLBACK
+    ordered = [acc_id for acc_id, row in data.items() if row.get("enabled", True)]
+    return ordered or AD_ACCOUNTS_FALLBACK
+
+# ========= СИНК из BM =========
+def upsert_accounts_from_fb() -> dict:
     data = load_accounts()
     me = User(fbid="me")
     fetched = list(me.get_ad_accounts(fields=["account_id", "name", "account_status"]))
-
-    added = updated = skipped = 0
+    added, updated, skipped = 0, 0, 0
     for item in fetched:
         acc_id = _normalize_act_id(item.get("account_id"))
         name = item.get("name") or acc_id
-
         if acc_id in EXCLUDED_AD_ACCOUNT_IDS or _looks_excluded_by_name(name):
             skipped += 1
             continue
-
         ACCOUNT_NAMES.setdefault(acc_id, name)
-
         if acc_id in data:
-            # Обновляем ТОЛЬКО имя
             if name and data[acc_id].get("name") != name:
                 data[acc_id]["name"] = name
                 updated += 1
         else:
-            # Новый аккаунт — включаем, переписки всегда ON, лиды выключены по умолчанию
             data[acc_id] = {
                 "name": name,
                 "enabled": True,
-                "metrics": {"leads": False}
+                "metrics": {"messaging": False, "leads": False},
+                "alerts": {"enabled": False, "target_cpl": 0.0, "target_cpm": 0.0}
             }
             added += 1
-
     save_accounts(data)
     return {"added": added, "updated": updated, "skipped": skipped, "total": len(data)}
 
-def get_enabled_accounts_in_order() -> List[str]:
-    data = load_accounts()
-    if not data:
-        return AD_ACCOUNTS_FALLBACK
-    return [aid for aid, row in data.items() if row.get("enabled", True)] or AD_ACCOUNTS_FALLBACK
-
-def leads_enabled(acc_id: str) -> bool:
-    cfg = load_accounts().get(acc_id, {})
-    return bool(cfg.get("metrics", {}).get("leads", False))
-
-
-# ==========================
-#   FACEBOOK REPORTS
-# ==========================
-
-account_statuses: Dict[str, int] = {}
-
-def is_account_active(account_id: str) -> str:
+# ========= КУРС USD→KZT с кешем и +5 ₸ =========
+def _load_fx_cache():
     try:
-        status = AdAccount(account_id).api_get(fields=['account_status'])['account_status']
-        return "🟢" if status == 1 else "🔴"
-    except Exception:
-        return "🔴"
+        with open(FX_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except:
+        return {}
 
-def format_number(num) -> str:
+def _save_fx_cache(obj: dict):
+    with open(FX_CACHE_FILE, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+
+def get_usd_to_kzt() -> float:
+    cache = _load_fx_cache()
+    now_ts = datetime.now().timestamp()
+    if cache.get("rate") and cache.get("ts") and (now_ts - cache["ts"] <= FX_CACHE_HOURS * 3600):
+        return float(cache["rate"])
+    # apilayer
     try:
-        return f"{int(float(num)):,}".replace(",", " ")
+        url = f"https://api.apilayer.com/fixer/latest?base=USD&symbols=KZT"
+        headers = {"apikey": FX_API_KEY}
+        r = requests.get(url, headers=headers, timeout=10)
+        data = r.json()
+        raw = float(data["rates"]["KZT"])
+        rate = raw + 5.0  # твоя надбавка +5 ₸
+        _save_fx_cache({"rate": rate, "ts": now_ts})
+        return rate
     except Exception:
+        # Фолбэк
+        rate = 500.0 + 5.0
+        _save_fx_cache({"rate": rate, "ts": now_ts})
+        return rate
+
+def kzt_round_up_1000(v: float) -> int:
+    """Округление вверх до 1000 ₸."""
+    return int(math.ceil(v / 1000.0) * 1000)
+
+# ========= Форматтеры =========
+def format_int(n) -> str:
+    try:
+        return f"{int(float(n)):,}".replace(",", " ")
+    except:
         return "0"
 
-def _period_to_params(period) -> Dict[str, Any]:
-    if isinstance(period, dict):
-        return {'time_range': period, 'level': 'account'}
-    return {'date_preset': period, 'level': 'account'}
-
-def get_facebook_data(account_id: str, period, date_label: str = "") -> str:
-    account = AdAccount(account_id)
-    fields = ['impressions', 'cpm', 'clicks', 'cpc', 'spend', 'actions']
-    params = _period_to_params(period)
+def is_account_active(acc_id: str) -> bool:
     try:
-        insights = account.get_insights(fields=fields, params=params)
-        info = account.api_get(fields=['name'])
-        account_name = info.get('name', ACCOUNT_NAMES.get(account_id, account_id))
+        st = AdAccount(acc_id).api_get(fields=["account_status"])["account_status"]
+        return st == 1
+    except:
+        return False
+
+# ========= Отчёты =========
+def extract_actions(insight) -> dict:
+    actions = insight.get("actions", []) or []
+    return {a.get("action_type"): float(a.get("value", 0)) for a in actions}
+
+def account_metrics_flags(acc_id: str) -> dict:
+    store = load_accounts()
+    row = store.get(acc_id, {})
+    metrics = row.get("metrics", {}) or {}
+    return {
+        "messaging": bool(metrics.get("messaging", False)),
+        "leads": bool(metrics.get("leads", False)),
+    }
+
+def get_insight(acc_id: str, period) -> tuple[str, dict]:
+    """
+    period: 'today'|'yesterday'|{'since':'YYYY-MM-DD','until':'YYYY-MM-DD'}
+    Возвращает (account_name, insight_dict_or_None) или бросает исключение.
+    """
+    account = AdAccount(acc_id)
+    fields = ["impressions", "cpm", "clicks", "cpc", "spend", "actions"]
+    params = {'level': 'account'}
+    if isinstance(period, dict):
+        params["time_range"] = period
+    else:
+        params["date_preset"] = period
+    insights = account.get_insights(fields=fields, params=params)
+    name = account.api_get(fields=['name']).get('name', get_account_name(acc_id))
+    return name, insights[0] if insights else None
+
+def build_report_text(acc_id: str, period, date_label="") -> str:
+    try:
+        name, insight = get_insight(acc_id, period)
     except Exception as e:
         err = str(e)
+        # Тихо игнорируем недоступные/403 аккаунты
         if "code: 200" in err or "403" in err or "permissions" in err.lower():
             return ""
-        return f"⚠ Ошибка: {e}"
+        return f"⚠ Ошибка по {get_account_name(acc_id)}:\n\n{e}"
 
+    badge = "🟢" if is_account_active(acc_id) else "🔴"
     date_info = f" ({date_label})" if date_label else ""
-    header = f"{is_account_active(account_id)} <b>{account_name}</b>{date_info}"
+    head = f"{badge} <b>{name}</b>{date_info}\n"
 
-    if not insights:
-        return f"{header}\nНет данных за выбранный период"
+    if not insight:
+        return head + "Нет данных за выбранный период"
 
-    ins = insights[0]
-    report = [
-        header,
-        f"👁 Показы: {format_number(ins.get('impressions', '0'))}",
-        f"🎯 CPM: {round(float(ins.get('cpm', 0) or 0), 2)} $",
-        f"🖱 Клики: {format_number(ins.get('clicks', '0'))}",
-        f"💸 CPC: {round(float(ins.get('cpc', 0) or 0), 2)} $",
-        f"💵 Затраты: {round(float(ins.get('spend', 0) or 0), 2)} $",
-    ]
+    body = []
+    body.append(f"👁 Показы: {format_int(insight.get('impressions', 0))}")
+    body.append(f"🎯 CPM: {round(float(insight.get('cpm', 0) or 0), 2)} $")
+    body.append(f"🖱 Клики: {format_int(insight.get('clicks', 0))}")
+    body.append(f"💸 CPC: {round(float(insight.get('cpc', 0) or 0), 2)} $")
+    body.append(f"💵 Затраты: {round(float(insight.get('spend', 0) or 0), 2)} $")
 
-    act_map = {a['action_type']: float(a['value']) for a in ins.get('actions', [])}
+    acts = extract_actions(insight)
+    flags = account_metrics_flags(acc_id)
 
-    # Переписки — ВСЕГДА
-    conv = act_map.get('onsite_conversion.messaging_conversation_started_7d', 0.0)
-    report.append(f"✉️ Переписки: {int(conv)}")
-    if conv > 0:
-        report.append(f"💬💲 Цена переписки: {round(float(ins.get('spend', 0) or 0) / conv, 2)} $")
+    # Переписки
+    if flags["messaging"]:
+        conv = acts.get('onsite_conversion.messaging_conversation_started_7d', 0)
+        body.append(f"✉️ Переписки: {int(conv)}")
+        spend = float(insight.get('spend', 0) or 0)
+        if conv > 0:
+            body.append(f"💬💲 Цена переписки: {round(spend/conv, 2)} $")
 
-    # Лиды — только если включено (♿️)
-    if leads_enabled(account_id):
-        leads = (
-            act_map.get('Website Submit Applications', 0.0) or
-            act_map.get('offsite_conversion.fb_pixel_submit_application', 0.0) or
-            act_map.get('offsite_conversion.fb_pixel_lead', 0.0) or
-            act_map.get('lead', 0.0)
-        )
-        report.append(f"📩 Лиды: {int(leads)}")
+    # Лиды сайта (Website Submit Applications — твоя специфика)
+    if flags["leads"]:
+        leads = acts.get('Website Submit Applications', 0) or \
+                acts.get('offsite_conversion.fb_pixel_submit_application', 0) or \
+                acts.get('offsite_conversion.fb_pixel_lead', 0) or \
+                acts.get('lead', 0)
+        body.append(f"📩 Лиды: {int(leads)}")
+        spend = float(insight.get('spend', 0) or 0)
         if leads > 0:
-            report.append(f"📩💲 Цена лида: {round(float(ins.get('spend', 0) or 0) / leads, 2)} $")
+            body.append(f"📩💲 Цена лида: {round(spend/leads, 2)} $")
 
-    return "\n".join(report)
+    return head + "\n".join(body)
 
-async def send_report(context: ContextTypes.DEFAULT_TYPE, chat_id: int | str, period, date_label: str = ""):
-    for acc in get_enabled_accounts_in_order():
-        msg = get_facebook_data(acc, period, date_label)
-        if msg:
-            await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='HTML')
+async def send_period_report(context, chat_id, period, date_label=""):
+    for acc_id in get_enabled_accounts_in_order():
+        txt = build_report_text(acc_id, period, date_label)
+        if txt:
+            await context.bot.send_message(chat_id=chat_id, text=txt, parse_mode="HTML")
 
-async def check_billing(context: ContextTypes.DEFAULT_TYPE):
-    global account_statuses
-    for account_id in get_enabled_accounts_in_order():
-        try:
-            account = AdAccount(account_id)
-            info = account.api_get(fields=['name', 'account_status', 'balance'])
-            status = info.get('account_status')
-            if account_id in account_statuses and account_statuses[account_id] == 1 and status != 1:
-                name = info.get('name', ACCOUNT_NAMES.get(account_id, account_id))
-                balance = float(info.get('balance', 0) or 0) / 100
-                await context.bot.send_message(
-                    chat_id=os.getenv("CHAT_ID", ""),
-                    text=f"⚠️ ⚠️ ⚠️ Ахтунг! {name}! у нас биллинг — {balance:.2f} $",
-                    parse_mode='HTML'
-                )
-            account_statuses[account_id] = status
-        except Exception:
-            continue
-
-async def daily_report(context: ContextTypes.DEFAULT_TYPE):
-    label = (datetime.now(timezone('Asia/Almaty')) - timedelta(days=1)).strftime('%d.%m.%Y')
-    await send_report(context, os.getenv("CHAT_ID", ""), 'yesterday', label)
-
-async def check_billing_forecast(context: ContextTypes.DEFAULT_TYPE):
-    today = datetime.now(timezone("Asia/Almaty")).date()
-    try:
-        with open(FORECAST_CACHE_FILE, "r") as f:
-            cache = json.load(f)
-    except Exception:
-        cache = {}
-
+# ========= Биллинг =========
+async def send_billing_list(ctx: ContextTypes.DEFAULT_TYPE, chat_id: str):
+    rate = get_usd_to_kzt()
     for acc_id in get_enabled_accounts_in_order():
         try:
-            acc = AdAccount(acc_id)
-            info = acc.api_get(fields=["name", "spend_cap", "amount_spent"])
-            spend_cap = float(info.get("spend_cap", 0) or 0) / 100
-            spent = float(info.get("amount_spent", 0) or 0) / 100
-            available = spend_cap - spent
-            daily_budget = sum(
-                int(c.get("daily_budget", 0) or 0) / 100
-                for c in acc.get_campaigns(fields=["name", "effective_status", "daily_budget"])
-                if c.get("effective_status") == "ACTIVE"
-            )
-            if daily_budget == 0:
-                continue
-            days_left = ceil(available / daily_budget) if daily_budget else 0
-            billing_date = today + timedelta(days=days_left)
-            if (billing_date - today).days == 3:
-                if cache.get(acc_id) == billing_date.isoformat():
-                    continue
-                name = ACCOUNT_NAMES.get(acc_id, acc_id)
-                msg = (
-                    f"⚠️ <b>{name}</b>\n\n"
-                    f"Предполагаемое списание: <b>{spend_cap:.2f} $</b>\n"
-                    f"Дата: <b>{billing_date.strftime('%d.%m.%Y')}</b>\n"
-                    f"До порога осталось: <b>{available:.2f} $</b>\n"
-                    f"Суммарный дневной бюджет: <b>{daily_budget:.2f} $</b>\n"
-                    f"Осталось дней: <b>{days_left}</b>"
-                )
-                await context.bot.send_message(chat_id=os.getenv("CHAT_ID", ""), text=msg, parse_mode='HTML')
-                cache[acc_id] = billing_date.isoformat()
+            info = AdAccount(acc_id).api_get(fields=["name", "account_status", "balance"])
         except Exception:
-            continue
+            continue  # нет доступа — молча пропускаем
+        if info.get("account_status") == 1:
+            continue  # активные не шлём — просили только неактивные
+        name = info.get("name", get_account_name(acc_id))
+        usd = float(info.get("balance", 0) or 0) / 100.0
+        kzt = kzt_round_up_1000(usd * rate)
+        badge = "🔴"
+        txt = (f"{badge} <b>{name}</b>\n"
+               f"   💵 {usd:.2f} $  |  🇰🇿 {format_int(kzt)} ₸")
+        await ctx.bot.send_message(chat_id=chat_id, text=txt, parse_mode="HTML")
 
-    with open(FORECAST_CACHE_FILE, "w") as f:
-        json.dump(cache, f)
-
-
-# ==========================
-#   UI / MENUS
-# ==========================
-
-def kb_main_private() -> InlineKeyboardMarkup:
+# ========= UI: меню и клавиатуры =========
+def main_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Сегодня", callback_data="rpt:all:today"),
-         InlineKeyboardButton("Вчера", callback_data="rpt:all:yesterday")],
-        [InlineKeyboardButton("Прошедшая неделя", callback_data="rpt:all:week")],
-        [InlineKeyboardButton("📊 Отчёт по аккаунту", callback_data="pick:account")],
-        [InlineKeyboardButton("💳 Биллинг", callback_data="billing:list")],
-        [InlineKeyboardButton("⚙️ Настройки", callback_data="settings:root")],
+        [InlineKeyboardButton("Сегодня", callback_data="rep_today"),
+         InlineKeyboardButton("Вчера", callback_data="rep_yesterday")],
+        [InlineKeyboardButton("Прошедшая неделя", callback_data="rep_week")],
+        [InlineKeyboardButton("Отчёт по аккаунту", callback_data="choose_acc_for_report")],
+        [InlineKeyboardButton("Биллинг", callback_data="billing_now")],
+        [InlineKeyboardButton("Настройки", callback_data="choose_acc_for_settings")],
     ])
 
-def kb_main_group() -> InlineKeyboardMarkup:
+def _acc_flags_text(acc_id: str) -> str:
+    store = load_accounts()
+    row = store.get(acc_id, {})
+    enabled = bool(row.get("enabled", True))
+    metrics = row.get("metrics", {}) or {}
+    alerts = row.get("alerts", {}) or {}
+    on = "🟢" if enabled else "🔴"
+    m = "💬" if metrics.get("messaging") else ""
+    l = "♿️" if metrics.get("leads") else ""
+    al = "⚠️" if alerts.get("enabled") else ""
+    return f"{on} {m}{l}{al}".strip()
+
+def accounts_list_kb(prefix: str) -> InlineKeyboardMarkup:
+    store = load_accounts()
+    acc_ids = list(store.keys()) if store else AD_ACCOUNTS_FALLBACK
+    rows = []
+    for acc_id in acc_ids:
+        name = get_account_name(acc_id)
+        flags = _acc_flags_text(acc_id)
+        label = f"{flags}  {name}" if flags else name
+        rows.append([InlineKeyboardButton(label, callback_data=f"{prefix}|{acc_id}")])
+    rows.append([InlineKeyboardButton("⬅️ В меню", callback_data="menu_back")])
+    return InlineKeyboardMarkup(rows)
+
+def settings_kb_for(acc_id: str) -> InlineKeyboardMarkup:
+    store = load_accounts()
+    row = store.get(acc_id, {"enabled": True, "metrics": {}, "alerts": {}})
+    en = "Выключить кабинет" if row.get("enabled", True) else "Включить кабинет"
+    m_on = row.get("metrics", {}).get("messaging", False)
+    l_on = row.get("metrics", {}).get("leads", False)
+    a_on = row.get("alerts", {}).get("enabled", False)
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Сегодня", callback_data="rpt:all:today"),
-         InlineKeyboardButton("Вчера", callback_data="rpt:all:yesterday"),
-         InlineKeyboardButton("Неделя", callback_data="rpt:all:week")],
-        [InlineKeyboardButton("Биллинг", callback_data="billing:list"),
-         InlineKeyboardButton("Аккаунт ▶︎", callback_data="pick:account")],
+        [InlineKeyboardButton(en, callback_data=f"toggle_enabled|{acc_id}")],
+        [InlineKeyboardButton(f"💬 Переписки: {'ON' if m_on else 'OFF'}",
+                              callback_data=f"toggle_messaging|{acc_id}"),
+         InlineKeyboardButton(f"♿️ Лиды сайта: {'ON' if l_on else 'OFF'}",
+                              callback_data=f"toggle_leads|{acc_id}")],
+        [InlineKeyboardButton(f"⚠️ Оповещения CPA: {'ON' if a_on else 'OFF'}",
+                              callback_data=f"toggle_alerts|{acc_id}")],
+        [InlineKeyboardButton("⬅️ Назад к списку", callback_data="choose_acc_for_settings")]
     ])
 
-def kb_period_for_account(acc_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Сегодня", callback_data=f"rpt:{acc_id}:today"),
-         InlineKeyboardButton("Вчера", callback_data=f"rpt:{acc_id}:yesterday")],
-        [InlineKeyboardButton("Прошедшая неделя", callback_data=f"rpt:{acc_id}:week")],
-        [InlineKeyboardButton("← Назад", callback_data="pick:account")],
-    ])
+# ========= Команды =========
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="🤖 Выберите действие:",
+        reply_markup=main_menu_kb()
+    )
 
-def kb_settings_account(acc_id: str, leads_on: bool) -> InlineKeyboardMarkup:
-    label_leads = f"♿️ Лид с сайта: {'ВКЛ' if leads_on else 'ВЫКЛ'}"
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(label_leads, callback_data=f"toggle:leads:{acc_id}")],
-        [InlineKeyboardButton("← Назад", callback_data="settings:root")],
-    ])
-
-
-# ==========================
-#   HANDLERS
-# ==========================
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    if chat.type == "private":
-        await update.message.reply_text("🤖 Выберите действие:", reply_markup=kb_main_private())
-    else:
-        await update.message.reply_text("🤖 Выберите отчёт:", reply_markup=kb_main_group())
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = (
         "Доступные команды:\n"
-        "/start — меню\n"
-        "/help — это сообщение\n"
-        "/sync_accounts — подтянуть кабинеты из БМ\n"
-        "/accounts — показать текущие флаги\n"
+        "/start — показать меню\n"
+        "/help — подсказка\n"
+        "/billing — список биллингов\n"
+        "/sync_accounts — подтянуть кабинеты из BM (админ)\n"
     )
     await update.message.reply_text(txt)
 
-def is_admin(user_id: int) -> bool:
-    return True
+async def cmd_billing(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_billing_list(context, update.effective_chat.id)
 
 async def cmd_sync_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
+    # при желании можно проверять ID админа
     try:
         res = upsert_accounts_from_fb()
-        msg = (
-            "✅ Синхронизация завершена\n"
-            f"Добавлено: {res['added']}\n"
-            f"Обновлено имён: {res['updated']}\n"
-            f"Пропущено (исключено): {res['skipped']}\n"
-            f"Итого в конфиге: {res['total']}"
-        )
+        msg = (f"✅ Синхронизировано.\nДобавлено: {res['added']}\n"
+               f"Обновлено имён: {res['updated']}\n"
+               f"Пропущено: {res['skipped']}\nВсего: {res['total']}")
         await update.message.reply_text(msg)
     except Exception as e:
-        await update.message.reply_text(f"⚠️ Ошибка синхронизации: {e}")
+        await update.message.reply_text(f"⚠️ Ошибка синка: {e}")
 
-async def cmd_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_accounts()
-    if not data:
-        await update.message.reply_text("Конфиг пуст. Сначала /sync_accounts")
+# ========= Callback-и (inline) =========
+async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = q.data or ""
+
+    # меню
+    if data == "menu_back":
+        await q.edit_message_text("🤖 Выберите действие:", reply_markup=main_menu_kb())
         return
-    lines = []
-    for acc_id, row in data.items():
-        name = row.get("name") or ACCOUNT_NAMES.get(acc_id, acc_id)
-        enabled = "ВКЛ" if row.get("enabled", True) else "ВЫКЛ"
-        leads = "ВКЛ" if row.get("metrics", {}).get("leads", False) else "ВЫКЛ"
-        lines.append(f"• {name}  —  аккаунт: {enabled}  /  ♿️ лид: {leads}")
-    await update.message.reply_text("Текущие настройки:\n" + "\n".join(lines))
 
-async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
+    # отчёты общие
+    if data == "rep_today":
+        label = datetime.now(ALMATY_TZ).strftime('%d.%m.%Y')
+        await q.edit_message_text(f"Отчёт за {label}. Готовлю…")
+        await send_period_report(context, q.message.chat.id, 'today', label)
         return
-    text = update.message.text.strip()
 
-    if text == 'Сегодня':
-        label = datetime.now().strftime('%d.%m.%Y')
-        await send_report(context, update.message.chat_id, 'today', label)
-    elif text == 'Вчера':
-        label = (datetime.now() - timedelta(days=1)).strftime('%d.%m.%Y')
-        await send_report(context, update.message.chat_id, 'yesterday', label)
-    elif text == 'Прошедшая неделя':
-        until = datetime.now() - timedelta(days=1)
+    if data == "rep_yesterday":
+        label = (datetime.now(ALMATY_TZ) - timedelta(days=1)).strftime('%d.%m.%Y')
+        await q.edit_message_text(f"Отчёт за {label}. Готовлю…")
+        await send_period_report(context, q.message.chat.id, 'yesterday', label)
+        return
+
+    if data == "rep_week":
+        until = datetime.now(ALMATY_TZ) - timedelta(days=1)
         since = until - timedelta(days=6)
         period = {'since': since.strftime('%Y-%m-%d'), 'until': until.strftime('%Y-%m-%d')}
         label = f"{since.strftime('%d.%m')}-{until.strftime('%d.%m')}"
-        await send_report(context, update.message.chat_id, period, label)
-    elif text == 'Биллинг':
-        await check_billing(context)
-    else:
-        if update.effective_chat.type == "private":
-            keyboard = [['Сегодня', 'Вчера'], ['Прошедшая неделя', 'Биллинг']]
-            await update.message.reply_text('🤖 Выберите отчёт:',
-                                            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
-
-async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data or ""
-
-    if data.startswith("rpt:"):
-        _, target, period = data.split(":")
-        if period == "today":
-            label = datetime.now().strftime('%d.%m.%Y')
-            if target == "all":
-                await send_report(context, query.message.chat_id, 'today', label)
-            else:
-                msg = get_facebook_data(target, 'today', label)
-                if msg:
-                    await context.bot.send_message(query.message.chat_id, msg, parse_mode='HTML')
-        elif period == "yesterday":
-            label = (datetime.now() - timedelta(days=1)).strftime('%d.%m.%Y')
-            if target == "all":
-                await send_report(context, query.message.chat_id, 'yesterday', label)
-            else:
-                msg = get_facebook_data(target, 'yesterday', label)
-                if msg:
-                    await context.bot.send_message(query.message.chat_id, msg, parse_mode='HTML')
-        elif period == "week":
-            until = datetime.now() - timedelta(days=1)
-            since = until - timedelta(days=6)
-            period_obj = {'since': since.strftime('%Y-%m-%d'), 'until': until.strftime('%Y-%m-%d')}
-            label = f"{since.strftime('%d.%m')}-{until.strftime('%d.%m')}"
-            if target == "all":
-                await send_report(context, query.message.chat_id, period_obj, label)
-            else:
-                msg = get_facebook_data(target, period_obj, label)
-                if msg:
-                    await context.bot.send_message(query.message.chat_id, msg, parse_mode='HTML')
+        await q.edit_message_text(f"Отчёт за {label}. Готовлю…")
+        await send_period_report(context, q.message.chat.id, period, label)
         return
 
-    if data == "billing:list":
-        await check_billing(context)
+    # выбор аккаунта для отчёта
+    if data == "choose_acc_for_report":
+        await q.edit_message_text("Выберите аккаунт:", reply_markup=accounts_list_kb("report_one"))
+        return
+    if data.startswith("report_one|"):
+        acc_id = data.split("|", 1)[1]
+        label = datetime.now(ALMATY_TZ).strftime('%d.%m.%Y')
+        await q.edit_message_text(f"Отчёт по {get_account_name(acc_id)} за сегодня:")
+        txt = build_report_text(acc_id, 'today', label)
+        if txt:
+            await context.bot.send_message(q.message.chat.id, txt, parse_mode="HTML")
+        else:
+            await context.bot.send_message(q.message.chat.id, "Нет данных/нет доступа.")
         return
 
-    if data == "pick:account":
-        rows = []
-        for acc in get_enabled_accounts_in_order():
-            dot = is_account_active(acc)
-            name = ACCOUNT_NAMES.get(acc, acc)
-            rows.append([InlineKeyboardButton(f"{dot} {name}", callback_data=f"pickp:{acc}")])
-        rows.append([InlineKeyboardButton("Закрыть", callback_data="noop")])
-        await query.message.reply_text("Выберите аккаунт:", reply_markup=InlineKeyboardMarkup(rows))
+    # биллинг
+    if data == "billing_now":
+        await q.edit_message_text("📋 Биллинги (неактивные аккаунты):")
+        await send_billing_list(context, q.message.chat.id)
         return
 
-    if data.startswith("pickp:"):
-        acc_id = data.split(":", 1)[1]
-        await query.message.reply_text("Выберите период:", reply_markup=kb_period_for_account(acc_id))
+    # настройки
+    if data == "choose_acc_for_settings":
+        await q.edit_message_text("Выберите аккаунт для настроек:", reply_markup=accounts_list_kb("settings"))
+        return
+    if data.startswith("settings|"):
+        acc_id = data.split("|", 1)[1]
+        await q.edit_message_text(
+            f"Настройки: {get_account_name(acc_id)}",
+            reply_markup=settings_kb_for(acc_id)
+        )
         return
 
-    if data == "settings:root":
-        rows = []
-        data_map = load_accounts()
-        if not data_map:
-            await query.message.reply_text("Сначала выполните /sync_accounts")
-            return
-        for acc_id, row in data_map.items():
-            name = row.get("name") or ACCOUNT_NAMES.get(acc_id, acc_id)
-            leads_on = bool(row.get("metrics", {}).get("leads", False))
-            rows.append([InlineKeyboardButton(f"{name} • ♿️ {'ВКЛ' if leads_on else 'ВЫКЛ'}",
-                                              callback_data=f"settings:acc:{acc_id}")])
-        rows.append([InlineKeyboardButton("Закрыть", callback_data="noop")])
-        await query.message.reply_text("Настройки метрик (переписки всегда ВКЛ):",
-                                       reply_markup=InlineKeyboardMarkup(rows))
+    # переключатели
+    if data.startswith("toggle_enabled|"):
+        acc_id = data.split("|", 1)[1]
+        store = load_accounts()
+        row = store.get(acc_id, {})
+        row["enabled"] = not row.get("enabled", True)
+        store[acc_id] = row
+        save_accounts(store)
+        await q.edit_message_text(
+            f"Настройки: {get_account_name(acc_id)}",
+            reply_markup=settings_kb_for(acc_id)
+        )
         return
 
-    if data.startswith("settings:acc:"):
-        acc_id = data.split(":")[-1]
-        accs = load_accounts()
-        row = accs.get(acc_id, {"metrics": {}})
-        leads_on = bool(row.get("metrics", {}).get("leads", False))
-        await query.message.reply_text(f"Настройки: {ACCOUNT_NAMES.get(acc_id, acc_id)}",
-                                       reply_markup=kb_settings_account(acc_id, leads_on))
+    if data.startswith("toggle_messaging|"):
+        acc_id = data.split("|", 1)[1]
+        store = load_accounts()
+        row = store.get(acc_id, {"metrics": {}})
+        metrics = row.get("metrics", {})
+        metrics["messaging"] = not metrics.get("messaging", False)
+        row["metrics"] = metrics
+        store[acc_id] = row
+        save_accounts(store)
+        await q.edit_message_text(
+            f"Настройки: {get_account_name(acc_id)}",
+            reply_markup=settings_kb_for(acc_id)
+        )
         return
 
-    if data.startswith("toggle:leads:"):
-        acc_id = data.split(":")[-1]
-        accs = load_accounts()
-        r = accs.get(acc_id)
-        if not r:
-            await query.message.reply_text("Не найдено в конфиге.")
-            return
-        m = r.setdefault("metrics", {})
-        m["leads"] = not bool(m.get("leads", False))
-        save_accounts(accs)
-        await query.message.reply_text("✅ Сохранено.",
-                                       reply_markup=kb_settings_account(acc_id, m["leads"]))
+    if data.startswith("toggle_leads|"):
+        acc_id = data.split("|", 1)[1]
+        store = load_accounts()
+        row = store.get(acc_id, {"metrics": {}})
+        metrics = row.get("metrics", {})
+        metrics["leads"] = not metrics.get("leads", False)
+        row["metrics"] = metrics
+        store[acc_id] = row
+        save_accounts(store)
+        await q.edit_message_text(
+            f"Настройки: {get_account_name(acc_id)}",
+            reply_markup=settings_kb_for(acc_id)
+        )
         return
 
-    if data == "noop":
+    if data.startswith("toggle_alerts|"):
+        acc_id = data.split("|", 1)[1]
+        store = load_accounts()
+        row = store.get(acc_id, {"alerts": {}})
+        alerts = row.get("alerts", {})
+        alerts["enabled"] = not alerts.get("enabled", False)
+        row["alerts"] = alerts
+        store[acc_id] = row
+        save_accounts(store)
+        await q.edit_message_text(
+            f"Настройки: {get_account_name(acc_id)}",
+            reply_markup=settings_kb_for(acc_id)
+        )
         return
 
+# ========= Планировщики (оставил пример ежедневного отчёта) =========
+async def daily_report(context: ContextTypes.DEFAULT_TYPE):
+    label = (datetime.now(ALMATY_TZ) - timedelta(days=1)).strftime('%d.%m.%Y')
+    await send_period_report(context, CHAT_ID, 'yesterday', label)
 
-# ==========================
-#   BOOTSTRAP
-# ==========================
+# ========= Boot =========
+def build_app() -> Application:
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-app = Application.builder().token(TELEGRAM_TOKEN).build()
+    # команды
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("billing", cmd_billing))
+    app.add_handler(CommandHandler("sync_accounts", cmd_sync_accounts))
 
-app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("help", help_cmd))
-app.add_handler(CommandHandler("sync_accounts", cmd_sync_accounts))
-app.add_handler(CommandHandler("accounts", cmd_accounts))
+    # inline callbacks
+    app.add_handler(CallbackQueryHandler(on_cb))
 
-app.add_handler(CallbackQueryHandler(callback_router))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+    # (опционально) — старые текстовые кнопки, если используешь где-то
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, lambda *_: None))
 
-# Планировщик
-app.job_queue.run_repeating(check_billing, interval=600, first=10)
-app.job_queue.run_daily(daily_report, time=time(hour=9, minute=30, tzinfo=timezone('Asia/Almaty')))
-app.job_queue.run_daily(check_billing_forecast, time=time(hour=9, minute=0, tzinfo=timezone('Asia/Almaty')))
+    # ежедневный отчёт 09:30
+    app.job_queue.run_daily(daily_report, time=time(hour=9, minute=30, tzinfo=ALMATY_TZ))
+
+    return app
 
 if __name__ == "__main__":
     print("🚀 Бот запущен и ожидает команд.")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    build_app().run_polling(allowed_updates=Update.ALL_TYPES)
