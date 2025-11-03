@@ -1,4 +1,4 @@
-import asyncio
+import os
 import json
 from math import ceil
 from datetime import datetime, timedelta, time
@@ -27,33 +27,46 @@ from telegram.ext import (
     ContextTypes,
 )
 
+
 # ==========================
-#   КОНФИГ / ТОКЕНЫ
+#   ENV / CONFIG
 # ==========================
 
-# Заполни своими значениями или выставь переменные окружения в Railway
-ACCESS_TOKEN = "PASTE_FACEBOOK_ACCESS_TOKEN"
-APP_ID = "PASTE_APP_ID"
-APP_SECRET = "PASTE_APP_SECRET"
+def _getenv_required(name: str) -> str:
+    val = os.getenv(name, "").strip()
+    if not val or val.startswith("PASTE_"):
+        raise RuntimeError(f"Missing or placeholder env var: {name}")
+    return val
 
-TELEGRAM_TOKEN = "PASTE_TELEGRAM_BOT_TOKEN"
-CHAT_ID = "-1002679045097"  # твоя группа для ежедневных отчётов
+TELEGRAM_TOKEN = _getenv_required("TELEGRAM_TOKEN")
+FB_ACCESS_TOKEN = _getenv_required("FB_ACCESS_TOKEN")
+FB_APP_ID = _getenv_required("FB_APP_ID")
+FB_APP_SECRET = _getenv_required("FB_APP_SECRET")
+
+# Где хранить файлы (должен указывать на смонтированный Volume)
+DATA_DIR = os.getenv("DATA_DIR", "/data").strip() or "/data"
+os.makedirs(DATA_DIR, exist_ok=True)
+
+def _path(name: str) -> str:
+    return os.path.join(DATA_DIR, name)
+
+FORECAST_CACHE_FILE = _path("forecast_cache.json")
+ACCOUNTS_JSON = _path("accounts.json")
 
 # Инициализация FB API
-FacebookAdsApi.init(APP_ID, APP_SECRET, ACCESS_TOKEN)
+FacebookAdsApi.init(FB_APP_ID, FB_APP_SECRET, FB_ACCESS_TOKEN)
 
-# Файлы кэша/конфига
-FORECAST_CACHE_FILE = "forecast_cache.json"
-ACCOUNTS_JSON = "accounts.json"
 
-# Фоллбек-список (если нет accounts.json)
+# ==========================
+#   ФОЛЛБЕК / ИМЕНА / EXCLUDE
+# ==========================
+
 AD_ACCOUNTS_FALLBACK = [
     "act_1415004142524014", "act_719853653795521", "act_1206987573792913", "act_1108417930211002",
     "act_2342025859327675", "act_844229314275496", "act_1333550570916716", "act_195526110289107",
     "act_2145160982589338", "act_508239018969999", "act_1357165995492721", "act_798205335840576",
 ]
 
-# Читабельные имена (дополняется во время синка)
 ACCOUNT_NAMES: Dict[str, str] = {
     "act_1415004142524014": "ЖС Астана", "act_719853653795521": "ЖС Караганда",
     "act_1206987573792913": "ЖС Павлодар", "act_1108417930211002": "ЖС Актау",
@@ -63,12 +76,12 @@ ACCOUNT_NAMES: Dict[str, str] = {
     "act_1357165995492721": "Ария Степи", "act_798205335840576": "Инвестиции",
 }
 
-# Исключаем из авто-синка (например «Кенсе»)
-EXCLUDED_AD_ACCOUNT_IDS = {"act_1042955424178074", "act_4030694587199998"}
+EXCLUDED_AD_ACCOUNT_IDS = {"act_1042955424178074", "act_4030694587199998"}  # «Кенсе»
 EXCLUDED_NAME_KEYWORDS = {"kense", "кенсе"}
 
+
 # ==========================
-#   УТИЛИТЫ accounts.json
+#   WORK WITH accounts.json
 # ==========================
 
 def load_accounts() -> Dict[str, Any]:
@@ -93,7 +106,8 @@ def _looks_excluded_by_name(name: str) -> bool:
 def upsert_accounts_from_fb() -> Dict[str, int]:
     """
     Тянем me/adaccounts, отбрасываем исключения, объединяем в accounts.json.
-    Переписки включены ВСЕГДА (не настраиваются), тумблер только для ♿️ leads.
+    ВАЖНО: НЕ меняем существующие настройки enabled/metrics — только
+    добавляем новые аккаунты и обновляем name.
     """
     data = load_accounts()
     me = User(fbid="me")
@@ -111,14 +125,16 @@ def upsert_accounts_from_fb() -> Dict[str, int]:
         ACCOUNT_NAMES.setdefault(acc_id, name)
 
         if acc_id in data:
+            # Обновляем ТОЛЬКО имя
             if name and data[acc_id].get("name") != name:
                 data[acc_id]["name"] = name
                 updated += 1
         else:
+            # Новый аккаунт — включаем, переписки всегда ON, лиды выключены по умолчанию
             data[acc_id] = {
                 "name": name,
                 "enabled": True,
-                "metrics": {"leads": False}  # переписки ALWAYS ON
+                "metrics": {"leads": False}
             }
             added += 1
 
@@ -129,15 +145,15 @@ def get_enabled_accounts_in_order() -> List[str]:
     data = load_accounts()
     if not data:
         return AD_ACCOUNTS_FALLBACK
-    # порядок — как в файле (dict в Py3.7+ упорядочен по вставке)
     return [aid for aid, row in data.items() if row.get("enabled", True)] or AD_ACCOUNTS_FALLBACK
 
 def leads_enabled(acc_id: str) -> bool:
     cfg = load_accounts().get(acc_id, {})
     return bool(cfg.get("metrics", {}).get("leads", False))
 
+
 # ==========================
-#   FB / ОТЧЁТЫ
+#   FACEBOOK REPORTS
 # ==========================
 
 account_statuses: Dict[str, int] = {}
@@ -161,11 +177,6 @@ def _period_to_params(period) -> Dict[str, Any]:
     return {'date_preset': period, 'level': 'account'}
 
 def get_facebook_data(account_id: str, period, date_label: str = "") -> str:
-    """
-    Возвращает HTML-сообщение по аккаунту или "" если аккаунт недоступен (403/permissions).
-    Переписки — всегда показываем.
-    Лиды — только если включены (♿️).
-    """
     account = AdAccount(account_id)
     fields = ['impressions', 'cpm', 'clicks', 'cpc', 'spend', 'actions']
     params = _period_to_params(period)
@@ -176,7 +187,7 @@ def get_facebook_data(account_id: str, period, date_label: str = "") -> str:
     except Exception as e:
         err = str(e)
         if "code: 200" in err or "403" in err or "permissions" in err.lower():
-            return ""  # молча пропускаем
+            return ""
         return f"⚠ Ошибка: {e}"
 
     date_info = f" ({date_label})" if date_label else ""
@@ -195,7 +206,6 @@ def get_facebook_data(account_id: str, period, date_label: str = "") -> str:
         f"💵 Затраты: {round(float(ins.get('spend', 0) or 0), 2)} $",
     ]
 
-    # Собираем действия
     act_map = {a['action_type']: float(a['value']) for a in ins.get('actions', [])}
 
     # Переписки — ВСЕГДА
@@ -204,7 +214,7 @@ def get_facebook_data(account_id: str, period, date_label: str = "") -> str:
     if conv > 0:
         report.append(f"💬💲 Цена переписки: {round(float(ins.get('spend', 0) or 0) / conv, 2)} $")
 
-    # Лиды — по тумблеру ♿️
+    # Лиды — только если включено (♿️)
     if leads_enabled(account_id):
         leads = (
             act_map.get('Website Submit Applications', 0.0) or
@@ -235,7 +245,7 @@ async def check_billing(context: ContextTypes.DEFAULT_TYPE):
                 name = info.get('name', ACCOUNT_NAMES.get(account_id, account_id))
                 balance = float(info.get('balance', 0) or 0) / 100
                 await context.bot.send_message(
-                    chat_id=CHAT_ID,
+                    chat_id=os.getenv("CHAT_ID", ""),
                     text=f"⚠️ ⚠️ ⚠️ Ахтунг! {name}! у нас биллинг — {balance:.2f} $",
                     parse_mode='HTML'
                 )
@@ -245,7 +255,7 @@ async def check_billing(context: ContextTypes.DEFAULT_TYPE):
 
 async def daily_report(context: ContextTypes.DEFAULT_TYPE):
     label = (datetime.now(timezone('Asia/Almaty')) - timedelta(days=1)).strftime('%d.%m.%Y')
-    await send_report(context, CHAT_ID, 'yesterday', label)
+    await send_report(context, os.getenv("CHAT_ID", ""), 'yesterday', label)
 
 async def check_billing_forecast(context: ContextTypes.DEFAULT_TYPE):
     today = datetime.now(timezone("Asia/Almaty")).date()
@@ -283,7 +293,7 @@ async def check_billing_forecast(context: ContextTypes.DEFAULT_TYPE):
                     f"Суммарный дневной бюджет: <b>{daily_budget:.2f} $</b>\n"
                     f"Осталось дней: <b>{days_left}</b>"
                 )
-                await context.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode='HTML')
+                await context.bot.send_message(chat_id=os.getenv("CHAT_ID", ""), text=msg, parse_mode='HTML')
                 cache[acc_id] = billing_date.isoformat()
         except Exception:
             continue
@@ -291,8 +301,9 @@ async def check_billing_forecast(context: ContextTypes.DEFAULT_TYPE):
     with open(FORECAST_CACHE_FILE, "w") as f:
         json.dump(cache, f)
 
+
 # ==========================
-#   UI / МЕНЮ
+#   UI / MENUS
 # ==========================
 
 def kb_main_private() -> InlineKeyboardMarkup:
@@ -329,8 +340,9 @@ def kb_settings_account(acc_id: str, leads_on: bool) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("← Назад", callback_data="settings:root")],
     ])
 
+
 # ==========================
-#   ХЕНДЛЕРЫ
+#   HANDLERS
 # ==========================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -346,12 +358,11 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/start — меню\n"
         "/help — это сообщение\n"
         "/sync_accounts — подтянуть кабинеты из БМ\n"
-        "/accounts — список/вкл/выкл аккаунтов\n"
+        "/accounts — показать текущие флаги\n"
     )
     await update.message.reply_text(txt)
 
 def is_admin(user_id: int) -> bool:
-    # при необходимости — ограничь список
     return True
 
 async def cmd_sync_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -384,7 +395,6 @@ async def cmd_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Текущие настройки:\n" + "\n".join(lines))
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Лёгкая клавиатура на текст «Сегодня/Вчера/Неделя/Биллинг» — по желанию
     if not update.message or not update.message.text:
         return
     text = update.message.text.strip()
@@ -414,7 +424,6 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data or ""
 
-    # Отчёты (все/один)
     if data.startswith("rpt:"):
         _, target, period = data.split(":")
         if period == "today":
@@ -446,12 +455,10 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await context.bot.send_message(query.message.chat_id, msg, parse_mode='HTML')
         return
 
-    # Биллинг
     if data == "billing:list":
         await check_billing(context)
         return
 
-    # Выбор аккаунта для отчёта
     if data == "pick:account":
         rows = []
         for acc in get_enabled_accounts_in_order():
@@ -467,7 +474,6 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("Выберите период:", reply_markup=kb_period_for_account(acc_id))
         return
 
-    # Настройки
     if data == "settings:root":
         rows = []
         data_map = load_accounts()
@@ -510,25 +516,22 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "noop":
         return
 
+
 # ==========================
 #   BOOTSTRAP
 # ==========================
 
 app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-# Команды
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("help", help_cmd))
 app.add_handler(CommandHandler("sync_accounts", cmd_sync_accounts))
 app.add_handler(CommandHandler("accounts", cmd_accounts))
 
-# Кнопки-инлайн
 app.add_handler(CallbackQueryHandler(callback_router))
-
-# Текстовые кнопки (reply-keyboard) – опционально
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
-# Джобы
+# Планировщик
 app.job_queue.run_repeating(check_billing, interval=600, first=10)
 app.job_queue.run_daily(daily_report, time=time(hour=9, minute=30, tzinfo=timezone('Asia/Almaty')))
 app.job_queue.run_daily(check_billing_forecast, time=time(hour=9, minute=0, tzinfo=timezone('Asia/Almaty')))
