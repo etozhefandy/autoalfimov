@@ -459,7 +459,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_period_report(context, q.message.chat.id, "today", label)
         return
     if data == "rep_yday":
-        label = (datetime.now(ALMATY_TZ) - timedelta(days=1)).strftime("%d.%м.%Y")
+        label = (datetime.now(ALMATY_TZ) - timedelta(days=1)).strftime("%d.%m.%Y")
         await q.edit_message_text(f"Готовлю отчёт за {label}…")
         await send_period_report(context, q.message.chat.id, "yesterday", label)
         return
