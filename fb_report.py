@@ -35,21 +35,36 @@ ACCESS_TOKEN = os.getenv("FB_ACCESS_TOKEN", "")
 APP_ID = os.getenv("FB_APP_ID", "1336645834088573")
 APP_SECRET = os.getenv("FB_APP_SECRET", "01bf23c5f726c59da318daa82dd0e9dc")
 if not ACCESS_TOKEN:
-    # можно оставить пустым локально: всё равно Railway подставит ENV
+    # локально можно оставить пустым: Railway подставит ENV
     pass
 FacebookAdsApi.init(APP_ID, APP_SECRET, ACCESS_TOKEN)
 
-TELEGRAM_TOKEN = os.getenv("TG_BOT_TOKEN", "")
+def _get_env(*names, default=""):
+    """Возвращает первое непустое значение из окружения по списку имён."""
+    for n in names:
+        v = os.getenv(n, "")
+        if v:
+            return v
+    return default
+
+# Читаем токен из любого из двух имён переменных
+TELEGRAM_TOKEN = _get_env("TG_BOT_TOKEN", "TELEGRAM_BOT_TOKEN")
 DEFAULT_REPORT_CHAT = os.getenv("TG_CHAT_ID", "-1002679045097")
+
+# Валидация токена заранее — чтобы не ловить падение глубже в библиотеке
+if not TELEGRAM_TOKEN or ":" not in TELEGRAM_TOKEN:
+    raise RuntimeError(
+        "TG_BOT_TOKEN / TELEGRAM_BOT_TOKEN не задан или некорректен. "
+        "Проверь переменные окружения в Railway (значение от @BotFather)."
+    )
 
 # === Приватный доступ ===
 # Сюда впиши свой user_id (и при необходимости id чатов/группы):
 ALLOWED_USER_IDS = {
-    # твой user id: позже можно добавить других
+    # твой user id: позже можно добавить других, пример: 123456789,
 }
-ALLOWED_CHAT_IDS = {
-    DEFAULT_REPORT_CHAT,  # группа/канал с отчётами
-}
+# Чат-ID допускаем только если он непустой
+ALLOWED_CHAT_IDS = {c for c in [DEFAULT_REPORT_CHAT] if c}
 
 # ======= ФАЙЛЫ =========
 ACCOUNTS_JSON = "accounts.json"
@@ -156,7 +171,7 @@ def looks_excluded(name: str) -> bool:
     return any(k in n for k in EXCLUDED_NAME_KEYWORDS)
 
 def upsert_from_bm() -> dict:
-    """Добавляет новые аккаунты и обновляет ИМЕНА. Ничего не затирает в настройках."""
+    """Добавляет новые аккаунты и обновляет имена. Настройки не затирает."""
     store = load_accounts()
     me = User(fbid="me")
     fetched = list(me.get_ad_accounts(fields=["account_id", "name", "account_status"]))
@@ -176,8 +191,7 @@ def upsert_from_bm() -> dict:
             store[aid] = {
                 "name": name,
                 "enabled": True,
-                # по умолчанию везде показываем Переписки
-                "metrics": {"messaging": True, "leads": False},
+                "metrics": {"messaging": True, "leads": False},  # по умолчанию Переписки
                 "alerts": {"enabled": False, "target_cpl": 0.0},
             }
             added += 1
@@ -205,8 +219,10 @@ def extract_actions(insight) -> dict:
 def metrics_flags(aid: str) -> dict:
     st = load_accounts().get(aid, {})
     m = st.get("metrics", {}) or {}
-    return {"messaging": bool(m.get("messaging", False)),
-            "leads": bool(m.get("leads", False))}
+    return {
+        "messaging": bool(m.get("messaging", False)),
+        "leads": bool(m.get("leads", False)),
+    }
 
 def fetch_insight(aid: str, period) -> tuple[str, dict | None]:
     acc = AdAccount(aid)
@@ -386,7 +402,8 @@ async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         res = upsert_from_bm()
         await update.message.reply_text(
-            f"✅ Синк завершён. Добавлено: {res['added']}, обновлено имён: {res['updated']}, пропущено: {res['skipped']}. Всего: {res['total']}"
+            f"✅ Синк завершён. Добавлено: {res['added']}, обновлено имён: {res['updated']}, "
+            f"пропущено: {res['skipped']}. Всего: {res['total']}"
         )
     except Exception as e:
         await update.message.reply_text(f"⚠️ Ошибка синка: {e}")
@@ -442,7 +459,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_period_report(context, q.message.chat.id, "today", label)
         return
     if data == "rep_yday":
-        label = (datetime.now(ALMATY_TZ) - timedelta(days=1)).strftime("%d.%m.%Y")
+        label = (datetime.now(ALMATY_TZ) - timedelta(days=1)).strftime("%d.%м.%Y")
         await q.edit_message_text(f"Готовлю отчёт за {label}…")
         await send_period_report(context, q.message.chat.id, "yesterday", label)
         return
@@ -599,10 +616,10 @@ async def on_text_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ============ JOBS ============
 async def daily_report_job(ctx: ContextTypes.DEFAULT_TYPE):
+    if not DEFAULT_REPORT_CHAT:
+        return
     label = (datetime.now(ALMATY_TZ) - timedelta(days=1)).strftime("%d.%m.%Y")
     await send_period_report(ctx, DEFAULT_REPORT_CHAT, "yesterday", label)
-
-# (предиктор биллинга/оповещения CPA прикрутим отдельным обновлением — места уже достаточно)
 
 # ============ APP ============
 def build_app() -> Application:
@@ -618,7 +635,10 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_any))
 
     # ежедневный отчёт 09:30
-    app.job_queue.run_daily(daily_report_job, time=time(hour=9, minute=30, tzinfo=ALMATY_TZ))
+    app.job_queue.run_daily(
+        daily_report_job,
+        time=time(hour=9, minute=30, tzinfo=ALMATY_TZ)
+    )
 
     return app
 
