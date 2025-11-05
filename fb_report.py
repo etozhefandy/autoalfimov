@@ -56,7 +56,7 @@ if not TELEGRAM_TOKEN or ":" not in TELEGRAM_TOKEN:
 
 # === Приватный доступ ===
 ALLOWED_USER_IDS = {
-    # сюда внеси свой user_id после /whoami, пример: 123456789,
+    253181449,
 }
     253181449,
     253181449,
