@@ -35,35 +35,29 @@ ACCESS_TOKEN = os.getenv("FB_ACCESS_TOKEN", "")
 APP_ID = os.getenv("FB_APP_ID", "1336645834088573")
 APP_SECRET = os.getenv("FB_APP_SECRET", "01bf23c5f726c59da318daa82dd0e9dc")
 if not ACCESS_TOKEN:
-    # локально можно оставить пустым: Railway подставит ENV
     pass
 FacebookAdsApi.init(APP_ID, APP_SECRET, ACCESS_TOKEN)
 
 def _get_env(*names, default=""):
-    """Возвращает первое непустое значение из окружения по списку имён."""
     for n in names:
         v = os.getenv(n, "")
         if v:
             return v
     return default
 
-# Читаем токен из любого из двух имён переменных
-TELEGRAM_TOKEN = _get_env("TG_BOT_TOKEN", "TELEGRAM_BOT_TOKEN")
+# читаем токен из известных имён
+TELEGRAM_TOKEN = _get_env("TG_BOT_TOKEN", "TELEGRAM_BOT_TOKEN", "TELEGRAM_TOKEN")
 DEFAULT_REPORT_CHAT = os.getenv("TG_CHAT_ID", "-1002679045097")
 
-# Валидация токена заранее — чтобы не ловить падение глубже в библиотеке
 if not TELEGRAM_TOKEN or ":" not in TELEGRAM_TOKEN:
     raise RuntimeError(
-        "TG_BOT_TOKEN / TELEGRAM_BOT_TOKEN не задан или некорректен. "
-        "Проверь переменные окружения в Railway (значение от @BotFather)."
+        "TG_BOT_TOKEN / TELEGRAM_BOT_TOKEN / TELEGRAM_TOKEN не задан или некорректен."
     )
 
 # === Приватный доступ ===
-# Сюда впиши свой user_id (и при необходимости id чатов/группы):
 ALLOWED_USER_IDS = {
-    # твой user id: позже можно добавить других, пример: 123456789,
+    # сюда внеси свой user_id после /whoami, пример: 123456789,
 }
-# Чат-ID допускаем только если он непустой
 ALLOWED_CHAT_IDS = {c for c in [DEFAULT_REPORT_CHAT] if c}
 
 # ======= ФАЙЛЫ =========
@@ -99,9 +93,9 @@ def usd_to_kzt() -> float:
         )
         data = r.json()
         raw = float(data["rates"]["KZT"])
-        rate = raw + 5.0  # твоя надбавка +5
+        rate = raw + 5.0
     except Exception:
-        rate = 505.0  # запасной
+        rate = 505.0
     _fx_save({"rate": rate, "ts": now})
     return rate
 
@@ -133,7 +127,6 @@ ACCOUNT_NAMES = {
     "act_806046635254439": "WonderStage WS",
 }
 
-# Исключения при синхронизации из BM
 EXCLUDED_AD_ACCOUNT_IDS = {"act_1042955424178074", "act_4030694587199998"}
 EXCLUDED_NAME_KEYWORDS = {"kense", "кенсе"}
 
@@ -191,7 +184,7 @@ def upsert_from_bm() -> dict:
             store[aid] = {
                 "name": name,
                 "enabled": True,
-                "metrics": {"messaging": True, "leads": False},  # по умолчанию Переписки
+                "metrics": {"messaging": True, "leads": False},
                 "alerts": {"enabled": False, "target_cpl": 0.0},
             }
             added += 1
@@ -242,7 +235,7 @@ def build_report(aid: str, period, label="") -> str:
     except Exception as e:
         err = str(e)
         if "code: 200" in err or "403" in err or "permissions" in err.lower():
-            return ""  # тихо пропускаем недоступные
+            return ""
         return f"⚠ Ошибка по {get_account_name(aid)}:\n\n{e}"
 
     badge = "🟢" if is_active(aid) else "🔴"
@@ -299,6 +292,75 @@ async def send_billing(ctx: ContextTypes.DEFAULT_TYPE, chat_id: str):
         kzt = kzt_round_up_1000(usd * rate)
         txt = f"🔴 <b>{name}</b>\n   💵 {usd:.2f} $  |  🇰🇿 {fmt_int(kzt)} ₸"
         await ctx.bot.send_message(chat_id=chat_id, text=txt, parse_mode="HTML")
+
+# ============ CPA ALERTS ============
+def _calc_metric(ins, use_msg: bool, use_lead: bool):
+    acts = extract_actions(ins)
+    spend = float(ins.get("spend", 0) or 0)
+
+    out = []
+    if use_msg:
+        conv = acts.get("onsite_conversion.messaging_conversation_started_7d", 0)
+        cpa = (spend / conv) if conv > 0 else None
+        out.append(("Переписки", int(conv), cpa))
+    if use_lead:
+        leads = acts.get("Website Submit Applications", 0) or \
+                acts.get("offsite_conversion.fb_pixel_submit_application", 0) or \
+                acts.get("offsite_conversion.fb_pixel_lead", 0) or \
+                acts.get("lead", 0)
+        cpa = (spend / leads) if leads > 0 else None
+        out.append(("Лиды", int(leads), cpa))
+    return spend, out
+
+async def cpa_alerts_job(ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = DEFAULT_REPORT_CHAT
+    if not chat_id:
+        return
+    # окно 10:00–22:59 по Алматы
+    now = datetime.now(ALMATY_TZ)
+    if not (10 <= now.hour <= 22):
+        return
+
+    store = load_accounts()
+    for aid in get_enabled_accounts_in_order():
+        row = store.get(aid, {})
+        alerts = row.get("alerts", {}) or {}
+        if not alerts.get("enabled"):
+            continue
+        target = float(alerts.get("target_cpl", 0.0) or 0.0)
+        if target <= 0:
+            continue
+
+        try:
+            name, ins = fetch_insight(aid, "today")
+        except Exception:
+            continue
+        if not ins:
+            continue
+
+        use_msg = bool(row.get("metrics", {}).get("messaging", False))
+        use_lead = bool(row.get("metrics", {}).get("leads", False))
+        spend, metrics = _calc_metric(ins, use_msg, use_lead)
+
+        for label, conv, cpa in metrics:
+            should_alert = False
+            reason = ""
+            if spend > 0 and conv == 0:
+                should_alert = True
+                reason = f"есть траты {spend:.2f}$, но 0 конверсий"
+            elif cpa is not None and cpa > target:
+                should_alert = True
+                reason = f"CPA {cpa:.2f}$ > таргета {target:.2f}$"
+
+            if should_alert:
+                txt = (
+                    f"⚠️ <b>{get_account_name(aid)}</b> — {label}\n"
+                    f"💵 Затраты: {spend:.2f} $\n"
+                    f"📊 Конверсии: {conv}\n"
+                    f"🎯 Таргет CPA: {target:.2f} $\n"
+                    f"🧾 Причина: {reason}"
+                )
+                await ctx.bot.send_message(chat_id=chat_id, text=txt, parse_mode="HTML")
 
 # ============ UI ============
 
@@ -368,11 +430,24 @@ def _allowed(update: Update) -> bool:
         return True
     return False
 
+# ======== SERVICE CMD (без ограничений) ========
+async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    user_id = update.effective_user.id if update.effective_user else None
+    await update.message.reply_text(
+        f"user_id: <code>{user_id}</code>\nchat_id: <code>{chat_id}</code>",
+        parse_mode="HTML"
+    )
+
 # ============ COMMANDS ============
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _allowed(update):
+        # мягко подскажем, что нужно добавить id в вайтлист
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="⛔️ Нет доступа. Отправь /whoami и добавь свой user_id в ALLOWED_USER_IDS."
+        )
         return
-    # в личке убираем любые Reply-кнопки
     await context.bot.send_message(
         chat_id=update.effective_chat.id,
         text="🤖 Выберите действие:",
@@ -388,6 +463,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/help — подсказка\n"
         "/billing — список биллингов\n"
         "/sync_accounts — синк кабинетов из BM\n"
+        "/whoami — показать user_id и chat_id\n"
     )
     await update.message.reply_text(txt, reply_markup=ReplyKeyboardRemove())
 
@@ -402,14 +478,13 @@ async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         res = upsert_from_bm()
         await update.message.reply_text(
-            f"✅ Синк завершён. Добавлено: {res['added']}, обновлено имён: {res['updated']}, "
+            f"✅ Синк завершён. Добавлено: {res['added']}, обновлено: {res['updated']}, "
             f"пропущено: {res['skipped']}. Всего: {res['total']}"
         )
     except Exception as e:
         await update.message.reply_text(f"⚠️ Ошибка синка: {e}")
 
 # ======== CUSTOM RANGE INPUT ========
-# user_data['await_range_for'] = ad_account_id
 _RANGE_RE = re.compile(r"^\s*(\d{2})\.(\d{2})\.(\d{4})\s*-\s*(\d{2})\.(\d{2})\.(\d{4})\s*$")
 
 def _parse_range(s: str):
@@ -476,6 +551,19 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "billing":
         await q.edit_message_text("📋 Биллинги (неактивные аккаунты):")
         await send_billing(context, q.message.chat.id)
+        return
+
+    # СИНХРОНИЗАЦИЯ ИЗ КНОПКИ
+    if data == "sync_bm":
+        try:
+            res = upsert_from_bm()
+            await q.edit_message_text(
+                f"✅ Синк завершён. Добавлено: {res['added']}, обновлено: {res['updated']}, "
+                f"пропущено: {res['skipped']}. Всего: {res['total']}",
+                reply_markup=main_menu()
+            )
+        except Exception as e:
+            await q.edit_message_text(f"⚠️ Ошибка синка: {e}", reply_markup=main_menu())
         return
 
     # выбор аккаунта для отчёта
@@ -582,7 +670,6 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Напиши в чат число (например 2.5), чтобы обновить.",
             reply_markup=settings_kb(aid)
         )
-        # включаем режим ожидания числа
         context.user_data["await_cpa_for"] = aid
         return
 
@@ -590,7 +677,6 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_text_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _allowed(update):
         return
-    # приоритизируем диапазон дат
     if "await_range_for" in context.user_data:
         return await on_text(update, context)
 
@@ -621,24 +707,26 @@ async def daily_report_job(ctx: ContextTypes.DEFAULT_TYPE):
     label = (datetime.now(ALMATY_TZ) - timedelta(days=1)).strftime("%d.%m.%Y")
     await send_period_report(ctx, DEFAULT_REPORT_CHAT, "yesterday", label)
 
+def schedule_cpa_alerts(app: Application):
+    # каждый час, 10:00..22:00
+    for h in range(10, 23):
+        app.job_queue.run_daily(cpa_alerts_job, time=time(hour=h, minute=0, tzinfo=ALMATY_TZ))
+
 # ============ APP ============
 def build_app() -> Application:
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
+    app.add_handler(CommandHandler("whoami", cmd_whoami))  # без ограничений
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("billing", cmd_billing))
     app.add_handler(CommandHandler("sync_accounts", cmd_sync))
     app.add_handler(CallbackQueryHandler(on_cb))
 
-    # текстовые вводы (диапазон дат / target CPA)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_any))
 
-    # ежедневный отчёт 09:30
-    app.job_queue.run_daily(
-        daily_report_job,
-        time=time(hour=9, minute=30, tzinfo=ALMATY_TZ)
-    )
+    app.job_queue.run_daily(daily_report_job, time=time(hour=9, minute=30, tzinfo=ALMATY_TZ))
+    schedule_cpa_alerts(app)
 
     return app
 
