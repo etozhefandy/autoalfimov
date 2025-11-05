@@ -58,6 +58,7 @@ if not TELEGRAM_TOKEN or ":" not in TELEGRAM_TOKEN:
 ALLOWED_USER_IDS = {
     # сюда внеси свой user_id после /whoami, пример: 123456789,
 }
+    253181449,
 ALLOWED_CHAT_IDS = {c for c in [DEFAULT_REPORT_CHAT] if c}
 
 # ======= ФАЙЛЫ =========
