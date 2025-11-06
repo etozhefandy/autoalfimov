@@ -3,6 +3,7 @@ import os
 import json
 import math
 import re
+import shutil
 from datetime import datetime, timedelta, time
 
 import requests
@@ -45,9 +46,9 @@ def _get_env(*names, default=""):
             return v
     return default
 
-# читаем токен из известных имён
+# Telegram токен и чат
 TELEGRAM_TOKEN = _get_env("TG_BOT_TOKEN", "TELEGRAM_BOT_TOKEN", "TELEGRAM_TOKEN")
-DEFAULT_REPORT_CHAT = os.getenv("TG_CHAT_ID", "-1002679045097")
+DEFAULT_REPORT_CHAT = os.getenv("TG_CHAT_ID", "-1002679045097")  # строка
 
 if not TELEGRAM_TOKEN or ":" not in TELEGRAM_TOKEN:
     raise RuntimeError(
@@ -56,16 +57,46 @@ if not TELEGRAM_TOKEN or ":" not in TELEGRAM_TOKEN:
 
 # === Приватный доступ ===
 ALLOWED_USER_IDS = {
-    253181449
+    253181449  # Andrey
 }
-ALLOWED_CHAT_IDS = {c for c in [DEFAULT_REPORT_CHAT] if c}
+ALLOWED_CHAT_IDS = {str(DEFAULT_REPORT_CHAT), "-1002679045097"}  # как строки
 
-# ======= ФАЙЛЫ =========
-ACCOUNTS_JSON = "accounts.json"
-FORECAST_CACHE_FILE = "forecast_cache.json"
-FX_CACHE_FILE = "fx_cache.json"
+# ======= ПУТИ / ФАЙЛЫ =========
+DATA_DIR = os.getenv("DATA_DIR", "/data")
+os.makedirs(DATA_DIR, exist_ok=True)
 
-# ========= КУРС USD→KZT (apilayer) =========
+ACCOUNTS_JSON = os.getenv("ACCOUNTS_JSON_PATH", os.path.join(DATA_DIR, "accounts.json"))
+REPO_ACCOUNTS_JSON = "./accounts.json"
+
+FORECAST_CACHE_FILE = os.path.join(DATA_DIR, "forecast_cache.json")
+FX_CACHE_FILE = os.path.join(DATA_DIR, "fx_cache.json")
+
+def _atomic_write_json(path: str, obj: dict):
+    tmp = f"{path}.tmp"
+    bak = f"{path}.bak"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    try:
+        if os.path.exists(path):
+            shutil.copy2(path, bak)
+    except Exception:
+        pass
+    os.replace(tmp, path)
+
+def _ensure_accounts_file():
+    if not os.path.exists(ACCOUNTS_JSON):
+        if os.path.exists(REPO_ACCOUNTS_JSON):
+            try:
+                shutil.copy2(REPO_ACCOUNTS_JSON, ACCOUNTS_JSON)
+                return
+            except Exception:
+                pass
+        _atomic_write_json(ACCOUNTS_JSON, {})
+_ensure_accounts_file()
+
+# ========= КУРС USD→KZT =========
 FX_API_KEY = os.getenv("FX_API_KEY", "LYr6odX08iC6PXKqQSTT4QtKouCFcWeF")
 FX_CACHE_HOURS = 12
 
@@ -77,8 +108,7 @@ def _fx_load():
         return {}
 
 def _fx_save(obj: dict):
-    with open(FX_CACHE_FILE, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
+    _atomic_write_json(FX_CACHE_FILE, obj)
 
 def usd_to_kzt() -> float:
     cache = _fx_load()
@@ -93,7 +123,7 @@ def usd_to_kzt() -> float:
         )
         data = r.json()
         raw = float(data["rates"]["KZT"])
-        rate = raw + 5.0
+        rate = raw + 5.0  # надбавка +5
     except Exception:
         rate = 505.0
     _fx_save({"rate": rate, "ts": now})
@@ -139,8 +169,7 @@ def load_accounts() -> dict:
         return {}
 
 def save_accounts(d: dict):
-    with open(ACCOUNTS_JSON, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
+    _atomic_write_json(ACCOUNTS_JSON, d)
 
 def _norm_act(aid: str) -> str:
     aid = str(aid).strip()
@@ -164,7 +193,7 @@ def looks_excluded(name: str) -> bool:
     return any(k in n for k in EXCLUDED_NAME_KEYWORDS)
 
 def upsert_from_bm() -> dict:
-    """Добавляет новые аккаунты и обновляет имена. Настройки не затирает."""
+    """Добавляет новые аккаунты и обновляет ИМЕНА. Настройки не затирает."""
     store = load_accounts()
     me = User(fbid="me")
     fetched = list(me.get_ad_accounts(fields=["account_id", "name", "account_status"]))
@@ -229,6 +258,22 @@ def fetch_insight(aid: str, period) -> tuple[str, dict | None]:
     name = acc.api_get(fields=["name"]).get("name", get_account_name(aid))
     return name, (data[0] if data else None)
 
+def _blend_totals(ins):
+    """Возвращает (spend, msg_conv, lead_conv, blended_conv, blended_cpa or None)"""
+    acts = extract_actions(ins)
+    spend = float(ins.get("spend", 0) or 0)
+    msgs = int(acts.get("onsite_conversion.messaging_conversation_started_7d", 0) or 0)
+    leads = int(
+        acts.get("Website Submit Applications", 0)
+        or acts.get("offsite_conversion.fb_pixel_submit_application", 0)
+        or acts.get("offsite_conversion.fb_pixel_lead", 0)
+        or acts.get("lead", 0)
+        or 0
+    )
+    total = msgs + leads
+    blended = (spend / total) if total > 0 else None
+    return spend, msgs, leads, total, blended
+
 def build_report(aid: str, period, label="") -> str:
     try:
         name, ins = fetch_insight(aid, period)
@@ -254,20 +299,35 @@ def build_report(aid: str, period, label="") -> str:
     acts = extract_actions(ins)
     flags = metrics_flags(aid)
 
+    msgs = int(acts.get("onsite_conversion.messaging_conversation_started_7d", 0) or 0)
+    leads = int(
+        acts.get("Website Submit Applications", 0)
+        or acts.get("offsite_conversion.fb_pixel_submit_application", 0)
+        or acts.get("offsite_conversion.fb_pixel_lead", 0)
+        or acts.get("lead", 0)
+        or 0
+    )
+
     if flags["messaging"]:
-        conv = acts.get("onsite_conversion.messaging_conversation_started_7d", 0)
-        body.append(f"✉️ Переписки: {int(conv)}")
-        if conv > 0:
-            body.append(f"💬💲 Цена переписки: {round(spend/conv, 2)} $")
+        body.append(f"✉️ Переписки: {msgs}")
+        if msgs > 0:
+            body.append(f"💬💲 Цена переписки: {round(spend/msgs, 2)} $")
 
     if flags["leads"]:
-        leads = acts.get("Website Submit Applications", 0) or \
-                acts.get("offsite_conversion.fb_pixel_submit_application", 0) or \
-                acts.get("offsite_conversion.fb_pixel_lead", 0) or \
-                acts.get("lead", 0)
-        body.append(f"📩 Лиды: {int(leads)}")
+        body.append(f"📩 Лиды: {leads}")
         if leads > 0:
             body.append(f"📩💲 Цена лида: {round(spend/leads, 2)} $")
+
+    # Если включены обе метрики — добавим итоговую строку
+    if flags["messaging"] and flags["leads"]:
+        total = msgs + leads
+        if total > 0:
+            blended = round(spend / total, 2)
+            body.append(f"—")
+            body.append(f"🧮 Итого: {total} заявок, CPA = {blended} $")
+        else:
+            body.append(f"—")
+            body.append(f"🧮 Итого: 0 заявок")
 
     return hdr + "\n".join(body)
 
@@ -286,6 +346,7 @@ async def send_billing(ctx: ContextTypes.DEFAULT_TYPE, chat_id: str):
         except Exception:
             continue
         if info.get("account_status") == 1:
+            # активные пропускаем по ТЗ "только неактивные"
             continue
         name = info.get("name", get_account_name(aid))
         usd = float(info.get("balance", 0) or 0) / 100.0
@@ -294,29 +355,10 @@ async def send_billing(ctx: ContextTypes.DEFAULT_TYPE, chat_id: str):
         await ctx.bot.send_message(chat_id=chat_id, text=txt, parse_mode="HTML")
 
 # ============ CPA ALERTS ============
-def _calc_metric(ins, use_msg: bool, use_lead: bool):
-    acts = extract_actions(ins)
-    spend = float(ins.get("spend", 0) or 0)
-
-    out = []
-    if use_msg:
-        conv = acts.get("onsite_conversion.messaging_conversation_started_7d", 0)
-        cpa = (spend / conv) if conv > 0 else None
-        out.append(("Переписки", int(conv), cpa))
-    if use_lead:
-        leads = acts.get("Website Submit Applications", 0) or \
-                acts.get("offsite_conversion.fb_pixel_submit_application", 0) or \
-                acts.get("offsite_conversion.fb_pixel_lead", 0) or \
-                acts.get("lead", 0)
-        cpa = (spend / leads) if leads > 0 else None
-        out.append(("Лиды", int(leads), cpa))
-    return spend, out
-
 async def cpa_alerts_job(ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = DEFAULT_REPORT_CHAT
+    chat_id = str(DEFAULT_REPORT_CHAT)
     if not chat_id:
         return
-    # окно 10:00–22:59 по Алматы
     now = datetime.now(ALMATY_TZ)
     if not (10 <= now.hour <= 22):
         return
@@ -325,42 +367,61 @@ async def cpa_alerts_job(ctx: ContextTypes.DEFAULT_TYPE):
     for aid in get_enabled_accounts_in_order():
         row = store.get(aid, {})
         alerts = row.get("alerts", {}) or {}
-        if not alerts.get("enabled"):
-            continue
+        # 1) target = 0 → алерты отключены
         target = float(alerts.get("target_cpl", 0.0) or 0.0)
-        if target <= 0:
+        if not alerts.get("enabled") or target <= 0:
+            continue
+
+        mflags = row.get("metrics", {}) or {}
+        use_msg = bool(mflags.get("messaging", False))
+        use_lead = bool(mflags.get("leads", False))
+        if not (use_msg or use_lead):
             continue
 
         try:
-            name, ins = fetch_insight(aid, "today")
+            _, ins = fetch_insight(aid, "today")
         except Exception:
             continue
         if not ins:
             continue
 
-        use_msg = bool(row.get("metrics", {}).get("messaging", False))
-        use_lead = bool(row.get("metrics", {}).get("leads", False))
-        spend, metrics = _calc_metric(ins, use_msg, use_lead)
+        spend, msgs, leads, total, blended = _blend_totals(ins)
 
-        for label, conv, cpa in metrics:
-            should_alert = False
-            reason = ""
-            if spend > 0 and conv == 0:
-                should_alert = True
-                reason = f"есть траты {spend:.2f}$, но 0 конверсий"
-            elif cpa is not None and cpa > target:
-                should_alert = True
-                reason = f"CPA {cpa:.2f}$ > таргета {target:.2f}$"
+        # 2) правило сравнения c target
+        # - только msgs → CPA=spend/msgs
+        # - только leads → CPA=spend/leads
+        # - обе → CPA=spend/(msgs+leads)
+        if use_msg and not use_lead:
+            conv = msgs
+            cpa = (spend / conv) if conv > 0 else None
+            label = "Переписки"
+        elif use_lead and not use_msg:
+            conv = leads
+            cpa = (spend / conv) if conv > 0 else None
+            label = "Лиды"
+        else:
+            conv = total
+            cpa = blended
+            label = "Итого (💬+📩)"
 
-            if should_alert:
-                txt = (
-                    f"⚠️ <b>{get_account_name(aid)}</b> — {label}\n"
-                    f"💵 Затраты: {spend:.2f} $\n"
-                    f"📊 Конверсии: {conv}\n"
-                    f"🎯 Таргет CPA: {target:.2f} $\n"
-                    f"🧾 Причина: {reason}"
-                )
-                await ctx.bot.send_message(chat_id=chat_id, text=txt, parse_mode="HTML")
+        should_alert = False
+        reason = ""
+        if spend > 0 and conv == 0:
+            should_alert = True
+            reason = f"есть траты {spend:.2f}$, но 0 конверсий"
+        elif cpa is not None and cpa > target:
+            should_alert = True
+            reason = f"CPA {cpa:.2f}$ > таргета {target:.2f}$"
+
+        if should_alert:
+            txt = (
+                f"⚠️ <b>{get_account_name(aid)}</b> — {label}\n"
+                f"💵 Затраты: {spend:.2f} $\n"
+                f"📊 Конверсии: {conv}\n"
+                f"🎯 Таргет CPA: {target:.2f} $\n"
+                f"🧾 Причина: {reason}"
+            )
+            await ctx.bot.send_message(chat_id=chat_id, text=txt, parse_mode="HTML")
 
 # ============ UI ============
 
@@ -383,7 +444,7 @@ def _flag_line(aid: str) -> str:
     on = "🟢" if enabled else "🔴"
     mm = "💬" if m.get("messaging") else ""
     ll = "♿️" if m.get("leads") else ""
-    aa = "⚠️" if a.get("enabled") else ""
+    aa = "⚠️" if a.get("enabled") and (a.get("target_cpl", 0) or 0) > 0 else ""
     return f"{on} {mm}{ll}{aa}".strip()
 
 def accounts_kb(prefix: str) -> InlineKeyboardMarkup:
@@ -401,12 +462,12 @@ def settings_kb(aid: str) -> InlineKeyboardMarkup:
     en_text = "Выключить кабинет" if st.get("enabled", True) else "Включить кабинет"
     m_on = st.get("metrics", {}).get("messaging", True)
     l_on = st.get("metrics", {}).get("leads", False)
-    a_on = st.get("alerts", {}).get("enabled", False)
+    a_on = st.get("alerts", {}).get("enabled", False) and (st.get("alerts", {}).get("target_cpl", 0) or 0) > 0
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(en_text, callback_data=f"toggle_enabled|{aid}")],
         [InlineKeyboardButton(f"💬 Переписки: {'ON' if m_on else 'OFF'}", callback_data=f"toggle_m|{aid}"),
          InlineKeyboardButton(f"♿️ Лиды сайта: {'ON' if l_on else 'OFF'}", callback_data=f"toggle_l|{aid}")],
-        [InlineKeyboardButton(f"⚠️ Оповещения CPA: {'ON' if a_on else 'OFF'}", callback_data=f"toggle_alert|{aid}")],
+        [InlineKeyboardButton(f"⚠️ Алерт CPA: {'ON' if a_on else 'OFF'}", callback_data=f"toggle_alert|{aid}")],
         [InlineKeyboardButton("✏️ Задать target CPA", callback_data=f"set_cpa|{aid}")],
         [InlineKeyboardButton("⬅️ Назад к списку", callback_data="choose_acc_settings")],
     ])
@@ -430,7 +491,7 @@ def _allowed(update: Update) -> bool:
         return True
     return False
 
-# ======== SERVICE CMD (без ограничений) ========
+# ======== SERVICE CMD ========
 async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id if update.effective_chat else None
     user_id = update.effective_user.id if update.effective_user else None
@@ -442,7 +503,6 @@ async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============ COMMANDS ============
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _allowed(update):
-        # мягко подскажем, что нужно добавить id в вайтлист
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text="⛔️ Нет доступа. Отправь /whoami и добавь свой user_id в ALLOWED_USER_IDS."
@@ -461,7 +521,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Команды:\n"
         "/start — показать меню\n"
         "/help — подсказка\n"
-        "/billing — список биллингов\n"
+        "/billing — список биллингов (неактивные аккаунты)\n"
         "/sync_accounts — синк кабинетов из BM\n"
         "/whoami — показать user_id и chat_id\n"
     )
@@ -470,7 +530,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_billing(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _allowed(update):
         return
-    await send_billing(context, update.effective_chat.id)
+    await send_billing(context, str(update.effective_chat.id))
 
 async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _allowed(update):
@@ -522,21 +582,19 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     data = q.data or ""
-    # меню
     if data in ("menu",):
         await q.edit_message_text("🤖 Выберите действие:", reply_markup=main_menu())
         return
 
-    # общие отчёты
     if data == "rep_today":
         label = datetime.now(ALMATY_TZ).strftime("%d.%m.%Y")
         await q.edit_message_text(f"Готовлю отчёт за {label}…")
-        await send_period_report(context, q.message.chat.id, "today", label)
+        await send_period_report(context, str(q.message.chat.id), "today", label)
         return
     if data == "rep_yday":
         label = (datetime.now(ALMATY_TZ) - timedelta(days=1)).strftime("%d.%m.%Y")
         await q.edit_message_text(f"Готовлю отчёт за {label}…")
-        await send_period_report(context, q.message.chat.id, "yesterday", label)
+        await send_period_report(context, str(q.message.chat.id), "yesterday", label)
         return
     if data == "rep_week":
         until = datetime.now(ALMATY_TZ) - timedelta(days=1)
@@ -544,16 +602,14 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         period = {"since": since.strftime("%Y-%m-%d"), "until": until.strftime("%Y-%m-%d")}
         label = f"{since.strftime('%d.%m')}-{until.strftime('%d.%m')}"
         await q.edit_message_text(f"Готовлю отчёт за {label}…")
-        await send_period_report(context, q.message.chat.id, period, label)
+        await send_period_report(context, str(q.message.chat.id), period, label)
         return
 
-    # биллинг
     if data == "billing":
         await q.edit_message_text("📋 Биллинги (неактивные аккаунты):")
-        await send_billing(context, q.message.chat.id)
+        await send_billing(context, str(q.message.chat.id))
         return
 
-    # СИНХРОНИЗАЦИЯ ИЗ КНОПКИ
     if data == "sync_bm":
         try:
             res = upsert_from_bm()
@@ -566,7 +622,6 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text(f"⚠️ Ошибка синка: {e}", reply_markup=main_menu())
         return
 
-    # выбор аккаунта для отчёта
     if data == "choose_acc_report":
         await q.edit_message_text("Выберите аккаунт:", reply_markup=accounts_kb("rep1"))
         return
@@ -580,14 +635,14 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         label = datetime.now(ALMATY_TZ).strftime("%d.%m.%Y")
         await q.edit_message_text(f"Отчёт по {get_account_name(aid)} за {label}:")
         txt = build_report(aid, "today", label)
-        await context.bot.send_message(q.message.chat.id, txt or "Нет данных/нет доступа.", parse_mode="HTML")
+        await context.bot.send_message(str(q.message.chat.id), txt or "Нет данных/нет доступа.", parse_mode="HTML")
         return
     if data.startswith("one_yday|"):
         aid = data.split("|", 1)[1]
         label = (datetime.now(ALMATY_TZ) - timedelta(days=1)).strftime("%d.%m.%Y")
         await q.edit_message_text(f"Отчёт по {get_account_name(aid)} за {label}:")
         txt = build_report(aid, "yesterday", label)
-        await context.bot.send_message(q.message.chat.id, txt or "Нет данных/нет доступа.", parse_mode="HTML")
+        await context.bot.send_message(str(q.message.chat.id), txt or "Нет данных/нет доступа.", parse_mode="HTML")
         return
     if data.startswith("one_week|"):
         aid = data.split("|", 1)[1]
@@ -597,7 +652,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         label = f"{since.strftime('%d.%m')}-{until.strftime('%d.%m')}"
         await q.edit_message_text(f"Отчёт по {get_account_name(aid)} за {label}:")
         txt = build_report(aid, period, label)
-        await context.bot.send_message(q.message.chat.id, txt or "Нет данных/нет доступа.", parse_mode="HTML")
+        await context.bot.send_message(str(q.message.chat.id), txt or "Нет данных/нет доступа.", parse_mode="HTML")
         return
     if data.startswith("one_custom|"):
         aid = data.split("|", 1)[1]
@@ -608,7 +663,6 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # настройки
     if data == "choose_acc_settings":
         await q.edit_message_text("Выберите аккаунт для настроек:", reply_markup=accounts_kb("set1"))
         return
@@ -649,8 +703,13 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         aid = data.split("|", 1)[1]
         st = load_accounts()
         row = st.get(aid, {"alerts": {}})
-        row["alerts"] = row.get("alerts", {})
-        row["alerts"]["enabled"] = not row["alerts"].get("enabled", False)
+        alerts = row.get("alerts", {})
+        # переключатель: ON только если target>0
+        if alerts.get("enabled", False):
+            alerts["enabled"] = False
+        else:
+            alerts["enabled"] = (float(alerts.get("target_cpl", 0) or 0) > 0)
+        row["alerts"] = alerts
         st[aid] = row
         save_accounts(st)
         await q.edit_message_text(f"Настройки: {get_account_name(aid)}", reply_markup=settings_kb(aid))
@@ -660,20 +719,19 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         st = load_accounts()
         row = st.get(aid, {"alerts": {}})
         alerts = row.get("alerts", {})
-        current = alerts.get("target_cpl", 0.0)
-        alerts["enabled"] = True
+        current = float(alerts.get("target_cpl", 0.0) or 0.0)
         row["alerts"] = alerts
         st[aid] = row
         save_accounts(st)
         await q.edit_message_text(
             f"⚠️ Текущий target CPA: {current:.2f} $.\n"
-            f"Напиши в чат число (например 2.5), чтобы обновить.",
+            f"Напиши в чат число (например 2.5). 0 — выключит алерты.",
             reply_markup=settings_kb(aid)
         )
         context.user_data["await_cpa_for"] = aid
         return
 
-# ввод target CPA (просто число)
+# ввод target CPA
 async def on_text_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _allowed(update):
         return
@@ -685,30 +743,35 @@ async def on_text_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             val = float(update.message.text.replace(",", ".").strip())
         except Exception:
-            await update.message.reply_text("Введите число, например: 2.5")
+            await update.message.reply_text("Введите число, например: 2.5 (или 0 чтобы выключить)")
             context.user_data["await_cpa_for"] = aid
             return
         st = load_accounts()
         row = st.get(aid, {"alerts": {}})
         alerts = row.get("alerts", {})
         alerts["target_cpl"] = float(val)
-        alerts["enabled"] = True
+        # 0 — выключаем алерты; >0 — включаем
+        alerts["enabled"] = (val > 0)
         row["alerts"] = alerts
         st[aid] = row
         save_accounts(st)
-        await update.message.reply_text(
-            f"✅ Target CPA для {get_account_name(aid)} обновлён: {val:.2f} $",
-        )
+        if val > 0:
+            await update.message.reply_text(
+                f"✅ Target CPA для {get_account_name(aid)} обновлён: {val:.2f} $ (алерты ВКЛ)",
+            )
+        else:
+            await update.message.reply_text(
+                f"✅ Target CPA для {get_account_name(aid)} установлен 0 — алерты ВЫКЛ",
+            )
 
 # ============ JOBS ============
 async def daily_report_job(ctx: ContextTypes.DEFAULT_TYPE):
     if not DEFAULT_REPORT_CHAT:
         return
     label = (datetime.now(ALMATY_TZ) - timedelta(days=1)).strftime("%d.%m.%Y")
-    await send_period_report(ctx, DEFAULT_REPORT_CHAT, "yesterday", label)
+    await send_period_report(ctx, str(DEFAULT_REPORT_CHAT), "yesterday", label)
 
 def schedule_cpa_alerts(app: Application):
-    # каждый час, 10:00..22:00
     for h in range(10, 23):
         app.job_queue.run_daily(cpa_alerts_job, time=time(hour=h, minute=0, tzinfo=ALMATY_TZ))
 
@@ -716,7 +779,7 @@ def schedule_cpa_alerts(app: Application):
 def build_app() -> Application:
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    app.add_handler(CommandHandler("whoami", cmd_whoami))  # без ограничений
+    app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("billing", cmd_billing))
