@@ -318,7 +318,7 @@ def build_report(aid: str, period, label="") -> str:
         if leads > 0:
             body.append(f"📩💲 Цена лида: {round(spend/leads, 2)} $")
 
-    # Если включены обе метрики — добавим итоговую строку
+    # Итоговая строка при обеих метриках
     if flags["messaging"] and flags["leads"]:
         total = msgs + leads
         if total > 0:
@@ -346,8 +346,7 @@ async def send_billing(ctx: ContextTypes.DEFAULT_TYPE, chat_id: str):
         except Exception:
             continue
         if info.get("account_status") == 1:
-            # активные пропускаем по ТЗ "только неактивные"
-            continue
+            continue  # показываем только НЕактивные
         name = info.get("name", get_account_name(aid))
         usd = float(info.get("balance", 0) or 0) / 100.0
         kzt = kzt_round_up_1000(usd * rate)
@@ -367,7 +366,6 @@ async def cpa_alerts_job(ctx: ContextTypes.DEFAULT_TYPE):
     for aid in get_enabled_accounts_in_order():
         row = store.get(aid, {})
         alerts = row.get("alerts", {}) or {}
-        # 1) target = 0 → алерты отключены
         target = float(alerts.get("target_cpl", 0.0) or 0.0)
         if not alerts.get("enabled") or target <= 0:
             continue
@@ -387,10 +385,6 @@ async def cpa_alerts_job(ctx: ContextTypes.DEFAULT_TYPE):
 
         spend, msgs, leads, total, blended = _blend_totals(ins)
 
-        # 2) правило сравнения c target
-        # - только msgs → CPA=spend/msgs
-        # - только leads → CPA=spend/leads
-        # - обе → CPA=spend/(msgs+leads)
         if use_msg and not use_lead:
             conv = msgs
             cpa = (spend / conv) if conv > 0 else None
@@ -704,7 +698,6 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         st = load_accounts()
         row = st.get(aid, {"alerts": {}})
         alerts = row.get("alerts", {})
-        # переключатель: ON только если target>0
         if alerts.get("enabled", False):
             alerts["enabled"] = False
         else:
@@ -750,8 +743,7 @@ async def on_text_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
         row = st.get(aid, {"alerts": {}})
         alerts = row.get("alerts", {})
         alerts["target_cpl"] = float(val)
-        # 0 — выключаем алерты; >0 — включаем
-        alerts["enabled"] = (val > 0)
+        alerts["enabled"] = (val > 0)  # 0 — выключаем
         row["alerts"] = alerts
         st[aid] = row
         save_accounts(st)
@@ -788,6 +780,7 @@ def build_app() -> Application:
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_any))
 
+    # Требуется установка python-telegram-bot[job-queue] в requirements.txt
     app.job_queue.run_daily(daily_report_job, time=time(hour=9, minute=30, tzinfo=ALMATY_TZ))
     schedule_cpa_alerts(app)
 
