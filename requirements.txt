@@ -1,6 +1,4 @@
-facebook-business
-python-telegram-bot[job-queue]==20.6
-pytz
-
-
-# v3
+python-telegram-bot==20.7
+facebook-business==20.0.0
+requests>=2.31.0
+pytz>=2024.1
