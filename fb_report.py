@@ -318,7 +318,6 @@ def build_report(aid: str, period, label="") -> str:
         if leads > 0:
             body.append(f"📩💲 Цена лида: {round(spend/leads, 2)} $")
 
-    # Итоговая строка при обеих метриках
     if flags["messaging"] and flags["leads"]:
         total = msgs + leads
         if total > 0:
@@ -338,7 +337,9 @@ async def send_period_report(ctx, chat_id, period, label=""):
             await ctx.bot.send_message(chat_id=chat_id, text=txt, parse_mode="HTML")
 
 # ============ БИЛЛИНГ ============
+
 async def send_billing(ctx: ContextTypes.DEFAULT_TYPE, chat_id: str):
+    """Текущие биллинги: только неактивные аккаунты."""
     rate = usd_to_kzt()
     for aid in get_enabled_accounts_in_order():
         try:
@@ -352,6 +353,169 @@ async def send_billing(ctx: ContextTypes.DEFAULT_TYPE, chat_id: str):
         kzt = kzt_round_up_1000(usd * rate)
         txt = f"🔴 <b>{name}</b>\n   💵 {usd:.2f} $  |  🇰🇿 {fmt_int(kzt)} ₸"
         await ctx.bot.send_message(chat_id=chat_id, text=txt, parse_mode="HTML")
+
+def _compute_billing_forecast_for_account(aid: str, rate_kzt: float, lookback_days: int = 7):
+    """
+    Возвращает dict с прогнозом по биллингу:
+    {
+      'aid', 'name', 'status', 'balance_usd', 'balance_kzt',
+      'avg_daily_spend', 'days_left'
+    }
+    или None, если прогноз бессмыслен (нет затрат, нет баланса и т.п.).
+    """
+    try:
+        info = AdAccount(aid).api_get(fields=["name", "account_status", "balance"])
+    except Exception:
+        return None
+
+    status = info.get("account_status")
+    # Прогноз имеет смысл в основном для активных кабинетов
+    if status != 1:
+        return None
+
+    balance_usd = float(info.get("balance", 0) or 0) / 100.0
+    if balance_usd <= 0:
+        return None
+
+    # Берём траты за последние lookback_days (без сегодняшнего)
+    acc = AdAccount(aid)
+    until = (datetime.now(ALMATY_TZ) - timedelta(days=1)).date()
+    since = until - timedelta(days=lookback_days - 1)
+    params = {
+        "level": "account",
+        "time_range": {
+            "since": since.strftime("%Y-%m-%d"),
+            "until": until.strftime("%Y-%m-%d"),
+        },
+    }
+    try:
+        data = acc.get_insights(fields=["spend"], params=params)
+    except Exception:
+        return None
+
+    total_spend = 0.0
+    for row in data:
+        try:
+            total_spend += float(row.get("spend", 0) or 0)
+        except Exception:
+            continue
+
+    if total_spend <= 0:
+        return None
+
+    avg_daily = total_spend / float(lookback_days)
+    if avg_daily <= 0:
+        return None
+
+    days_left = balance_usd / avg_daily
+    if days_left <= 0:
+        return None
+
+    name = info.get("name", get_account_name(aid))
+    balance_kzt = kzt_round_up_1000(balance_usd * rate_kzt)
+
+    return {
+        "aid": aid,
+        "name": name,
+        "status": status,
+        "balance_usd": balance_usd,
+        "balance_kzt": balance_kzt,
+        "avg_daily_spend": avg_daily,
+        "days_left": days_left,
+    }
+
+async def send_billing_forecast(ctx: ContextTypes.DEFAULT_TYPE, chat_id: str):
+    """
+    Прогноз списаний по всем активным аккаунтам.
+    Показываем примерную дату на день РАНЬШЕ расчёта.
+    """
+    rate = usd_to_kzt()
+    items = []
+    for aid in get_enabled_accounts_in_order():
+        fc = _compute_billing_forecast_for_account(aid, rate_kzt=rate)
+        if fc:
+            items.append(fc)
+
+    if not items:
+        await ctx.bot.send_message(
+            chat_id=chat_id,
+            text="🔮 Прогноз списаний: нет данных (нет трат/баланса по активным аккаунтам).",
+        )
+        return
+
+    # сортируем от самых "горящих"
+    items.sort(key=lambda x: x["days_left"])
+
+    lines = ["🔮 <b>Прогноз списаний по кабинетам</b>"]
+    today = datetime.now(ALMATY_TZ).date()
+
+    for fc in items:
+        days_left = fc["days_left"]
+        # день списания на 1 день раньше
+        if days_left < 1:
+            approx_days = 0
+        else:
+            approx_days = max(int(math.floor(days_left)) - 1, 0)
+        date = today + timedelta(days=approx_days)
+        if approx_days <= 0:
+            when_str = "сегодня (ориентир)"
+        else:
+            when_str = f"через {approx_days} дн. (ориентир {date.strftime('%d.%m')})"
+
+        lines.append(
+            f"\n💳 <b>{fc['name']}</b>\n"
+            f"   Баланс: {fc['balance_usd']:.2f} $  |  🇰🇿 {fmt_int(fc['balance_kzt'])} ₸\n"
+            f"   Средний расход: {fc['avg_daily_spend']:.2f} $/день\n"
+            f"   ⏳ Примерное списание: {when_str}"
+        )
+
+    await ctx.bot.send_message(chat_id=chat_id, text="\n".join(lines), parse_mode="HTML")
+
+async def billing_digest_job(ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    Ежедневный дайджест утром:
+    список аккаунтов, у которых days_left ≤ 5, отсортированный от самых “горящих”.
+    """
+    chat_id = str(DEFAULT_REPORT_CHAT)
+    if not chat_id:
+        return
+
+    rate = usd_to_kzt()
+    items = []
+    for aid in get_enabled_accounts_in_order():
+        fc = _compute_billing_forecast_for_account(aid, rate_kzt=rate)
+        if fc and fc["days_left"] <= 5.0:
+            items.append(fc)
+
+    if not items:
+        # Можно вообще ничего не слать, чтобы не спамить
+        return
+
+    items.sort(key=lambda x: x["days_left"])
+
+    today = datetime.now(ALMATY_TZ).date()
+    lines = ["☀️ <b>Предстоящие списания (≤ 5 дней)</b>"]
+
+    for fc in items:
+        days_left = fc["days_left"]
+        if days_left < 1:
+            approx_days = 0
+        else:
+            approx_days = max(int(math.floor(days_left)) - 1, 0)
+        date = today + timedelta(days=approx_days)
+        if approx_days <= 0:
+            when_str = "сегодня (ориентир)"
+        else:
+            when_str = f"через {approx_days} дн. (ориентир {date.strftime('%d.%m')})"
+
+        lines.append(
+            f"\n💳 <b>{fc['name']}</b>\n"
+            f"   Баланс: {fc['balance_usd']:.2f} $  |  🇰🇿 {fmt_int(fc['balance_kzt'])} ₸\n"
+            f"   Средний расход: {fc['avg_daily_spend']:.2f} $/день\n"
+            f"   ⏳ {when_str}"
+        )
+
+    await ctx.bot.send_message(chat_id=chat_id, text="\n".join(lines), parse_mode="HTML")
 
 # ============ CPA ALERTS ============
 async def cpa_alerts_job(ctx: ContextTypes.DEFAULT_TYPE):
@@ -428,6 +592,13 @@ def main_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("Биллинг", callback_data="billing")],
         [InlineKeyboardButton("Настройки", callback_data="choose_acc_settings")],
         [InlineKeyboardButton("Синхронизировать кабинеты из BM", callback_data="sync_bm")],
+    ])
+
+def billing_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Текущие биллинги", callback_data="billing_current")],
+        [InlineKeyboardButton("Прогноз списаний", callback_data="billing_forecast")],
+        [InlineKeyboardButton("⬅️ В меню", callback_data="menu")],
     ])
 
 def _flag_line(aid: str) -> str:
@@ -515,7 +686,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Команды:\n"
         "/start — показать меню\n"
         "/help — подсказка\n"
-        "/billing — список биллингов (неактивные аккаунты)\n"
+        "/billing — список биллингов/прогноз\n"
         "/sync_accounts — синк кабинетов из BM\n"
         "/whoami — показать user_id и chat_id\n"
     )
@@ -524,7 +695,10 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_billing(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _allowed(update):
         return
-    await send_billing(context, str(update.effective_chat.id))
+    await update.message.reply_text(
+        "Что показать по биллингу?",
+        reply_markup=billing_menu()
+    )
 
 async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _allowed(update):
@@ -580,6 +754,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("🤖 Выберите действие:", reply_markup=main_menu())
         return
 
+    # общие отчёты
     if data == "rep_today":
         label = datetime.now(ALMATY_TZ).strftime("%d.%m.%Y")
         await q.edit_message_text(f"Готовлю отчёт за {label}…")
@@ -599,11 +774,20 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_period_report(context, str(q.message.chat.id), period, label)
         return
 
+    # биллинг
     if data == "billing":
+        await q.edit_message_text("Что показать по биллингу?", reply_markup=billing_menu())
+        return
+    if data == "billing_current":
         await q.edit_message_text("📋 Биллинги (неактивные аккаунты):")
         await send_billing(context, str(q.message.chat.id))
         return
+    if data == "billing_forecast":
+        await q.edit_message_text("🔮 Считаю прогноз списаний…")
+        await send_billing_forecast(context, str(q.message.chat.id))
+        return
 
+    # синк из BM
     if data == "sync_bm":
         try:
             res = upsert_from_bm()
@@ -616,6 +800,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text(f"⚠️ Ошибка синка: {e}", reply_markup=main_menu())
         return
 
+    # выбор аккаунта для отчёта
     if data == "choose_acc_report":
         await q.edit_message_text("Выберите аккаунт:", reply_markup=accounts_kb("rep1"))
         return
@@ -657,6 +842,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # настройки
     if data == "choose_acc_settings":
         await q.edit_message_text("Выберите аккаунт для настроек:", reply_markup=accounts_kb("set1"))
         return
@@ -780,8 +966,11 @@ def build_app() -> Application:
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_any))
 
-    # Требуется установка python-telegram-bot[job-queue] в requirements.txt
+    # ежедневный отчёт за вчера
     app.job_queue.run_daily(daily_report_job, time=time(hour=9, minute=30, tzinfo=ALMATY_TZ))
+    # ежедневный дайджест по предстоящим списаниям
+    app.job_queue.run_daily(billing_digest_job, time=time(hour=9, minute=0, tzinfo=ALMATY_TZ))
+    # почасовые CPA-алерты
     schedule_cpa_alerts(app)
 
     return app
