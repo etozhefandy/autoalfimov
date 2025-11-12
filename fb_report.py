@@ -27,6 +27,8 @@ from telegram.ext import (
     filters,
 )
 
+from billing_watch import init_billing_watch
+
 # ================== КОНСТАНТЫ / КРЕДЫ ==================
 
 ALMATY_TZ = timezone("Asia/Almaty")
@@ -50,6 +52,7 @@ def _get_env(*names, default=""):
 # Telegram токен и чат
 TELEGRAM_TOKEN = _get_env("TG_BOT_TOKEN", "TELEGRAM_BOT_TOKEN", "TELEGRAM_TOKEN")
 DEFAULT_REPORT_CHAT = os.getenv("TG_CHAT_ID", "-1002679045097")  # строка
+OWNER_ID = 253181449  # личные уведомления (Андрей)
 
 if not TELEGRAM_TOKEN or ":" not in TELEGRAM_TOKEN:
     raise RuntimeError(
@@ -1335,6 +1338,17 @@ def build_app() -> Application:
     )
     # почасовые CPA-алерты
     schedule_cpa_alerts(app)
+
+        # === Фоновые проверки биллингов ===
+    init_billing_watch(
+        app,
+        get_enabled_accounts=get_enabled_accounts_in_order,
+        get_account_name=get_account_name,
+        usd_to_kzt=usd_to_kzt,
+        kzt_round_up_1000=kzt_round_up_1000,
+        owner_id=OWNER_ID,
+        group_chat_id=str(DEFAULT_REPORT_CHAT),
+    )
 
     return app
 
