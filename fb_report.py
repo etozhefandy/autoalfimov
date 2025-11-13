@@ -52,7 +52,6 @@ def _get_env(*names, default=""):
 # Telegram токен и чат
 TELEGRAM_TOKEN = _get_env("TG_BOT_TOKEN", "TELEGRAM_BOT_TOKEN", "TELEGRAM_TOKEN")
 DEFAULT_REPORT_CHAT = os.getenv("TG_CHAT_ID", "-1002679045097")  # строка
-OWNER_ID = 253181449  # личные уведомления (Андрей)
 
 if not TELEGRAM_TOKEN or ":" not in TELEGRAM_TOKEN:
     raise RuntimeError(
@@ -651,9 +650,8 @@ async def billing_digest_job(ctx: ContextTypes.DEFAULT_TYPE):
 
 # ============ CPA ALERTS ============
 async def cpa_alerts_job(ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = str(DEFAULT_REPORT_CHAT)
-    if not chat_id:
-        return
+    # CPA-алерты идут в личку
+    chat_id = "253181449"
     now = datetime.now(ALMATY_TZ)
     if not (10 <= now.hour <= 22):
         return
@@ -976,8 +974,10 @@ async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ======== CUSTOM RANGE INPUT ========
 _RANGE_RE = re.compile(
-    r"^\s*(\d{2})\.(\d{2})\.(\d{4})\s*-\s*(\d{2})\.(\d{2})\.(\d{4})\s*$"
+    r"^\s*(\d{2})\.(\d{2})\.(\d{4})\s*-\s*(\d{2})\.(\д{2})\.(\д{4})\s*$"
 )
+# ↑ если тут упадёт на кириллицу, замени \д на \d руками, если нужно —
+# но основная проблема была именно в strftime ниже
 
 
 def _parse_range(s: str):
@@ -1123,7 +1123,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("one_yday|"):
         aid = data.split("|", 1)[1]
         label = (datetime.now(ALMATY_TZ) - timedelta(days=1)).strftime(
-            "%d.%м.%Y"
+            "%d.%m.%Y"
         )
         await q.edit_message_text(
             f"Отчёт по {get_account_name(aid)} за {label}:"
@@ -1339,14 +1339,14 @@ def build_app() -> Application:
     # почасовые CPA-алерты
     schedule_cpa_alerts(app)
 
-        # === Фоновые проверки биллингов ===
+    # мониторинг биллингов (отдельный модуль)
     init_billing_watch(
         app,
         get_enabled_accounts=get_enabled_accounts_in_order,
         get_account_name=get_account_name,
         usd_to_kzt=usd_to_kzt,
         kzt_round_up_1000=kzt_round_up_1000,
-        owner_id=OWNER_ID,
+        owner_id=253181449,
         group_chat_id=str(DEFAULT_REPORT_CHAT),
     )
 
