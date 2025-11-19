@@ -1,234 +1,183 @@
 # billing_watch.py
-# Модуль фонового мониторинга биллингов Facebook Ads
+"""
+Модуль для отслеживания биллингов Facebook Ads.
 
-import os
-import json
-import math
+Что делает:
+- Раз в N минут обходит включённые аккаунты.
+- Смотрит смену статуса account_status: было 1 (ACTIVE) → стало != 1.
+  Это и есть "момент биллинга / блокировки".
+- В момент события отправляет алерт в группу с текстом про биллинг
+  и суммой долга в $ и ₸.
+- Параллельно ставит follow-up через ~20 минут, чтобы получить уже
+  откорректированный баланс и выдать текст, который можно переслать клиенту.
+"""
+
+from __future__ import annotations
+
 from datetime import datetime, timedelta
+from typing import Callable, Iterable, Dict, Any
 
 from pytz import timezone
 from facebook_business.adobjects.adaccount import AdAccount
-from telegram.ext import ContextTypes
 
+# Локальное время
 ALMATY_TZ = timezone("Asia/Almaty")
-STATE_FILE = "/data/billing_state.json"
 
 
-# === Вспомогательные функции работы с JSON ===
-def _load_state():
+def fmt_int(n) -> str:
+    """Красивый формат целых чисел: 12345 -> '12 345'."""
     try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-
-def _save_state(d: dict):
-    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-
-
-# === Хелперы для баланса и прогноза ===
-def _fetch_balance(aid: str):
-    """Возвращает (name, status, balance_usd)"""
-    info = AdAccount(aid).api_get(fields=["name", "account_status", "balance"])
-    name = info.get("name", aid)
-    status = int(info.get("account_status", 0))
-    balance = float(info.get("balance", 0) or 0) / 100.0
-    return name, status, balance
-
-
-def _avg_daily_spend(aid: str, lookback_days: int = 7):
-    """
-    Средний дневной расход за lookback_days (без сегодняшнего дня).
-    Сейчас не используем в уведомлениях, но функция пригодится дальше.
-    """
-    until = (datetime.now(ALMATY_TZ) - timedelta(days=1)).date()
-    since = until - timedelta(days=lookback_days - 1)
-    acc = AdAccount(aid)
-    data = acc.get_insights(
-        fields=["spend"],
-        params={
-            "time_range": {
-                "since": since.strftime("%Y-%m-%d"),
-                "until": until.strftime("%Y-%m-%d"),
-            }
-        },
-    )
-    total = 0.0
-    for row in data:
-        try:
-            total += float(row.get("spend", 0) or 0)
-        except Exception:
-            continue
-    return (total / lookback_days) if total > 0 else 0.0
-
-
-def _forecast_days_left(balance_usd, avg_daily):
-    """
-    Логика прогноза дней до биллинга:
-    (Порог списаний - Баланс) / средний дневной бюджет - 1.5, округление вниз.
-    Сейчас не используется напрямую в этом модуле, но оставляем для будущего.
-    """
-    if avg_daily <= 0:
-        return None
-    return math.floor(balance_usd / avg_daily - 1.5)
-
-
-def _fmt_kzt(n: float) -> str:
-    try:
-        return f"{int(round(n)):,}".replace(",", " ")
+        return f"{int(float(n)):,}".replace(",", " ")
     except Exception:
         return "0"
 
 
-# === Основной процесс мониторинга (каждые 15 минут) ===
-async def billing_check_job(ctx: ContextTypes.DEFAULT_TYPE):
+class BillingWatcher:
     """
-    Джоба, которую вызывает JobQueue.
-    НИЧЕГО не принимает позиционно, всё берёт из context.job.data:
-
-    context.job.data = {
-      "get_enabled_accounts": ...,
-      "get_account_name": ...,
-      "usd_to_kzt": ...,
-      "kzt_round_up_1000": ...,
-      "owner_id": int,
-      "group_chat_id": str,
-    }
+    Класс-обёртка над логикой биллингов, чтобы удобно повесить
+    его .job на JobQueue как callback.
     """
-    jd = ctx.job.data or {}
-    get_enabled_accounts = jd["get_enabled_accounts"]
-    get_account_name = jd["get_account_name"]
-    usd_to_kzt = jd["usd_to_kzt"]
-    kzt_round_up_1000 = jd["kzt_round_up_1000"]
-    group_chat_id = jd["group_chat_id"]
 
-    rate = usd_to_kzt()
-    state = _load_state()
-    now_ts = datetime.now(ALMATY_TZ).timestamp()
+    def __init__(
+        self,
+        get_enabled_accounts: Callable[[], Iterable[str]],
+        get_account_name: Callable[[str], str],
+        usd_to_kzt: Callable[[], float],
+        kzt_round_up_1000: Callable[[float], int],
+        group_chat_id: str,
+    ) -> None:
+        self.get_enabled_accounts = get_enabled_accounts
+        self.get_account_name = get_account_name
+        self.usd_to_kzt = usd_to_kzt
+        self.kzt_round_up_1000 = kzt_round_up_1000
+        self.group_chat_id = str(group_chat_id)
 
-    for aid in get_enabled_accounts():
+        # сюда запоминаем предыдущие значения account_status
+        # { "act_123": 1, "act_456": 2, ... }
+        self._last_status: Dict[str, int] = {}
+
+    # ---------- ВСПОМОГАТЕЛЬНОЕ ----------
+
+    def _get_account_info(self, aid: str) -> dict | None:
+        """Аккуратно достаём name, account_status, balance."""
         try:
-            name, status, balance = _fetch_balance(aid)
+            info = AdAccount(aid).api_get(
+                fields=["name", "account_status", "balance"]
+            )
+            return info
         except Exception:
-            continue
+            return None
 
-        # Следим только за активными аккаунтами
-        if status != 1:
-            # Если раньше фиксировали "минус" — чистим
-            if aid in state:
-                del state[aid]
-                _save_state(state)
-            continue
+    # ---------- ОСНОВНОЙ JOB ДЛЯ JOBQUEUE ----------
 
-        kzt = kzt_round_up_1000(balance * rate)
+    async def job(self, ctx) -> None:
+        """
+        Основной callback, который вешается на JobQueue через run_repeating.
 
-        # 1) Событие биллинга: кабинет ушёл в минус и мы этого ещё не фиксировали
-        if balance < 0 and aid not in state:
-            state[aid] = {"first_ts": now_ts}
-            _save_state(state)
+        ctx: telegram.ext.CallbackContext (в async-версии).
+        """
+        bot = ctx.bot
+        rate = self.usd_to_kzt()
 
-            txt = (
-                f"🚨 У аккаунта <b>{name}</b> биллинг!\n"
-                f"Сумма неудавшегося списания: {abs(balance):.2f} $ / {_fmt_kzt(abs(kzt))} ₸\n\n"
-                "Подожди, не отправляй заказчику — баланс уточнится через ~20 минут."
+        for aid in self.get_enabled_accounts():
+            info = self._get_account_info(aid)
+            if not info:
+                continue
+
+            name = info.get("name") or self.get_account_name(aid)
+            status = int(info.get("account_status", 0) or 0)
+            balance_cents = float(info.get("balance", 0) or 0)
+            balance_usd = balance_cents / 100.0
+
+            prev_status = self._last_status.get(aid)
+
+            # первый запуск по этому аккаунту — просто запоминаем
+            self._last_status[aid] = status
+
+            # нас интересует только момент: БЫЛ активен (1), СТАЛ неактивен (!=1)
+            if prev_status == 1 and status != 1:
+                # момент биллинга
+                kzt_val = self.kzt_round_up_1000(balance_usd * rate)
+
+                # Первое сообщение — техническое, не для клиента.
+                text = (
+                    f"🚨 У аккаунта <b>{name}</b> биллинг!\n"
+                    f"Сумма неудавшегося биллинга: {balance_usd:.2f} $ / "
+                    f"{fmt_int(kzt_val)} ₸\n\n"
+                    f"⚠️ Подожди, не отправляй это сообщение заказчику — "
+                    f"через ~20 минут баланс обновится, и я пришлю текст, "
+                    f"который можно переслать клиенту."
+                )
+
+                try:
+                    await bot.send_message(
+                        chat_id=self.group_chat_id,
+                        text=text,
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    # если не смогли отправить — просто молча продолжаем
+                    pass
+
+                # Ставим follow-up через 20 минут
+                try:
+                    if ctx.application and ctx.application.job_queue:
+                        ctx.application.job_queue.run_once(
+                            self._followup_job,
+                            when=20 * 60,  # 20 минут
+                            data={"aid": aid, "name": name},
+                        )
+                except Exception:
+                    pass
+
+    # ---------- FOLLOW-UP ЧЕРЕЗ 20 МИН ----------
+
+    async def _followup_job(self, ctx) -> None:
+        """
+        Через ~20 минут после биллинга ещё раз смотрим баланс и даём
+        аккуратный текст, который уже можно пересылать клиенту.
+        """
+        bot = ctx.bot
+        data: Dict[str, Any] = ctx.job.data or {}
+        aid = data.get("aid")
+        name = data.get("name") or (aid and self.get_account_name(aid)) or "Аккаунт"
+
+        if not aid:
+            return
+
+        info = self._get_account_info(aid)
+        if not info:
+            return
+
+        # Баланс через 20 минут — должен быть более корректным после частичных списаний
+        balance_cents = float(info.get("balance", 0) or 0)
+        balance_usd = balance_cents / 100.0
+
+        rate = self.usd_to_kzt()
+        kzt_val = self.kzt_round_up_1000(balance_usd * rate)
+
+        # Текст, который можно копировать заказчику
+        today = datetime.now(ALMATY_TZ).strftime("%d.%m.%Y")
+
+        client_text = (
+            f"Добрый день!\n\n"
+            f"По аккаунту <b>{name}</b> на {today} есть задолженность "
+            f"перед Facebook: <b>{balance_usd:.2f} $ / {fmt_int(kzt_val)} ₸</b>.\n"
+            f"Нужно пополнить рекламный кабинет, чтобы объявления продолжили крутиться."
+        )
+
+        final_text = (
+            f"✅ Обновлённый долг по аккаунту <b>{name}</b>:\n"
+            f"{balance_usd:.2f} $ / {fmt_int(kzt_val)} ₸\n\n"
+            f"📝 Текст для отправки заказчику:\n\n"
+            f"{client_text}"
+        )
+
+        try:
+            await bot.send_message(
+                chat_id=self.group_chat_id,
+                text=final_text,
+                parse_mode="HTML",
             )
-            await ctx.bot.send_message(
-                chat_id=group_chat_id, text=txt, parse_mode="HTML"
-            )
-
-            # Планируем уточнение через 20 минут
-            ctx.job_queue.run_once(
-                billing_recheck_job,
-                when=20 * 60,
-                data={
-                    "aid": aid,
-                    "rate": rate,
-                    "get_account_name": get_account_name,
-                    "kzt_round_up_1000": kzt_round_up_1000,
-                    "group_chat_id": group_chat_id,
-                },
-            )
-            continue
-
-        # 2) Если баланс восстановился (>= 0) и был в state — чистим запись
-        if balance >= 0 and aid in state:
-            del state[aid]
-            _save_state(state)
-
-
-# === Повторная проверка через 20 минут ===
-async def billing_recheck_job(ctx: ContextTypes.DEFAULT_TYPE):
-    jd = ctx.job.data or {}
-    aid = jd.get("aid")
-    rate = jd.get("rate")
-    get_account_name = jd.get("get_account_name")
-    kzt_round_up_1000 = jd.get("kzt_round_up_1000")
-    group_chat_id = jd.get("group_chat_id")
-
-    if not aid or rate is None or not group_chat_id:
-        return
-
-    try:
-        name, status, balance = _fetch_balance(aid)
-    except Exception:
-        return
-
-    # Если долг уже погашен — просто чистим state и выходим
-    if balance >= 0:
-        st = _load_state()
-        if aid in st:
-            del st[aid]
-            _save_state(st)
-        return
-
-    kzt = kzt_round_up_1000(balance * rate)
-
-    txt = (
-        f"🔁 Уточнённый долг по аккаунту <b>{name}</b>:\n"
-        f"Текущий баланс: {balance:.2f} $ / {_fmt_kzt(kzt)} ₸\n\n"
-        f"💬 Отправь заказчику:\n"
-        f"«Нужно пополнить рекламный кабинет на {abs(balance):.0f}–{abs(balance)*1.15:.0f} $ "
-        f"(~{_fmt_kzt(abs(kzt))}–{_fmt_kzt(abs(kzt)*1.15)} ₸) для продолжения работы рекламы.»"
-    )
-    await ctx.bot.send_message(
-        chat_id=group_chat_id, text=txt, parse_mode="HTML"
-    )
-
-    st = _load_state()
-    if aid in st:
-        del st[aid]
-        _save_state(st)
-
-
-# === Инициализация модуля ===
-def init_billing_watch(
-    app,
-    *,
-    get_enabled_accounts,
-    get_account_name,
-    usd_to_kzt,
-    kzt_round_up_1000,
-    owner_id: int,
-    group_chat_id: str,
-):
-    """
-    Регистрируем фоновые проверки биллингов.
-    JobQueue будет вызывать billing_check_job(context),
-    а все параметры мы передаём в data.
-    """
-    app.job_queue.run_repeating(
-        billing_check_job,
-        interval=900,  # каждые 15 минут
-        first=15,
-        data={
-            "get_enabled_accounts": get_enabled_accounts,
-            "get_account_name": get_account_name,
-            "usd_to_kzt": usd_to_kzt,
-            "kzt_round_up_1000": kzt_round_up_1000,
-            "owner_id": owner_id,
-            "group_chat_id": group_chat_id,
-        },
-    )
+        except Exception:
+            pass
