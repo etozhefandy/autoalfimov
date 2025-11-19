@@ -65,11 +65,12 @@ ALLOWED_USER_IDS = {
 ALLOWED_CHAT_IDS = {str(DEFAULT_REPORT_CHAT), "-1002679045097"}  # как строки
 
 # ======= ПУТИ / ФАЙЛЫ =========
+# Все живёт в /data (volume на Railway). Локально тоже можно завести переменную DATA_DIR.
 DATA_DIR = os.getenv("DATA_DIR", "/data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 ACCOUNTS_JSON = os.getenv("ACCOUNTS_JSON_PATH", os.path.join(DATA_DIR, "accounts.json"))
-REPO_ACCOUNTS_JSON = "./accounts.json"
+REPO_ACCOUNTS_JSON = os.path.join(os.path.dirname(__file__), "accounts.json")
 
 REPORT_CACHE_FILE = os.path.join(DATA_DIR, "report_cache.json")
 REPORT_CACHE_TTL = int(os.getenv("REPORT_CACHE_TTL", "3600"))  # сек, по умолчанию 1 час
@@ -444,8 +445,6 @@ async def send_period_report(ctx, chat_id, period, label=""):
 
 
 # ============ БИЛЛИНГ ============
-
-
 async def send_billing(ctx: ContextTypes.DEFAULT_TYPE, chat_id: str):
     """Текущие биллинги: только неактивные аккаунты."""
     rate = usd_to_kzt()
@@ -843,7 +842,7 @@ def settings_kb(aid: str) -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(
                     f"⚠️ Алерт CPA: {'ON' if a_on else 'OFF'}",
-                    callback_data=f"toggle_alert|{aid}",
+                    callback_data=f"toggle_alert|{aid}"
                 )
             ],
             [
@@ -974,10 +973,8 @@ async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ======== CUSTOM RANGE INPUT ========
 _RANGE_RE = re.compile(
-    r"^\s*(\d{2})\.(\d{2})\.(\d{4})\s*-\s*(\d{2})\.(\д{2})\.(\д{4})\s*$"
+    r"^\s*(\d{2})\.(\d{2})\.(\d{4})\s*-\s*(\d{2})\.(\d{2})\.(\d{4})\s*$"
 )
-# ↑ если тут упадёт на кириллицу, замени \д на \d руками, если нужно —
-# но основная проблема была именно в strftime ниже
 
 
 def _parse_range(s: str):
@@ -1032,7 +1029,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # общие отчёты
     if data == "rep_today":
-        label = datetime.now(ALMATY_TZ).strftime("%d.%m.%Y")
+        label = datetime.now(ALMATY_TZ).strftime("%d.%м.%Y")
         await q.edit_message_text(f"Готовлю отчёт за {label}…")
         await send_period_report(
             context, str(q.message.chat.id), "today", label
