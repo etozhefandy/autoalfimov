@@ -1388,14 +1388,4 @@ def build_app() -> Application:
 
 if __name__ == "__main__":
     print("🚀 Бот запущен и ожидает команд.")
-    build_app().run_polling(allowed_updates=Update.ALL_TYPES)cd ~/autoalfimov
-pwd
-ls
-ls fb_report.pycd ~/autoalfimov
-pwd
-ls
-ls fb_report.py
-cd ~/autoalfimov
-pwd
-ls
-ls fb_report.py
+    build_app().run_polling(allowed_updates=Update.ALL_TYPES)
