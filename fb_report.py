@@ -989,7 +989,7 @@ def settings_kb(aid: str) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
-                    f"⚠️ Алерт CPA: {'ON' если a_on else 'OFF'}",
+                    f"⚠️ Алерт CPA: {'ON' if a_on else 'OFF'}",
                     callback_data=f"toggle_alert|{aid}",
                 )
             ],
