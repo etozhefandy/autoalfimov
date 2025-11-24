@@ -30,7 +30,23 @@ from telegram.ext import (
 )
 
 from billing_watch import init_billing_watch
-from history_store import append_snapshot, prune_old_history
+
+# --- history_store: мягкий импорт, чтобы бот не падал, если файла нет ---
+try:
+    from history_store import append_snapshot, prune_old_history
+
+    HISTORY_STORE_AVAILABLE = True
+except ImportError:
+    HISTORY_STORE_AVAILABLE = False
+
+    def append_snapshot(*args, **kwargs):
+        # заглушка, чтобы не ломать работу бота
+        return
+
+    def prune_old_history(*args, **kwargs):
+        # заглушка, чтобы не ломать работу бота
+        return
+
 
 # ================== КОНСТАНТЫ / КРЕДЫ ==================
 
@@ -521,7 +537,14 @@ def build_comparison_report(aid: str, period1, label1: str, period2, label2: str
     # 3️⃣ Сравнение (новый vs старый)
     txt_lines.append("3️⃣ <b>Сравнение (новый vs старый)</b>")
 
-    def _add_diff(label: str, old_v: float, new_v: float, is_better_lower: bool = False, fmt_func=None, icon: str = ""):
+    def _add_diff(
+        label: str,
+        old_v: float,
+        new_v: float,
+        is_better_lower: bool = False,
+        fmt_func=None,
+        icon: str = "",
+    ):
         if fmt_func is None:
             fmt_func = lambda x: str(int(x))
         base = f"{icon} {label}: {fmt_func(old_v)} → {fmt_func(new_v)}"
@@ -529,29 +552,99 @@ def build_comparison_report(aid: str, period1, label1: str, period2, label2: str
         if pct is None:
             txt_lines.append(base + " (Δ %: н/д)")
             return
-        sign = "📈" if ((not is_better_lower and pct > 0) or (is_better_lower and pct < 0)) else "📉" if pct != 0 else "➡️"
+        if pct == 0:
+            sign = "➡️"
+        else:
+            sign = (
+                "📈"
+                if ((not is_better_lower and pct > 0) or (is_better_lower and pct < 0))
+                else "📉"
+            )
         txt_lines.append(f"{base}   {sign} {pct:+.1f}%")
 
     # Охваты / клики / затраты
-    _add_diff("Охваты", s1["impr"], s2["impr"], is_better_lower=False, fmt_func=lambda v: fmt_int(v), icon="👁")
-    _add_diff("Клики", s1["clicks"], s2["clicks"], is_better_lower=False, fmt_func=lambda v: fmt_int(v), icon="🖱")
-    _add_diff("Затраты", s1["spend"], s2["spend"], is_better_lower=False, fmt_func=_fmt_money, icon="💵")
+    _add_diff(
+        "Охваты",
+        s1["impr"],
+        s2["impr"],
+        is_better_lower=False,
+        fmt_func=lambda v: fmt_int(v),
+        icon="👁",
+    )
+    _add_diff(
+        "Клики",
+        s1["clicks"],
+        s2["clicks"],
+        is_better_lower=False,
+        fmt_func=lambda v: fmt_int(v),
+        icon="🖱",
+    )
+    _add_diff(
+        "Затраты",
+        s1["spend"],
+        s2["spend"],
+        is_better_lower=False,
+        fmt_func=_fmt_money,
+        icon="💵",
+    )
 
     # CPM / CPC (меньше = лучше)
-    _add_diff("CPM", s1["cpm"], s2["cpm"], is_better_lower=True, fmt_func=lambda v: f"{v:.2f} $", icon="🎯")
-    _add_diff("CPC", s1["cpc"], s2["cpc"], is_better_lower=True, fmt_func=lambda v: f"{v:.2f} $", icon="💸")
+    _add_diff(
+        "CPM",
+        s1["cpm"],
+        s2["cpm"],
+        is_better_lower=True,
+        fmt_func=lambda v: f"{v:.2f} $",
+        icon="🎯",
+    )
+    _add_diff(
+        "CPC",
+        s1["cpc"],
+        s2["cpc"],
+        is_better_lower=True,
+        fmt_func=lambda v: f"{v:.2f} $",
+        icon="💸",
+    )
 
     # Переписки / лиды
     if flags["messaging"]:
-        _add_diff("Переписки", s1["msgs"], s2["msgs"], is_better_lower=False, fmt_func=lambda v: str(int(v)), icon="💬")
+        _add_diff(
+            "Переписки",
+            s1["msgs"],
+            s2["msgs"],
+            is_better_lower=False,
+            fmt_func=lambda v: str(int(v)),
+            icon="💬",
+        )
     if flags["leads"]:
-        _add_diff("Лиды", s1["leads"], s2["leads"], is_better_lower=False, fmt_func=lambda v: str(int(v)), icon="📩")
+        _add_diff(
+            "Лиды",
+            s1["leads"],
+            s2["leads"],
+            is_better_lower=False,
+            fmt_func=lambda v: str(int(v)),
+            icon="📩",
+        )
 
     # Общие заявки и CPA
     if flags["messaging"] or flags["leads"]:
-        _add_diff("Заявки всего", s1["total"], s2["total"], is_better_lower=False, fmt_func=lambda v: str(int(v)), icon="🧮")
+        _add_diff(
+            "Заявки всего",
+            s1["total"],
+            s2["total"],
+            is_better_lower=False,
+            fmt_func=lambda v: str(int(v)),
+            icon="🧮",
+        )
         if s1["cpa"] is not None and s2["cpa"] is not None:
-            _add_diff("CPA", s1["cpa"], s2["cpa"], is_better_lower=True, fmt_func=_fmt_cpa, icon="🎯")
+            _add_diff(
+                "CPA",
+                s1["cpa"],
+                s2["cpa"],
+                is_better_lower=True,
+                fmt_func=_fmt_cpa,
+                icon="🎯",
+            )
 
     return "\n".join(txt_lines)
 
@@ -809,12 +902,12 @@ async def cpa_alerts_job(ctx: ContextTypes.DEFAULT_TYPE):
             _, ins = fetch_insight(aid, "today")
         except Exception:
             ins = None
-        if ins:
+        if ins and HISTORY_STORE_AVAILABLE:
             spend, msgs, leads, total, blended = _blend_totals(ins)
             append_snapshot(aid, spend=spend, msgs=msgs, leads=leads, ts=now)
 
         # Чистим историю (проверка по часу, но фактически раз в день)
-        if now.hour == 3:
+        if now.hour == 3 and HISTORY_STORE_AVAILABLE:
             prune_old_history(max_age_days=365)
 
         # Если алерты не включены или таргет 0 — дальше не проверяем
@@ -870,22 +963,14 @@ def main_menu() -> InlineKeyboardMarkup:
     last_sync = human_last_sync()
     return InlineKeyboardMarkup(
         [
-            [
-                InlineKeyboardButton(
-                    "Отчёт по всем", callback_data="rep_all_menu"
-                )
-            ],
+            [InlineKeyboardButton("Отчёт по всем", callback_data="rep_all_menu")],
             [InlineKeyboardButton("Биллинг", callback_data="billing")],
             [
                 InlineKeyboardButton(
                     "Отчёт по аккаунту", callback_data="choose_acc_report"
                 )
             ],
-            [
-                InlineKeyboardButton(
-                    "Настройки", callback_data="choose_acc_settings"
-                )
-            ],
+            [InlineKeyboardButton("Настройки", callback_data="choose_acc_settings")],
             [
                 InlineKeyboardButton(
                     f"Синк BM (посл. {last_sync})",
@@ -1012,12 +1097,8 @@ def period_kb_for(aid: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton(
-                    "Сегодня", callback_data=f"one_today|{aid}"
-                ),
-                InlineKeyboardButton(
-                    "Вчера", callback_data=f"one_yday|{aid}"
-                ),
+                InlineKeyboardButton("Сегодня", callback_data=f"one_today|{aid}"),
+                InlineKeyboardButton("Вчера", callback_data=f"one_yday|{aid}"),
             ],
             [
                 InlineKeyboardButton(
@@ -1034,11 +1115,7 @@ def period_kb_for(aid: str) -> InlineKeyboardMarkup:
                     "🗓 Свой диапазон", callback_data=f"one_custom|{aid}"
                 )
             ],
-            [
-                InlineKeyboardButton(
-                    "⬅️ К аккаунтам", callback_data="choose_acc_report"
-                )
-            ],
+            [InlineKeyboardButton("⬅️ К аккаунтам", callback_data="choose_acc_report")],
         ]
     )
 
@@ -1314,9 +1391,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if data.startswith("one_yday|"):
         aid = data.split("|", 1)[1]
-        label = (datetime.now(ALMATY_TZ) - timedelta(days=1)).strftime(
-            "%d.%m.%Y"
-        )
+        label = (datetime.now(ALMATY_TZ) - timedelta(days=1)).strftime("%d.%m.%Y")
         await q.edit_message_text(
             f"Отчёт по {get_account_name(aid)} за {label}:"
         )
@@ -1387,19 +1462,19 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
         label1 = f"{since1.strftime('%d.%m')}-{until1.strftime('%d.%m')}"
         label2 = f"{since2.strftime('%d.%m')}-{until2.strftime('%d.%m')}"
-        await q.edit_message_text(
-            f"Сравниваю {label1} vs {label2}…"
-        )
+        await q.edit_message_text(f"Сравниваю {label1} vs {label2}…")
+        txt = build_comparison_report(aid, period
         txt = build_comparison_report(aid, period1, label1, period2, label2)
         await context.bot.send_message(chat_id, txt, parse_mode="HTML")
         return
+
     if data.startswith("cmp_custom|"):
         aid = data.split("|", 1)[1]
         context.user_data["await_cmp_for"] = aid
         await q.edit_message_text(
-            f"Отправь два диапазона дат через ';' или с новой строки.\n"
-            f"Например:\n"
-            f"01.06.2025-07.06.2025;08.06.2025-14.06.2025",
+            "Отправь два диапазона дат через ';' или с новой строки.\n"
+            "Например:\n"
+            "01.06.2025-07.06.2025;08.06.2025-14.06.2025",
             reply_markup=compare_kb_for(aid),
         )
         return
@@ -1411,6 +1486,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=accounts_kb("set1"),
         )
         return
+
     if data.startswith("set1|"):
         aid = data.split("|", 1)[1]
         await q.edit_message_text(
@@ -1418,6 +1494,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=settings_kb(aid),
         )
         return
+
     if data.startswith("toggle_enabled|"):
         aid = data.split("|", 1)[1]
         st = load_accounts()
@@ -1430,6 +1507,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=settings_kb(aid),
         )
         return
+
     if data.startswith("toggle_m|"):
         aid = data.split("|", 1)[1]
         st = load_accounts()
@@ -1443,6 +1521,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=settings_kb(aid),
         )
         return
+
     if data.startswith("toggle_l|"):
         aid = data.split("|", 1)[1]
         st = load_accounts()
@@ -1456,6 +1535,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=settings_kb(aid),
         )
         return
+
     if data.startswith("toggle_alert|"):
         aid = data.split("|", 1)[1]
         st = load_accounts()
@@ -1473,6 +1553,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=settings_kb(aid),
         )
         return
+
     if data.startswith("set_cpa|"):
         aid = data.split("|", 1)[1]
         st = load_accounts()
@@ -1491,7 +1572,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
-# ввод target CPA / кастомных диапазонов
+# ввод target CPA и кастомных диапазонов
 async def on_text_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _allowed(update):
         return
@@ -1525,6 +1606,7 @@ async def on_text_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             context.user_data["await_cpa_for"] = aid
             return
+
         st = load_accounts()
         row = st.get(aid, {"alerts": {}})
         alerts = row.get("alerts", {})
@@ -1533,6 +1615,7 @@ async def on_text_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
         row["alerts"] = alerts
         st[aid] = row
         save_accounts(st)
+
         if val > 0:
             await update.message.reply_text(
                 f"✅ Target CPA для {get_account_name(aid)} обновлён: {val:.2f} $ (алерты ВКЛ)"
@@ -1548,7 +1631,7 @@ async def on_text_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def daily_report_job(ctx: ContextTypes.DEFAULT_TYPE):
     if not DEFAULT_REPORT_CHAT:
         return
-    label = (datetime.now(ALMATY_TZ) - timedelta(days=1)).strftime("%d.%м.%Y")
+    label = (datetime.now(ALMATY_TZ) - timedelta(days=1)).strftime("%d.%m.%Y")
     await send_period_report(ctx, str(DEFAULT_REPORT_CHAT), "yesterday", label)
 
 
@@ -1570,23 +1653,20 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("billing", cmd_billing))
     app.add_handler(CommandHandler("sync_accounts", cmd_sync))
     app.add_handler(CallbackQueryHandler(on_cb))
-
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_any))
 
-    # ежедневный отчёт за вчера
     app.job_queue.run_daily(
         daily_report_job,
         time=time(hour=9, minute=30, tzinfo=ALMATY_TZ),
     )
-    # ежедневный дайджест по предстоящим списаниям
+
     app.job_queue.run_daily(
         billing_digest_job,
         time=time(hour=9, minute=0, tzinfo=ALMATY_TZ),
     )
-    # почасовые CPA-алерты + лог истории
+
     schedule_cpa_alerts(app)
 
-    # мониторинг биллингов (отдельный модуль)
     init_billing_watch(
         app,
         get_enabled_accounts=get_enabled_accounts_in_order,
