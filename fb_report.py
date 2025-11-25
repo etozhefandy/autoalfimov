@@ -1547,8 +1547,8 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "since": since2.strftime("%Y-%m-%d"),
             "until": until2.strftime("%Y-%m-%d"),
         }
-        label1 = f"{since1.strftime('%d.%m')}-{until1.strftime('%d.%м')}"
-        label2 = f"{since2.strftime('%d.%m')}-{until2.strftime('%d.%м')}"
+        label1 = f"{since1.strftime('%d.%m')}-{until1.strftime('%d.%m')}"
+        label2 = f"{since2.strftime('%d.%m')}-{until2.strftime('%d.%m')}"
         await q.edit_message_text(f"Сравниваю {label1} vs {label2}…")
         txt = build_comparison_report(aid, period1, label1, period2, label2)
         await context.bot.send_message(chat_id, txt, parse_mode="HTML")
