@@ -1,4 +1,4 @@
-# fb_report.py - версия с логированием истории и улучшенным сравнением периодов
+# fb_report.py - версия с логированием истории, локальным кэшем инсайтов и улучшенным сравнением периодов
 
 import os
 import json
@@ -123,6 +123,40 @@ def _ensure_accounts_file():
 
 
 _ensure_accounts_file()
+
+# --- ЛОКАЛЬНОЕ ХРАНИЛИЩЕ ИНСАЙТОВ (основной источник данных) ---
+
+INSIGHTS_DIR = os.path.join(DATA_DIR, "insights_cache")
+os.makedirs(INSIGHTS_DIR, exist_ok=True)
+
+
+def _insight_file(aid: str) -> str:
+    safe = aid.replace("act_", "")
+    return os.path.join(INSIGHTS_DIR, f"{safe}.json")
+
+
+def load_local_insights(aid: str) -> dict:
+    """Читает локальный файл с инсайтами аккаунта."""
+    path = _insight_file(aid)
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_local_insights(aid: str, d: dict):
+    """Атомарно сохраняет локальный файл с инсайтами."""
+    path = _insight_file(aid)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
 
 # ========= КУРС USD→KZT =========
 FX_RATE_OVERRIDE = float(os.getenv("FX_RATE_OVERRIDE", "0") or 0.0)
@@ -336,19 +370,6 @@ def metrics_flags(aid: str) -> dict:
     }
 
 
-def fetch_insight(aid: str, period) -> tuple[str, dict | None]:
-    acc = AdAccount(aid)
-    fields = ["impressions", "cpm", "clicks", "cpc", "spend", "actions"]
-    params = {"level": "account"}
-    if isinstance(period, dict):
-        params["time_range"] = period
-    else:
-        params["date_preset"] = period
-    data = acc.get_insights(fields=fields, params=params)
-    name = acc.api_get(fields=["name"]).get("name", get_account_name(aid))
-    return name, (data[0] if data else None)
-
-
 def _blend_totals(ins):
     """Возвращает (spend, msg_conv, lead_conv, blended_conv, blended_cpa or None)"""
     acts = extract_actions(ins)
@@ -368,11 +389,98 @@ def _blend_totals(ins):
     return spend, msgs, leads, total, blended
 
 
+# ========== КЕШ ОТЧЁТОВ ==========
+def _load_report_cache() -> dict:
+    try:
+        with open(REPORT_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_report_cache(d: dict):
+    _atomic_write_json(REPORT_CACHE_FILE, d)
+
+
+def _period_key(period) -> str:
+    if isinstance(period, dict):
+        since = period.get("since", "")
+        until = period.get("until", "")
+        return f"range:{since}:{until}"
+    return f"preset:{str(period)}"
+
+
+# ========== НОВЫЙ ИСТОЧНИК ДАННЫХ ДЛЯ ИНСАЙТОВ ==========
+def fetch_insight(aid: str, period) -> tuple[str, dict | None]:
+    """
+    Новый источник:
+    1. читаем локальные инсайты (основной источник)
+    2. если нужного периода нет — делаем 1 запрос в FB
+    3. сохраняем в локальный storage
+    4. возвращаем данные
+    """
+    # 1 — локальный кэш
+    store = load_local_insights(aid)
+    key = _period_key(period)
+
+    if key in store:
+        # имя берём из локального конфига / словаря имён
+        name = get_account_name(aid)
+        return name, store[key]
+
+    # 2 — прямой запрос в FB (первый раз за этот период)
+    acc = AdAccount(aid)
+    fields = ["impressions", "cpm", "clicks", "cpc", "spend", "actions"]
+
+    params = {"level": "account"}
+    if isinstance(period, dict):
+        params["time_range"] = period
+    else:
+        params["date_preset"] = period
+
+    data = acc.get_insights(fields=fields, params=params)
+    name = acc.api_get(fields=["name"]).get("name", get_account_name(aid))
+    ins = data[0] if data else None
+
+    # 3 — сохраняем в локальный storage (включая None, чтобы не дёргать FB лишний раз)
+    store[key] = ins
+    save_local_insights(aid, store)
+
+    return name, ins
+
+
+def get_cached_report(aid: str, period, label: str = "") -> str:
+    """
+    Возвращает текст отчёта из кеша, если свежий,
+    иначе строит заново и обновляет кеш.
+    (Текстовый кеш поверх локального хранилища инсайтов.)
+    """
+    key = _period_key(period)
+    now_ts = datetime.now().timestamp()
+
+    cache = _load_report_cache()
+    acc_cache = cache.get(aid, {})
+    item = acc_cache.get(key)
+
+    if item and (now_ts - float(item.get("ts", 0))) <= REPORT_CACHE_TTL:
+        return item.get("text", "")
+
+    # кеша нет или устарел — строим
+    text = build_report(aid, period, label)
+
+    cache.setdefault(aid, {})
+    cache[aid][key] = {"text": text, "ts": now_ts}
+    _save_report_cache(cache)
+
+    return text
+
+
 def build_report(aid: str, period, label: str = "") -> str:
     try:
         name, ins = fetch_insight(aid, period)
     except Exception as e:
         err = str(e)
+        # на лимитах/пермишенах просто не показываем кабинет, чтобы не спамить ошибками
         if "code: 200" in err or "403" in err or "permissions" in err.lower():
             return ""
         return f"⚠ Ошибка по {get_account_name(aid)}:\n\n{e}"
@@ -661,52 +769,6 @@ def build_comparison_report(aid: str, period1, label1: str, period2, label2: str
             )
 
     return "\n".join(txt_lines)
-
-
-# ========== КЕШ ОТЧЁТОВ ==========
-def _load_report_cache() -> dict:
-    try:
-        with open(REPORT_CACHE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-
-def _save_report_cache(d: dict):
-    _atomic_write_json(REPORT_CACHE_FILE, d)
-
-
-def _period_key(period) -> str:
-    if isinstance(period, dict):
-        since = period.get("since", "")
-        until = period.get("until", "")
-        return f"range:{since}:{until}"
-    return f"preset:{str(period)}"
-
-
-def get_cached_report(aid: str, period, label: str = "") -> str:
-    """
-    Возвращает текст отчёта из кеша, если свежий,
-    иначе строит заново и обновляет кеш.
-    """
-    key = _period_key(period)
-    now_ts = datetime.now().timestamp()
-
-    cache = _load_report_cache()
-    acc_cache = cache.get(aid, {})
-    item = acc_cache.get(key)
-
-    if item and (now_ts - float(item.get("ts", 0))) <= REPORT_CACHE_TTL:
-        return item.get("text", "")
-
-    # кеша нет или устарел — строим
-    text = build_report(aid, period, label)
-
-    cache.setdefault(aid, {})
-    cache[aid][key] = {"text": text, "ts": now_ts}
-    _save_report_cache(cache)
-
-    return text
 
 
 async def send_period_report(ctx, chat_id, period, label: str = ""):
@@ -1485,8 +1547,8 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "since": since2.strftime("%Y-%m-%d"),
             "until": until2.strftime("%Y-%m-%d"),
         }
-        label1 = f"{since1.strftime('%d.%m')}-{until1.strftime('%d.%m')}"
-        label2 = f"{since2.strftime('%d.%m')}-{until2.strftime('%d.%m')}"
+        label1 = f"{since1.strftime('%d.%m')}-{until1.strftime('%d.%м')}"
+        label2 = f"{since2.strftime('%d.%m')}-{until2.strftime('%d.%м')}"
         await q.edit_message_text(f"Сравниваю {label1} vs {label2}…")
         txt = build_comparison_report(aid, period1, label1, period2, label2)
         await context.bot.send_message(chat_id, txt, parse_mode="HTML")
@@ -1652,6 +1714,45 @@ async def on_text_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============ JOBS ============
+async def full_daily_scan_job(ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    1 раз в день — собирает инсайты по всем включённым аккаунтам и
+    сохраняет их в локальное хранилище, чтобы утром и при запросах
+    по типовым периодам не дёргать FB лишний раз.
+
+    Периоды:
+    - today
+    - yesterday
+    - прошедшие 7 дней (до вчера включительно)
+    """
+    now = datetime.now(ALMATY_TZ)
+
+    yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+    periods = {
+        "today": "today",
+        "yesterday": "yesterday",
+        "week": {
+            "since": (now - timedelta(days=7)).strftime("%Y-%m-%d"),
+            "until": yesterday,
+        },
+    }
+
+    for aid in iter_enabled_accounts_only():
+        store = load_local_insights(aid)
+        for _, period in periods.items():
+            key = _period_key(period)
+            if key in store:
+                continue
+            try:
+                _, ins = fetch_insight(aid, period)
+                store[key] = ins
+            except Exception as e:
+                print(f"[daily_scan] error for {aid}: {e}")
+        save_local_insights(aid, store)
+
+    print("[daily_scan] full daily scan completed")
+
+
 async def daily_report_job(ctx: ContextTypes.DEFAULT_TYPE):
     if not DEFAULT_REPORT_CHAT:
         return
@@ -1684,6 +1785,13 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("sync_accounts", cmd_sync))
     app.add_handler(CallbackQueryHandler(on_cb))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_any))
+
+    # Плотный проход по аккаунтам чуть раньше утреннего отчёта,
+    # чтобы к 9:30 данные уже были в локальном кэше.
+    app.job_queue.run_daily(
+        full_daily_scan_job,
+        time=time(hour=9, minute=20, tzinfo=ALMATY_TZ),
+    )
 
     app.job_queue.run_daily(
         daily_report_job,

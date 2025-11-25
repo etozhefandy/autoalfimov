@@ -1,77 +1,76 @@
-# history_store.py - лог истории для "часов пик"
-
+# history_store.py
 import os
 import json
 from datetime import datetime, timedelta
+from pytz import timezone
 
+ALMATY_TZ = timezone("Asia/Almaty")
+
+# Папка для истории
 DATA_DIR = os.getenv("DATA_DIR", "/data")
-HISTORY_FILE = os.path.join(DATA_DIR, "history.jsonl")
-HISTORY_MAX_AGE_DAYS = int(os.getenv("HISTORY_MAX_AGE_DAYS", "365"))
+HISTORY_DIR = os.path.join(DATA_DIR, "history")
+os.makedirs(HISTORY_DIR, exist_ok=True)
 
 
-def _ensure_dir():
-    try:
-        os.makedirs(DATA_DIR, exist_ok=True)
-    except Exception:
-        pass
+def _history_file_for(aid: str) -> str:
+    """Формирует путь к файлу истории для аккаунта."""
+    safe = aid.replace("act_", "")
+    return os.path.join(HISTORY_DIR, f"history_{safe}.jsonl")
 
 
-def append_snapshot(account_id: str, spend: float, msgs: int, leads: int, ts=None):
+def append_snapshot(aid: str, spend: float, msgs: int, leads: int, ts: datetime):
     """
-    Добавляет строку-замер в history.jsonl.
-    ts — datetime, если None, берём utcnow.
+    Добавляет строку в историю:
+    {
+      "ts": "...",
+      "spend": ...,
+      "msgs": ...,
+      "leads": ...
+    }
     """
-    _ensure_dir()
-    if ts is None:
-        ts = datetime.utcnow()
-    rec = {
+    path = _history_file_for(aid)
+    row = {
         "ts": ts.isoformat(),
-        "account_id": account_id,
         "spend": float(spend),
         "msgs": int(msgs),
         "leads": int(leads),
     }
-    line = json.dumps(rec, ensure_ascii=False)
-    try:
-        with open(HISTORY_FILE, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
-    except Exception:
-        # молча игнорируем, чтобы не ломать основной поток
-        return
+
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
-def prune_old_history(max_age_days: int = HISTORY_MAX_AGE_DAYS):
+def prune_old_history(max_age_days: int = 365):
     """
-    Оставляет только записи за последние max_age_days (по ts).
+    Удаляет записи старше max_age_days.
+    Делается раз в сутки внутри cpa_alerts_job.
     """
-    try:
-        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-    except FileNotFoundError:
-        return
-    except Exception:
-        return
+    cutoff = datetime.now(ALMATY_TZ) - timedelta(days=max_age_days)
 
-    cutoff = datetime.utcnow() - timedelta(days=max_age_days)
-    new_lines = []
-    for ln in lines:
-        ln = ln.strip()
-        if not ln:
+    for fname in os.listdir(HISTORY_DIR):
+        if not fname.startswith("history_"):
             continue
-        try:
-            rec = json.loads(ln)
-            ts_str = rec.get("ts")
-            if not ts_str:
-                continue
-            ts = datetime.fromisoformat(ts_str.split("Z")[0])
-        except Exception:
-            continue
-        if ts >= cutoff:
-            new_lines.append(ln + "\n")
 
-    try:
-        _ensure_dir()
-        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-            f.writelines(new_lines)
-    except Exception:
-        return
+        full = os.path.join(HISTORY_DIR, fname)
+        if not os.path.isfile(full):
+            continue
+
+        tmp = full + ".tmp"
+        with open(full, "r", encoding="utf-8") as fin, open(tmp, "w", encoding="utf-8") as fout:
+            for line in fin:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                try:
+                    dt = datetime.fromisoformat(obj.get("ts", ""))
+                except Exception:
+                    continue
+
+                if dt >= cutoff:
+                    fout.write(line + "\n")
+
+        os.replace(tmp, full)
