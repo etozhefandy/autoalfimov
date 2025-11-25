@@ -413,22 +413,21 @@ def _period_key(period) -> str:
 # ========== НОВЫЙ ИСТОЧНИК ДАННЫХ ДЛЯ ИНСАЙТОВ ==========
 def fetch_insight(aid: str, period) -> tuple[str, dict | None]:
     """
-    Новый источник:
-    1. читаем локальные инсайты (основной источник)
-    2. если нужного периода нет — делаем 1 запрос в FB
-    3. сохраняем в локальный storage
-    4. возвращаем данные
+    Достаёт инсайты:
+    - сначала из локального кэша
+    - если нет — запрашивает у Facebook
+    - важно: ВСЕГДА приводим AdsInsights к обычному dict
     """
-    # 1 — локальный кэш
+
+    # 1 — пробуем локальный кэш
     store = load_local_insights(aid)
     key = _period_key(period)
 
     if key in store:
-        # имя берём из локального конфига / словаря имён
         name = get_account_name(aid)
-        return name, store[key]
+        return name, store[key]  # уже dict или None
 
-    # 2 — прямой запрос в FB (первый раз за этот период)
+    # 2 — прямой запрос к FB
     acc = AdAccount(aid)
     fields = ["impressions", "cpm", "clicks", "cpc", "spend", "actions"]
 
@@ -440,13 +439,23 @@ def fetch_insight(aid: str, period) -> tuple[str, dict | None]:
 
     data = acc.get_insights(fields=fields, params=params)
     name = acc.api_get(fields=["name"]).get("name", get_account_name(aid))
-    ins = data[0] if data else None
 
-    # 3 — сохраняем в локальный storage (включая None, чтобы не дёргать FB лишний раз)
-    store[key] = ins
+    if not data:
+        ins_dict = None
+    else:
+        raw = data[0]
+
+        # 🔥 КОНВЕРТИРУЕМ из AdsInsights → dict
+        if hasattr(raw, "export_all_data"):
+            ins_dict = raw.export_all_data()
+        else:
+            ins_dict = dict(raw)
+
+    # 3 — Сохраняем в локальный кэш только JSON-safe данные
+    store[key] = ins_dict
     save_local_insights(aid, store)
 
-    return name, ins
+    return name, ins_dict
 
 
 def get_cached_report(aid: str, period, label: str = "") -> str:
