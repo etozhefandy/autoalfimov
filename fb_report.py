@@ -567,7 +567,7 @@ def build_comparison_report(aid: str, period1, label1: str, period2, label2: str
         name, ins1 = fetch_insight(aid, period1)
         _, ins2 = fetch_insight(aid, period2)
     except Exception as e:
-        return f"⚠ Ошибка при получении данных: {e}"
+        return f"⚠ Ошибка при получении данных: {e.__class__.__name__}: {str(e)}"
 
     if not ins1 and not ins2:
         return f"Нет данных по {get_account_name(aid)} за оба периода."
