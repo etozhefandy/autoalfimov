@@ -242,6 +242,20 @@ def get_enabled_accounts_in_order() -> list[str]:
     return ordered or AD_ACCOUNTS_FALLBACK
 
 
+def iter_enabled_accounts_only():
+    """Итерируем только включённые аккаунты (enabled=True)."""
+    store = load_accounts()
+    ids = get_enabled_accounts_in_order()
+    if not store:
+        # если нет конфига, считаем все аккаунты включёнными (fallback)
+        for aid in ids:
+            yield aid
+        return
+    for aid in ids:
+        if store.get(aid, {}).get("enabled", True):
+            yield aid
+
+
 def looks_excluded(name: str) -> bool:
     n = (name or "").lower()
     return any(k in n for k in EXCLUDED_NAME_KEYWORDS)
@@ -704,9 +718,9 @@ async def send_period_report(ctx, chat_id, period, label: str = ""):
 
 # ============ БИЛЛИНГ ============
 async def send_billing(ctx: ContextTypes.DEFAULT_TYPE, chat_id: str):
-    """Текущие биллинги: только неактивные аккаунты."""
+    """Текущие биллинги: только неактивные аккаунты И только включённые (enabled=True)."""
     rate = usd_to_kzt()
-    for aid in get_enabled_accounts_in_order():
+    for aid in iter_enabled_accounts_only():
         try:
             info = AdAccount(aid).api_get(fields=["name", "account_status", "balance"])
         except Exception:
@@ -793,12 +807,12 @@ def _compute_billing_forecast_for_account(
 
 async def send_billing_forecast(ctx: ContextTypes.DEFAULT_TYPE, chat_id: str):
     """
-    Прогноз списаний по всем активным аккаунтам.
+    Прогноз списаний по всем активным аккаунтам (только enabled=True).
     Показываем примерную дату на день РАНЬШЕ расчёта.
     """
     rate = usd_to_kzt()
     items = []
-    for aid in get_enabled_accounts_in_order():
+    for aid in iter_enabled_accounts_only():
         fc = _compute_billing_forecast_for_account(aid, rate_kzt=rate)
         if fc:
             items.append(fc)
@@ -841,6 +855,7 @@ async def billing_digest_job(ctx: ContextTypes.DEFAULT_TYPE):
     """
     Ежедневный дайджест утром:
     список аккаунтов, у которых days_left ≤ 5, отсортированный от самых “горящих”.
+    Учитывает только включённые аккаунты (enabled=True).
     """
     chat_id = str(DEFAULT_REPORT_CHAT)
     if not chat_id:
@@ -848,7 +863,7 @@ async def billing_digest_job(ctx: ContextTypes.DEFAULT_TYPE):
 
     rate = usd_to_kzt()
     items = []
-    for aid in get_enabled_accounts_in_order():
+    for aid in iter_enabled_accounts_only():
         fc = _compute_billing_forecast_for_account(aid, rate_kzt=rate)
         if fc and fc["days_left"] <= 5.0:
             items.append(fc)
@@ -885,30 +900,40 @@ async def billing_digest_job(ctx: ContextTypes.DEFAULT_TYPE):
 
 # ============ CPA ALERTS + ЛОГ ИСТОРИИ ============
 async def cpa_alerts_job(ctx: ContextTypes.DEFAULT_TYPE):
-    # CPA-алерты идут в личку
+    """
+    Джоб для логирования истории и CPA-алертов.
+
+    * История (append_snapshot) пишется 24/7.
+    * prune_old_history() запускается раз в сутки около 03:00 (12 месяцев = 365 дней).
+    * Уведомления в Telegram отправляются только с 10:00 до 22:00 по времени Алматы.
+    """
     chat_id = "253181449"
     now = datetime.now(ALMATY_TZ)
-    if not (10 <= now.hour <= 22):
-        return
 
     store = load_accounts()
-    for aid in get_enabled_accounts_in_order():
+
+    for aid in iter_enabled_accounts_only():
         row = store.get(aid, {})
         alerts = row.get("alerts", {}) or {}
         target = float(alerts.get("target_cpl", 0.0) or 0.0)
 
-        # Сначала логируем историю (даже если алёрты выключены)
+        # 1) Всегда логируем историю, если есть данные
         try:
             _, ins = fetch_insight(aid, "today")
         except Exception:
             ins = None
+
         if ins and HISTORY_STORE_AVAILABLE:
             spend, msgs, leads, total, blended = _blend_totals(ins)
             append_snapshot(aid, spend=spend, msgs=msgs, leads=leads, ts=now)
 
-        # Чистим историю (проверка по часу, но фактически раз в день)
+        # 2) Раз в сутки чистим историю старше 12 месяцев
         if now.hour == 3 and HISTORY_STORE_AVAILABLE:
             prune_old_history(max_age_days=365)
+
+        # 3) Всё, что ниже — только для алертов (10–22)
+        if not (10 <= now.hour <= 22):
+            continue
 
         # Если алерты не включены или таргет 0 — дальше не проверяем
         if not alerts.get("enabled") or target <= 0:
@@ -1635,11 +1660,17 @@ async def daily_report_job(ctx: ContextTypes.DEFAULT_TYPE):
 
 
 def schedule_cpa_alerts(app: Application):
-    for h in range(10, 23):
-        app.job_queue.run_daily(
-            cpa_alerts_job,
-            time=time(hour=h, minute=0, tzinfo=ALMATY_TZ),
-        )
+    """
+    Запускаем cpa_alerts_job каждый час (24/7).
+    Внутри самого джоба уже есть логика,
+    когда слать уведомления и когда только логировать историю.
+    """
+    app.job_queue.run_repeating(
+        cpa_alerts_job,
+        interval=3600,  # раз в час
+        first=0,        # сразу после старта приложения
+        name="cpa_alerts_job",
+    )
 
 
 # ============ APP ============
