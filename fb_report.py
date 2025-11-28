@@ -404,6 +404,141 @@ def _blend_totals(ins):
     blended = (spend / total) if total > 0 else None
     return spend, msgs, leads, total, blended
 
+# ========== ТЕПЛОВАЯ КАРТА НА ОСНОВЕ ИСТОРИИ ==========
+def _history_path_for(aid: str) -> str:
+    """
+    Путь к history-файлу для аккаунта, в формате как в history_store.py:
+    DATA_DIR/history/history_<actid>.jsonl
+    """
+    safe = aid.replace("act_", "")
+    history_dir = os.path.join(DATA_DIR, "history")
+    os.makedirs(history_dir, exist_ok=True)
+    return os.path.join(history_dir, f"history_{safe}.jsonl")
+
+
+def build_heatmap_for_account(aid: str, name_getter, mode: str = "7") -> str:
+    """
+    Строит текстовую тепловую карту заявок (переписки+лиды) по часам
+    за последние N дней, на основе логов history_store (append_snapshot).
+
+    mode:
+      "7"     — 7 дней
+      "14"    — 14 дней
+      "month" — с начала месяца до вчера
+    """
+    now = datetime.now(ALMATY_TZ)
+    today = now.date()
+
+    if mode == "7":
+        days = 7
+        since_date = today - timedelta(days=days - 1)
+        until_date = today
+        title = f"за последние {days} дней"
+    elif mode == "14":
+        days = 14
+        since_date = today - timedelta(days=days - 1)
+        until_date = today
+        title = f"за последние {days} дней"
+    elif mode == "month":
+        since_date = today.replace(day=1)
+        until_date = today
+        days = (until_date - since_date).days + 1
+        title = f"за {since_date.strftime('%m.%Y')}"
+    else:
+        days = 7
+        since_date = today - timedelta(days=days - 1)
+        until_date = today
+        title = f"за последние {days} дней"
+
+    path = _history_path_for(aid)
+    if not os.path.exists(path):
+        return (
+            f"🔥 Тепловая карта для {name_getter(aid)}\n"
+            f"Нет истории для построения тепловой карты."
+        )
+
+    # Готовим сетку: 24 часа x N дней
+    dates = [since_date + timedelta(days=i) for i in range(days)]
+    date_index = {d: idx for idx, d in enumerate(dates)}
+    grid = [[0 for _ in range(days)] for _ in range(24)]
+
+    # Для корректных дельт по дню
+    last_total_per_day = {}
+
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+
+            ts_str = obj.get("ts")
+            if not ts_str:
+                continue
+            try:
+                dt = datetime.fromisoformat(ts_str)
+            except Exception:
+                continue
+
+            d = dt.date()
+            if d < since_date or d > until_date:
+                continue
+
+            msgs = int(obj.get("msgs", 0) or 0)
+            leads = int(obj.get("leads", 0) or 0)
+            total = msgs + leads
+
+            prev = last_total_per_day.get(d, 0)
+            delta = max(total - prev, 0)
+            last_total_per_day[d] = total
+
+            hour = dt.hour
+            col = date_index.get(d)
+            if col is None:
+                continue
+
+            grid[hour][col] += delta
+
+    # Находим максимум для нормализации
+    max_val = 0
+    for h in range(24):
+        for c in range(days):
+            if grid[h][c] > max_val:
+                max_val = grid[h][c]
+
+    def cell_char(v: int) -> str:
+        if max_val <= 0 or v <= 0:
+            return "·"
+        ratio = v / max_val
+        if ratio < 0.25:
+            return "░"
+        elif ratio < 0.5:
+            return "▒"
+        elif ratio < 0.75:
+            return "▓"
+        else:
+            return "█"
+
+    header = "    " + " ".join(d.strftime("%d") for d in dates)
+    lines = [header]
+    for hour in range(24):
+        row = f"{hour:02d}: " + " ".join(cell_char(grid[hour][c]) for c in range(days))
+        lines.append(row)
+
+    name = name_getter(aid)
+    period_label = f"{since_date.strftime('%d.%m.%Y')}–{until_date.strftime('%d.%m.%Y')}"
+    body = "\n".join(lines)
+
+    return (
+        f"🔥 Тепловая карта для <b>{name}</b>\n"
+        f"Период: {period_label} ({title})\n"
+        f"Основа: заявки (переписки+лиды) по логам за каждый час.\n\n"
+        f"<pre>{body}</pre>"
+    )
+
 
 # ========== КЕШ ОТЧЁТОВ ==========
 def _load_report_cache() -> dict:
@@ -1082,6 +1217,9 @@ def main_menu() -> InlineKeyboardMarkup:
                     "Отчёт по аккаунту", callback_data="choose_acc_report"
                 )
             ],
+            [
+                InlineKeyboardButton("Тепловая карта", callback_data="hm_menu")
+            ],
             [InlineKeyboardButton("Настройки", callback_data="choose_acc_settings")],
             [
                 InlineKeyboardButton("🤖 Автопилат", callback_data="ap_main")
@@ -1533,19 +1671,38 @@ async def on_cb_autopilot(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    # 5) Кнопки под конкретной рекомендацией (up/down/manual/off/back)
+      # 5) Кнопки под конкретной рекомендацией (up/down/manual/off/back)
     if data.startswith("ap|"):
         parts = data.split("|")
 
-        # ожидаем минимум: ap|action|entity_id
-        if len(parts) < 3:
+        # ожидаем минимум "ap|action" или "ap|action|entity_id"
+        if len(parts) < 2:
             await q.edit_message_text(
-                "⚠ Ошибка кнопки: не передан ID сущности.\n"
-                "Обнови рекомендации и попробуй ещё раз."
+                "⚠ Ошибка кнопки: некорректный формат callback_data.",
+                parse_mode="HTML",
             )
             return
 
-        _, action, entity_id = parts
+        _, action, *rest = parts
+        entity_id = rest[0] if rest else ""
+
+        # 👉 Обработка кнопки "Назад"
+        if action == "back":
+            # возвращаемся в главное меню автопилата
+            await q.edit_message_text(
+                "Выберите режим автопилата:",
+                reply_markup=autopilot_main_menu(),
+            )
+            return
+
+        # дальше всё как раньше, но с проверкой entity_id
+        if not entity_id:
+            await q.edit_message_text(
+                "⚠ Ошибка кнопки: не передан ID сущности.\n"
+                "Обнови рекомендации и попробуй ещё раз.",
+                parse_mode="HTML",
+            )
+            return
 
         # Ввести вручную — ждём текст от тебя
         if action == "manual":
@@ -1553,7 +1710,7 @@ async def on_cb_autopilot(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text(
                 f"✍️ Введите число (например 1.2, -20, 15):\n"
                 f"ID: <code>{entity_id}</code>",
-                parse_mode="HTML"
+                parse_mode="HTML",
             )
             return
 
@@ -1561,7 +1718,7 @@ async def on_cb_autopilot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(
             f"Подтвердить действие <b>{action}</b> для <code>{entity_id}</code>?",
             parse_mode="HTML",
-            reply_markup=confirm_action_buttons(action, entity_id)
+            reply_markup=confirm_action_buttons(action, entity_id),
         )
         return
 
@@ -1649,6 +1806,14 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         label = f"{since.strftime('%d.%m')}-{until.strftime('%d.%m')}"
         await q.edit_message_text(f"Готовлю отчёт за {label}…")
         await send_period_report(context, chat_id, period, label)
+        return
+
+        # вход в тепловую карту из главного меню
+    if data == "hm_menu":
+        await q.edit_message_text(
+            "Выберите аккаунт для тепловой карты:",
+            reply_markup=accounts_kb("hmacc"),
+        )
         return
 
     # ========== ТЕПЛОВЫЕ КАРТЫ ==========
