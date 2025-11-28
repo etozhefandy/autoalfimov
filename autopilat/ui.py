@@ -1,11 +1,11 @@
 # autopilat/ui.py
 
-ALMATY_TZ = timezone("Asia/Almaty")
 from datetime import datetime, timedelta
 from pytz import timezone
 from facebook_business.adobjects.adset import AdSet
-
 from telegram import InlineKeyboardMarkup, InlineKeyboardButton
+
+ALMATY_TZ = timezone("Asia/Almaty")
 
 
 # ============================================================
