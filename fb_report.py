@@ -1356,26 +1356,28 @@ async def cmd_heatmap(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _allowed(update):
         return
 
-    text = update.message.text.strip().split()
+    parts = update.message.text.strip().split()
 
-    if len(text) == 1:
+    # 1) Если /heatmap без аргументов — показываем выбор аккаунтов
+    if len(parts) == 1:
         await update.message.reply_text(
-            "Использование:\n/heatmap <account_id>",
+            "Выберите аккаунт для тепловой карты:",
+            reply_markup=accounts_kb("hmacc"),
         )
         return
 
-    aid = text[1].strip()
+    # 2) Если /heatmap act_XXXX — оставляем старый режим
+    aid = parts[1].strip()
     if not aid.startswith("act_"):
         aid = "act_" + aid
 
-
-    # сохраняем в user_data, чтобы callback-обработчик знал какой id
     context.user_data["heatmap_aid"] = aid
 
     await update.message.reply_text(
         f"Выберите период тепловой карты для {get_account_name(aid)}:",
-        reply_markup=heatmap_menu(aid)
+        reply_markup=heatmap_menu(aid),
     )
+
 
 
 
@@ -1464,7 +1466,6 @@ async def safe_edit_message(q, text: str, **kwargs):
         raise
 
 
-# ============ CALLBACKS ============
 # ============ CALLBACKS ДЛЯ АВТОПИЛАТА ============
 async def on_cb_autopilot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -1534,7 +1535,17 @@ async def on_cb_autopilot(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 5) Кнопки под конкретной рекомендацией (up/down/manual/off/back)
     if data.startswith("ap|"):
-        _, action, entity_id = data.split("|")
+        parts = data.split("|")
+
+        # ожидаем минимум: ap|action|entity_id
+        if len(parts) < 3:
+            await q.edit_message_text(
+                "⚠ Ошибка кнопки: не передан ID сущности.\n"
+                "Обнови рекомендации и попробуй ещё раз."
+            )
+            return
+
+        _, action, entity_id = parts
 
         # Ввести вручную — ждём текст от тебя
         if action == "manual":
@@ -1641,6 +1652,17 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ========== ТЕПЛОВЫЕ КАРТЫ ==========
+    # сначала обработка выбора аккаунта из меню
+    if data.startswith("hmacc|"):
+        aid = data.split("|", 1)[1]
+        context.user_data["heatmap_aid"] = aid
+        await q.edit_message_text(
+            f"Выберите период тепловой карты для {get_account_name(aid)}:",
+            reply_markup=heatmap_menu(aid),
+        )
+        return
+
+    # затем уже сами периоды
     if data.startswith("hm7|"):
         aid = data.split("|")[1]
         heat = build_heatmap_for_account(aid, get_account_name, mode="7")
@@ -1658,6 +1680,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         heat = build_heatmap_for_account(aid, get_account_name, mode="month")
         await q.edit_message_text(heat, parse_mode="HTML")
         return
+
 
     # биллинг
     if data == "billing":
@@ -1905,6 +1928,68 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_text_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _allowed(update):
         return
+
+    # Игнорируем произвольный текст в группах/супергруппах,
+    # чтобы бот не отвечал на каждое сообщение
+    chat = update.effective_chat
+    if chat and chat.type in ("group", "supergroup"):
+        # В группах реагируем только на команды (/start, /help, и т.п.),
+        # а обычный текст пропускаем
+        return
+
+    # ----- кастомный диапазон для ОДНОГО периода -----
+    if "await_range_for" in context.user_data:
+        await on_text(update, context)
+        return
+
+    # ----- сравнение ДВУХ диапазонов -----
+    if "await_cmp_for" in context.user_data:
+        aid = context.user_data.pop("await_cmp_for")
+        parsed = _parse_two_ranges(update.message.text)
+        if not parsed:
+            # Флаг НЕ возвращаем, чтобы бот не цеплялся за любой текст дальше
+            await update.message.reply_text(
+                "Не распознал форматы дат.\n"
+                "Пример: 01.06.2025-07.06.2025;08.06.2025-14.06.2025"
+            )
+            return
+
+        (p1, label1), (p2, label2) = parsed
+        txt = build_comparison_report(aid, p1, label1, p2, label2)
+        await update.message.reply_text(txt, parse_mode="HTML")
+        return
+
+    # ----- ввод target CPA -----
+    if "await_cpa_for" in context.user_data:
+        aid = context.user_data.pop("await_cpa_for")
+        try:
+            val = float(update.message.text.replace(",", ".").strip())
+        except Exception:
+            await update.message.reply_text(
+                "Введите число, например: 2.5 (или 0 чтобы выключить)"
+            )
+            context.user_data["await_cpa_for"] = aid
+            return
+
+        st = load_accounts()
+        row = st.get(aid, {"alerts": {}})
+        alerts = row.get("alerts", {})
+        alerts["target_cpl"] = float(val)
+        alerts["enabled"] = val > 0
+        row["alerts"] = alerts
+        st[aid] = row
+        save_accounts(st)
+
+        if val > 0:
+            await update.message.reply_text(
+                f"✅ Target CPA для {get_account_name(aid)} обновлён: {val:.2f} $ (алерты ВКЛ)"
+            )
+        else:
+            await update.message.reply_text(
+                f"✅ Target CPA для {get_account_name(aid)} установлен 0 — алерты ВЫКЛ"
+            )
+        return
+
 
     # ============================================================
     # 🔥 РУЧНОЙ ВВОД ДЛЯ АВТОПИЛАТА
