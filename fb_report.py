@@ -31,6 +31,22 @@ from telegram.ext import (
 
 from billing_watch import init_billing_watch
 
+# === AUTOPILАТ / AUTOPILOT ===
+from autopilat.engine import get_recommendations_ui, handle_autopilot_action
+from autopilat.ui import (
+    autopilot_main_menu,
+    autopilot_submode_menu,
+    build_recommendations_ui,
+    recommendation_buttons,
+    confirm_action_buttons,
+)
+from autopilat.actions import (
+    apply_budget_change,
+    disable_entity,
+    parse_manual_input,
+    can_disable,
+)
+
 # --- history_store: мягкий импорт, чтобы бот не падал, если файла нет ---
 try:
     from history_store import append_snapshot, prune_old_history
@@ -1068,6 +1084,9 @@ def main_menu() -> InlineKeyboardMarkup:
             ],
             [InlineKeyboardButton("Настройки", callback_data="choose_acc_settings")],
             [
+                InlineKeyboardButton("🤖 Автопилат", callback_data="ap_main")
+            ],
+            [
                 InlineKeyboardButton(
                     f"Синк BM (посл. {last_sync})",
                     callback_data="sync_bm",
@@ -1076,22 +1095,6 @@ def main_menu() -> InlineKeyboardMarkup:
         ]
     )
 
-
-def all_reports_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("Сегодня", callback_data="rep_today"),
-                InlineKeyboardButton("Вчера", callback_data="rep_yday"),
-            ],
-            [
-                InlineKeyboardButton(
-                    "Прошедшая неделя", callback_data="rep_week"
-                )
-            ],
-            [InlineKeyboardButton("⬅️ В меню", callback_data="menu")],
-        ]
-    )
 
 
 def billing_menu() -> InlineKeyboardMarkup:
@@ -1110,6 +1113,46 @@ def billing_menu() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("⬅️ В меню", callback_data="menu")],
         ]
     )
+
+
+# 👉 ВСТАВЬ ЭТОТ БЛОК ПРЯМО СЮДА
+def all_reports_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Сегодня", callback_data="rep_today"),
+                InlineKeyboardButton("Вчера", callback_data="rep_yday"),
+            ],
+            [
+                InlineKeyboardButton("Прошедшая неделя", callback_data="rep_week")
+            ],
+            [
+                InlineKeyboardButton("⬅️ В меню", callback_data="menu")
+            ],
+        ]
+    )
+
+
+# (этот уже есть)
+def heatmap_menu(aid: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("7 дней", callback_data=f"hm7|{aid}"),
+                InlineKeyboardButton("14 дней", callback_data=f"hm14|{aid}"),
+            ],
+            [
+                InlineKeyboardButton(
+                    "Текущий месяц", callback_data=f"hmmonth|{aid}"
+                )
+            ],
+            [
+                InlineKeyboardButton("⬅️ Назад", callback_data="menu")
+            ],
+        ]
+    )
+
+
 
 
 def _flag_line(aid: str) -> str:
@@ -1281,13 +1324,20 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _allowed(update):
         return
     txt = (
-        "Команды:\n"
-        "/start — показать меню\n"
-        "/help — подсказка\n"
-        "/billing — список биллингов/прогноз\n"
-        "/sync_accounts — синк кабинетов из BM\n"
-        "/whoami — показать user_id и chat_id\n"
-    )
+    "Команды:\n"
+    "/start — главное меню\n"
+    "/help — список всех команд\n"
+    "/billing — биллинги и прогнозы\n"
+    "/sync_accounts — синхронизация BM\n"
+    "/whoami — показать user_id/chat_id\n"
+    "/heatmap <act_id> — тепловая карта адсетов за 7 дней\n"
+    "\n"
+    "🚀 Функции автопилата:\n"
+    "• Автоматические рекомендации по аккаунту\n"
+    "• Изменение бюджета (-20%, +20%, ручной ввод)\n"
+    "• Безопасное отключение дорогих адсетов\n"
+    "• Подготовка к ИИ-управлению (Пилат)\n"
+)
     await update.message.reply_text(txt, reply_markup=ReplyKeyboardRemove())
 
 
@@ -1297,6 +1347,36 @@ async def cmd_billing(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Что показать по биллингу?", reply_markup=billing_menu()
     )
+
+
+# =========================
+# 📌 ПРАВИЛЬНАЯ ФУНКЦИЯ cmd_heatmap (ОТДЕЛЬНО)
+# =========================
+async def cmd_heatmap(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _allowed(update):
+        return
+
+    text = update.message.text.strip().split()
+
+    if len(text) == 1:
+        await update.message.reply_text(
+            "Использование:\n/heatmap <account_id>",
+        )
+        return
+
+    aid = text[1].strip()
+    if not aid.startswith("act_"):
+        aid = "act_" + aid
+
+
+    # сохраняем в user_data, чтобы callback-обработчик знал какой id
+    context.user_data["heatmap_aid"] = aid
+
+    await update.message.reply_text(
+        f"Выберите период тепловой карты для {get_account_name(aid)}:",
+        reply_markup=heatmap_menu(aid)
+    )
+
 
 
 async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1385,6 +1465,138 @@ async def safe_edit_message(q, text: str, **kwargs):
 
 
 # ============ CALLBACKS ============
+# ============ CALLBACKS ДЛЯ АВТОПИЛАТА ============
+async def on_cb_autopilot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+
+    if not _allowed(update):
+        await q.edit_message_text("⛔️ Нет доступа.")
+        return
+
+    data = q.data or ""
+    chat_id = str(q.message.chat.id)
+
+    # 1) Главное меню автопилата
+    if data == "ap_main":
+        await q.edit_message_text(
+            "Выберите режим автопилата:",
+            reply_markup=autopilot_main_menu()
+        )
+        return
+
+    # 2) Выбор основного режима (Рекомендации / Автопилат)
+    if data.startswith("apmode|"):
+        mode = data.split("|", 1)[1]
+        context.user_data["autopilot_mode"] = mode
+
+        await q.edit_message_text(
+            f"Режим: <b>{mode}</b>\nВыберите подрежим:",
+            parse_mode="HTML",
+            reply_markup=autopilot_submode_menu()
+        )
+        return
+
+    # 3) Подрежимы (ручной / авто)
+    if data.startswith("apsub|"):
+        sub = data.split("|", 1)[1]
+        context.user_data["autopilot_submode"] = sub
+
+        await q.edit_message_text(
+            f"Режим: <b>{context.user_data.get('autopilot_mode')}</b>\n"
+            f"Подрежим: <b>{sub}</b>\n\n"
+            f"Теперь выберите аккаунт:",
+            parse_mode="HTML",
+            reply_markup=accounts_kb("ap_acc")
+        )
+        return
+
+    # 4) Выбор аккаунта для автопилата
+    if data.startswith("ap_acc|"):
+        aid = data.split("|", 1)[1]
+        context.user_data["ap_aid"] = aid
+
+        ui = get_recommendations_ui(aid)
+        blocks = build_recommendations_ui(ui["items"])
+
+        text = f"🔍 <b>Рекомендации по {get_account_name(aid)}</b>\n\n{ui['text']}"
+        await q.edit_message_text(text, parse_mode="HTML")
+
+        # Отправляем каждую рекомендацию отдельным сообщением
+        for block in blocks:
+            await context.bot.send_message(
+                chat_id,
+                block["text"],
+                parse_mode="HTML",
+                reply_markup=block["reply_markup"]
+            )
+        return
+
+    # 5) Кнопки под конкретной рекомендацией (up/down/manual/off/back)
+    if data.startswith("ap|"):
+        _, action, entity_id = data.split("|")
+
+        # Ввести вручную — ждём текст от тебя
+        if action == "manual":
+            context.user_data["await_manual_input"] = entity_id
+            await q.edit_message_text(
+                f"✍️ Введите число (например 1.2, -20, 15):\n"
+                f"ID: <code>{entity_id}</code>",
+                parse_mode="HTML"
+            )
+            return
+
+        # Остальные действия требуют подтверждения
+        await q.edit_message_text(
+            f"Подтвердить действие <b>{action}</b> для <code>{entity_id}</code>?",
+            parse_mode="HTML",
+            reply_markup=confirm_action_buttons(action, entity_id)
+        )
+        return
+
+    # 6) Подтверждение (Да/Нет)
+    if data.startswith("apconfirm|"):
+        _, yesno, action, entity_id = data.split("|", 3)
+
+        if yesno == "no":
+            await q.edit_message_text("Операция отменена.", parse_mode="HTML")
+            return
+
+        # down20 / up20 — фиксированные проценты
+        if action in ("up20", "down20"):
+            percent = 20 if action == "up20" else -20
+            res = apply_budget_change(entity_id, percent)
+            await q.edit_message_text(res["message"], parse_mode="HTML")
+            return
+
+        # off — выключение
+        if action == "off":
+            aid = context.user_data.get("ap_aid")
+            if aid and not can_disable(aid, entity_id):
+                await q.edit_message_text(
+                    "❌ Нельзя отключить этот адсет — иначе весь аккаунт останется без трафика.",
+                    parse_mode="HTML"
+                )
+                return
+
+            res = disable_entity(entity_id)
+            await q.edit_message_text(res["message"], parse_mode="HTML")
+            return
+
+        # иначе — это ручной процент (action = "12.5" например)
+        try:
+            percent = float(action.replace(",", "."))
+        except Exception:
+            await q.edit_message_text(
+                "⚠ Не получилось прочитать процент изменения.",
+                parse_mode="HTML"
+            )
+            return
+
+        res = apply_budget_change(entity_id, percent)
+        await q.edit_message_text(res["message"], parse_mode="HTML")
+        return
+    
 async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -1403,17 +1615,19 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("Выберите период:", reply_markup=all_reports_menu())
         return
 
-    # общие отчёты
+        # общие отчёты
     if data == "rep_today":
         label = datetime.now(ALMATY_TZ).strftime("%d.%m.%Y")
         await q.edit_message_text(f"Готовлю отчёт за {label}…")
         await send_period_report(context, chat_id, "today", label)
         return
+
     if data == "rep_yday":
         label = (datetime.now(ALMATY_TZ) - timedelta(days=1)).strftime("%d.%m.%Y")
         await q.edit_message_text(f"Готовлю отчёт за {label}…")
         await send_period_report(context, chat_id, "yesterday", label)
         return
+
     if data == "rep_week":
         until = datetime.now(ALMATY_TZ) - timedelta(days=1)
         since = until - timedelta(days=6)
@@ -1424,6 +1638,25 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         label = f"{since.strftime('%d.%m')}-{until.strftime('%d.%m')}"
         await q.edit_message_text(f"Готовлю отчёт за {label}…")
         await send_period_report(context, chat_id, period, label)
+        return
+
+    # ========== ТЕПЛОВЫЕ КАРТЫ ==========
+    if data.startswith("hm7|"):
+        aid = data.split("|")[1]
+        heat = build_heatmap_for_account(aid, get_account_name, mode="7")
+        await q.edit_message_text(heat, parse_mode="HTML")
+        return
+
+    if data.startswith("hm14|"):
+        aid = data.split("|")[1]
+        heat = build_heatmap_for_account(aid, get_account_name, mode="14")
+        await q.edit_message_text(heat, parse_mode="HTML")
+        return
+
+    if data.startswith("hmmonth|"):
+        aid = data.split("|")[1]
+        heat = build_heatmap_for_account(aid, get_account_name, mode="month")
+        await q.edit_message_text(heat, parse_mode="HTML")
         return
 
     # биллинг
@@ -1668,12 +1901,52 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ввод target CPA и кастомных диапазонов
+
 async def on_text_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _allowed(update):
         return
 
+    # ============================================================
+    # 🔥 РУЧНОЙ ВВОД ДЛЯ АВТОПИЛАТА
+    # ============================================================
+    if "await_manual_input" in context.user_data:
+        entity_id = context.user_data.pop("await_manual_input")
+        raw = update.message.text.strip()
+
+        percent = parse_manual_input(raw)
+        if percent is None:
+            await update.message.reply_text(
+                "❌ Не получилось разобрать число. Пример: 1.2, 20, -15",
+                parse_mode="HTML"
+            )
+            context.user_data["await_manual_input"] = entity_id
+            return
+
+        # Отправляем подтверждение через кнопки
+        await update.message.reply_text(
+            f"Подтвердить изменение бюджета на <b>{percent:+.1f}%</b> "
+            f"для <code>{entity_id}</code>?",
+            parse_mode="HTML",
+            reply_markup=confirm_action_buttons(str(percent), entity_id)
+        )
+        return
+
+    # ====== дальше идёт твоя старая логика текстовых вводов ======
+
     if "await_range_for" in context.user_data:
-        await on_text(update, context)
+        aid = context.user_data.pop("await_range_for")
+        parsed = _parse_range(update.message.text.strip())
+        if not parsed:
+            await update.message.reply_text(
+                "Формат дат: 01.06.2025-07.06.2025. Попробуй ещё раз."
+            )
+            context.user_data["await_range_for"] = aid
+            return
+        period, label = parsed
+        txt = get_cached_report(aid, period, label)
+        await update.message.reply_text(
+            txt or "Нет данных/нет доступа.", parse_mode="HTML"
+        )
         return
 
     if "await_cmp_for" in context.user_data:
@@ -1720,7 +1993,6 @@ async def on_text_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"✅ Target CPA для {get_account_name(aid)} установлен 0 — алерты ВЫКЛ"
             )
         return
-
 
 # ============ JOBS ============
 async def full_daily_scan_job(ctx: ContextTypes.DEFAULT_TYPE):
@@ -1792,6 +2064,8 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("billing", cmd_billing))
     app.add_handler(CommandHandler("sync_accounts", cmd_sync))
+    app.add_handler(CommandHandler("heatmap", cmd_heatmap))
+    app.add_handler(CallbackQueryHandler(on_cb_autopilot, pattern="^ap"))
     app.add_handler(CallbackQueryHandler(on_cb))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_any))
 
