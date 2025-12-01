@@ -22,6 +22,7 @@ def autopilot_main_menu():
             InlineKeyboardButton("⬅️ Назад", callback_data="menu")
         ]
     ])
+...
 
 
 # ============================================================

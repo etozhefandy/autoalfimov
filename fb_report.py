@@ -932,11 +932,11 @@ def build_comparison_report(aid: str, period1, label1: str, period2, label2: str
 
 
 async def send_period_report(ctx, chat_id, period, label: str = ""):
-    for aid in get_enabled_accounts_in_order():
+    # Берём только включённые аккаунты
+    for aid in iter_enabled_accounts_only():
         txt = get_cached_report(aid, period, label)
         if txt:
             await ctx.bot.send_message(chat_id=chat_id, text=txt, parse_mode="HTML")
-
 
 # ============ БИЛЛИНГ ============
 async def send_billing(ctx: ContextTypes.DEFAULT_TYPE, chat_id: str):
