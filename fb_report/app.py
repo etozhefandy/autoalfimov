@@ -25,6 +25,8 @@ from .constants import (
     DEFAULT_REPORT_CHAT,
     ALLOWED_USER_IDS,
     ALLOWED_CHAT_IDS,
+    usd_to_kzt,
+    kzt_round_up_1000,
 )
 from .storage import (
     load_accounts,
@@ -48,7 +50,7 @@ from .adsets import send_adset_report
 from .billing import send_billing, send_billing_forecast, billing_digest_job
 from .jobs import full_daily_scan_job, daily_report_job, schedule_cpa_alerts
 
-# === AUTOPИЛАТ ===
+# === АВТОПИЛАТ ===
 from autopilat.engine import get_recommendations_ui
 from autopilat.ui import (
     autopilot_main_menu,
@@ -91,11 +93,20 @@ def main_menu() -> InlineKeyboardMarkup:
         [
             [InlineKeyboardButton("Отчёт по всем", callback_data="rep_all_menu")],
             [InlineKeyboardButton("Биллинг", callback_data="billing")],
-            [InlineKeyboardButton("Отчёт по аккаунту", callback_data="choose_acc_report")],
-            [InlineKeyboardButton("Отчёт по адсетам", callback_data="adsets_menu")],
-            [InlineKeyboardButton("Тепловая карта", callback_data="hm_menu")],
-            [InlineKeyboardButton("Настройки", callback_data="choose_acc_settings")],
-            [InlineKeyboardButton("🤖 Автопилат", callback_data="ap_main")],
+            [
+                InlineKeyboardButton(
+                    "Отчёт по аккаунту", callback_data="choose_acc_report"
+                )
+            ],
+            [
+                InlineKeyboardButton("Тепловая карта", callback_data="hm_menu")
+            ],
+            [
+                InlineKeyboardButton("Настройки", callback_data="choose_acc_settings")
+            ],
+            [
+                InlineKeyboardButton("🤖 Автопилат", callback_data="ap_main")
+            ],
             [
                 InlineKeyboardButton(
                     f"Синк BM (посл. {last_sync})",
@@ -960,7 +971,6 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(on_cb))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_any))
 
-    # Джобы
     app.job_queue.run_daily(
         full_daily_scan_job,
         time=time(hour=9, minute=20, tzinfo=ALMATY_TZ),
@@ -982,8 +992,8 @@ def build_app() -> Application:
         app,
         get_enabled_accounts=get_enabled_accounts_in_order,
         get_account_name=get_account_name,
-        usd_to_kzt=None,  # если нужно — можно прокинуть из constants.usd_to_kzt
-        kzt_round_up_1000=None,
+        usd_to_kzt=usd_to_kzt,
+        kzt_round_up_1000=kzt_round_up_1000,
         owner_id=253181449,
         group_chat_id=str(DEFAULT_REPORT_CHAT),
     )
