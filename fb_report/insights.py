@@ -1,7 +1,6 @@
 # fb_report/insights.py
 import json
 import os
-from collections import defaultdict
 from datetime import datetime, timedelta
 
 from pytz import timezone
@@ -39,10 +38,6 @@ def _atomic_write_json(path: str, obj: dict):
 # ========= ПУБЛИЧНЫЕ ХЕЛПЕРЫ ДЛЯ ЛОКАЛЬНОГО КЭША =========
 
 def load_local_insights(aid: str) -> dict:
-    """
-    Загружает словарь инсайтов по аккаунту:
-    { period_key -> dict | None }
-    """
     path = _insights_path(aid)
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -52,9 +47,6 @@ def load_local_insights(aid: str) -> dict:
 
 
 def save_local_insights(aid: str, data: dict):
-    """
-    Сохраняет словарь инсайтов по аккаунту.
-    """
     path = _insights_path(aid)
     _atomic_write_json(path, data)
 
@@ -62,10 +54,6 @@ def save_local_insights(aid: str, data: dict):
 # ========= ОБРАБОТКА ACTIONS И СВОДНЫХ МЕТРИК =========
 
 def extract_actions(row: dict) -> dict:
-    """
-    Преобразует поле actions из ответа Facebook в dict:
-    { action_type -> value } с суммированием по типам.
-    """
     res: dict[str, float] = {}
     actions = row.get("actions") or []
     for a in actions:
@@ -81,11 +69,6 @@ def extract_actions(row: dict) -> dict:
 
 
 def _extract_leads(acts: dict) -> int:
-    """
-    Унифицированное извлечение лидов:
-    сначала пытаемся взять Website Submit Applications,
-    если нет — падаем на пиксельные/lead-события.
-    """
     keys = [
         "Website Submit Applications",
         "offsite_conversion.fb_pixel_submit_application",
@@ -103,12 +86,6 @@ def _extract_leads(acts: dict) -> int:
 
 
 def _blend_totals(row: dict):
-    """
-    Единый расчёт итогов для аккаунта/кампании/адсета.
-
-    Возвращает кортеж:
-    (spend, msgs, leads, total, blended_cpa_or_None)
-    """
     try:
         spend = float(row.get("spend", 0) or 0)
     except Exception:
@@ -127,7 +104,7 @@ def _blend_totals(row: dict):
     return spend, msgs, leads, total, blended
 
 
-# ========= ТЕПЛОВАЯ КАРТА АДСЕТОВ =========
+# ========= ВСПОМОГАТЕЛЬНОЕ ДЛЯ ПЕРИОДОВ =========
 
 def _date_range_for_mode(mode: str):
     now = datetime.now(ALMATY_TZ).date()
@@ -137,17 +114,13 @@ def _date_range_for_mode(mode: str):
     elif mode == "14":
         until = now - timedelta(days=1)
         since = until - timedelta(days=13)
-    else:  # "month" — текущий месяц до вчера
+    else:  # "month"
         until = now - timedelta(days=1)
         since = until.replace(day=1)
     return since, until
 
 
 def _heat_emoji(cpa: float | None) -> str:
-    """
-    Грубая 'тепловая' оценка по CPA:
-    дешёвые — зелёные, средние — жёлтые, дорогие — красные.
-    """
     if cpa is None:
         return "⚪️"
     if cpa <= 2:
@@ -157,21 +130,44 @@ def _heat_emoji(cpa: float | None) -> str:
     return "🔴"
 
 
+def _cpa_bar(cpa: float | None) -> str:
+    """
+    4-ступенчатый индикатор:
+    ⬜ — нет заявок / нет CPA
+    ▢ — дорогой
+    ▦ — средний
+    ▩ — дешёвый
+    """
+    if cpa is None:
+        return "⬜"
+    if cpa > 4:
+        return "▢"
+    if cpa > 2:
+        return "▦"
+    return "▩"
+
+
+# ========= ТЕПЛОВАЯ КАРТА АДСЕТОВ =========
+
 def build_heatmap_for_account(
     aid: str,
     get_account_name,
     mode: str = "7",
+    period: dict | None = None,
 ) -> str:
     """
-    Тепловая карта по адсетам аккаунта за период:
-    mode = "7" | "14" | "month".
-
-    Строит простой отчет:
-    - TOP-адсеты по spend
-    - для каждого: CPA и 'тепловой' индикатор
-    (используется в Telegram-кнопках hm7/hm14/hmmonth).
+    mode: "7" | "14" | "month"
+    или period={"since": "YYYY-MM-DD", "until": "YYYY-MM-DD"} для кастомного диапазона.
     """
-    since, until = _date_range_for_mode(mode)
+    if period is not None:
+        from datetime import date
+        try:
+            since = datetime.strptime(period["since"], "%Y-%m-%d").date()
+            until = datetime.strptime(period["until"], "%Y-%m-%d").date()
+        except Exception:
+            since, until = _date_range_for_mode("7")
+    else:
+        since, until = _date_range_for_mode(mode)
 
     acc = AdAccount(aid)
     params = {
@@ -204,7 +200,6 @@ def build_heatmap_for_account(
             f"за {since.strftime('%d.%m')}–{until.strftime('%d.%m')}"
         )
 
-    # Агрегируем по адсетам
     agg: dict[str, dict] = {}
 
     for row in data:
@@ -235,7 +230,6 @@ def build_heatmap_for_account(
         slot["leads"] += leads
         slot["total"] += total
 
-    # Подсчёт CPA и сортировка по тратам
     items = list(agg.values())
     for it in items:
         if it["total"] > 0:
@@ -244,12 +238,10 @@ def build_heatmap_for_account(
             it["cpa"] = None
 
     items.sort(key=lambda x: x["spend"], reverse=True)
-
-    # Ограничимся топ-15 по тратам, чтобы сообщение не разъезжалось
     items = items[:15]
 
     header = [
-        f"🔥 <b>Тепловая карта по адсетам</b>",
+        "🔥 <b>Тепловая карта по адсетам</b>",
         f"Аккаунт: <b>{get_account_name(aid)}</b>",
         f"Период: {since.strftime('%d.%m.%Y')}–{until.strftime('%d.%m.%Y')}",
         "",
@@ -266,6 +258,8 @@ def build_heatmap_for_account(
     for it in items:
         cpa = it["cpa"]
         emoji = _heat_emoji(cpa)
+        bar = _cpa_bar(cpa)
+
         if cpa is None:
             cpa_txt = "—"
         else:
@@ -274,7 +268,8 @@ def build_heatmap_for_account(
         line = (
             f"{emoji} <b>{it['name']}</b>\n"
             f"   💵 {it['spend']:.2f} $  |  👁 {it['impr']}  |  🖱 {it['clicks']}\n"
-            f"   💬 {it['msgs']}  |  📩 {it['leads']}  |  🧮 {it['total']}  |  🎯 CPA: {cpa_txt}"
+            f"   💬 {it['msgs']}  |  📩 {it['leads']}  |  🧮 {it['total']}  |  🎯 CPA: {cpa_txt}\n"
+            f"   ▪️ Индикатор: {bar}"
         )
         lines.append(line)
 

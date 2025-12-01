@@ -1,4 +1,3 @@
-# fb_report/app.py
 from datetime import datetime, timedelta, time
 
 from telegram import (
@@ -35,10 +34,8 @@ from .storage import (
     get_enabled_accounts_in_order,
     human_last_sync,
     upsert_from_bm,
-    metrics_flags,
 )
 from .reporting import (
-    fmt_int,
     get_cached_report,
     build_comparison_report,
     send_period_report,
@@ -277,6 +274,24 @@ def compare_kb_for(aid: str) -> InlineKeyboardMarkup:
                     "⬅️ К периодам", callback_data=f"back_periods|{aid}"
                 )
             ],
+        ]
+    )
+
+
+def account_report_kind_kb(aid: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "Отчёт по аккаунту", callback_data=f"rep_acc|{aid}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "Отчёт по адсетам", callback_data=f"rep_adsets|{aid}"
+                )
+            ],
+            [InlineKeyboardButton("⬅️ К аккаунтам", callback_data="choose_acc_report")],
         ]
     )
 
@@ -543,7 +558,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("Выберите период:", reply_markup=all_reports_menu())
         return
 
-    # ===== ОТЧЁТ ПО АДСЕТАМ =====
+    # ===== ОТЧЁТ ПО АДСЕТАМ (из главного меню) =====
     if data == "adsets_menu":
         await q.edit_message_text(
             "Выберите аккаунт для отчёта по адсетам:",
@@ -560,7 +575,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_adset_report(context, chat_id, aid)
         return
 
-    # общие отчёты
+    # ===== ОБЩИЕ ОТЧЁТЫ =====
     if data == "rep_today":
         label = datetime.now(ALMATY_TZ).strftime("%d.%m.%Y")
         await q.edit_message_text(f"Готовлю отчёт за {label}…")
@@ -585,7 +600,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_period_report(context, chat_id, period, label)
         return
 
-    # вход в тепловую карту
+    # ===== ТЕПЛОВАЯ КАРТА =====
     if data == "hm_menu":
         await q.edit_message_text(
             "Выберите аккаунт для тепловой карты:",
@@ -620,7 +635,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(heat, parse_mode="HTML")
         return
 
-    # биллинг
+    # ===== БИЛЛИНГ =====
     if data == "billing":
         await q.edit_message_text(
             "Что показать по биллингу?", reply_markup=billing_menu()
@@ -635,7 +650,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_billing_forecast(context, chat_id)
         return
 
-    # синк из BM
+    # ===== СИНК BM =====
     if data == "sync_bm":
         try:
             res = upsert_from_bm()
@@ -653,19 +668,39 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    # выбор аккаунта для отчёта
+    # ===== ОТЧЁТ ПО АККАУНТУ (ИНДИВИДУАЛЬНЫЙ) =====
     if data == "choose_acc_report":
         await q.edit_message_text(
-            "Выберите аккаунт:", reply_markup=accounts_kb("rep1")
+            "Выберите аккаунт:", reply_markup=accounts_kb("rep_choose")
         )
         return
-    if data.startswith("rep1|"):
+
+    if data.startswith("rep_choose|"):
+        aid = data.split("|", 1)[1]
+        await q.edit_message_text(
+            f"Отчёт индивидуальный:\n"
+            f"Выберите вид отчёта для {get_account_name(aid)}:",
+            reply_markup=account_report_kind_kb(aid),
+        )
+        return
+
+    if data.startswith("rep_adsets|"):
+        aid = data.split("|", 1)[1]
+        await q.edit_message_text(
+            f"Готовлю отчёт по адсетам для {get_account_name(aid)} "
+            f"за последние 7 дней…"
+        )
+        await send_adset_report(context, chat_id, aid)
+        return
+
+    if data.startswith("rep_acc|"):
         aid = data.split("|", 1)[1]
         await q.edit_message_text(
             f"Отчёт по: {get_account_name(aid)}\nВыбери период:",
             reply_markup=period_kb_for(aid),
         )
         return
+
     if data.startswith("one_today|"):
         aid = data.split("|", 1)[1]
         label = datetime.now(ALMATY_TZ).strftime("%d.%m.%Y")
@@ -679,6 +714,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML",
         )
         return
+
     if data.startswith("one_yday|"):
         aid = data.split("|", 1)[1]
         label = (datetime.now(ALMATY_TZ) - timedelta(days=1)).strftime("%d.%m.%Y")
@@ -692,6 +728,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML",
         )
         return
+
     if data.startswith("one_week|"):
         aid = data.split("|", 1)[1]
         until = datetime.now(ALMATY_TZ) - timedelta(days=1)
@@ -711,6 +748,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML",
         )
         return
+
     if data.startswith("one_custom|"):
         aid = data.split("|", 1)[1]
         context.user_data["await_range_for"] = aid
@@ -720,7 +758,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # меню сравнения
+    # ===== СРАВНЕНИЕ ПЕРИОДОВ =====
     if data.startswith("cmp_menu|"):
         aid = data.split("|", 1)[1]
         await q.edit_message_text(
@@ -728,6 +766,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=compare_kb_for(aid),
         )
         return
+
     if data.startswith("back_periods|"):
         aid = data.split("|", 1)[1]
         await q.edit_message_text(
@@ -735,6 +774,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=period_kb_for(aid),
         )
         return
+
     if data.startswith("cmp_week|"):
         aid = data.split("|", 1)[1]
         now = datetime.now(ALMATY_TZ)
@@ -768,7 +808,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # настройки
+    # ===== НАСТРОЙКИ =====
     if data == "choose_acc_settings":
         await q.edit_message_text(
             "Выберите аккаунт для настроек:",
@@ -971,6 +1011,7 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(on_cb))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_any))
 
+    # Джобы
     app.job_queue.run_daily(
         full_daily_scan_job,
         time=time(hour=9, minute=20, tzinfo=ALMATY_TZ),
