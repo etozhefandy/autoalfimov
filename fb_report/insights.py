@@ -22,75 +22,73 @@ def extract_actions(*args, **kwargs):
 
 
 def _blend_totals(*args, **kwargs):
-    # если вдруг где-то вызывается, просто отдаём первый аргумент
     return args[0] if args else {}
 
 
-# ===== Локальный парсер итогов (скопирован из jobs.py, чтобы не было импортов) =====
+# ===== Локальный парсер итогов из текстового отчёта =====
 
 def _parse_totals_from_report_text(txt: str):
+    """
+    Парсим итоговые значения из текстового отчёта по аккаунту.
+
+    Ориентируемся НЕ на эмодзи, а на текст:
+      - "Переписки" -> сообщения
+      - "Лиды"      -> лиды
+      - "Затраты"   -> spend
+      - "Итого: X заявок" -> total_conversions
+
+    Если строки "Итого" нет, считаем total_conversions = messages + leads.
+    """
+
     messages = 0
     leads = 0
     spend = 0.0
+    total_convs = 0
 
-    msg_pattern = re.compile(r"💬[^0-9]*?(\d+)")
-    lead_pattern = re.compile(r"♿️[^0-9]*?(\d+)")
-    spend_pattern = re.compile(r"💵[^0-9]*?([0-9]+[.,]?[0-9]*)")
+    # любые числа после слов "Переписки" / "Лиды" / "Затраты"
+    line_msg_pattern = re.compile(r"Переписк[аеи][^0-9]*?(\d+)")
+    line_lead_pattern = re.compile(r"Лид[ыа][^0-9]*?(\d+)")
+    line_spend_pattern = re.compile(r"Затраты[^0-9]*?([0-9]+[.,]?[0-9]*)")
+
+    # строка формата "Итого: 12 заявок"
+    total_conv_pattern = re.compile(r"Итого[^0-9]*?(\d+)\s+заяв", re.IGNORECASE)
 
     for line in txt.splitlines():
-        if "Итого" in line:
-            m_msg = msg_pattern.search(line)
-            if m_msg:
-                try:
-                    messages = int(m_msg.group(1))
-                except Exception:
-                    pass
+        # Итого X заявок
+        m_total = total_conv_pattern.search(line)
+        if m_total:
+            try:
+                total_convs = int(m_total.group(1))
+            except Exception:
+                pass
 
-            m_lead = lead_pattern.search(line)
-            if m_lead:
-                try:
-                    leads = int(m_lead.group(1))
-                except Exception:
-                    pass
+        # Переписки
+        m_msg = line_msg_pattern.search(line)
+        if m_msg:
+            try:
+                messages = int(m_msg.group(1))
+            except Exception:
+                pass
 
-            m_spend = spend_pattern.search(line)
-            if m_spend:
-                try:
-                    spend = float(m_spend.group(1).replace(",", "."))
-                except Exception:
-                    pass
+        # Лиды
+        m_lead = line_lead_pattern.search(line)
+        if m_lead:
+            try:
+                leads = int(m_lead.group(1))
+            except Exception:
+                pass
 
-    if messages == 0 and leads == 0:
-        total_msg = 0
-        total_leads = 0
-        total_spend = 0.0
-        for line in txt.splitlines():
-            m_msg = msg_pattern.search(line)
-            if m_msg:
-                try:
-                    total_msg += int(m_msg.group(1))
-                except Exception:
-                    pass
+        # Затраты
+        m_spend = line_spend_pattern.search(line)
+        if m_spend:
+            try:
+                spend = float(m_spend.group(1).replace(",", "."))
+            except Exception:
+                pass
 
-            m_lead = lead_pattern.search(line)
-            if m_lead:
-                try:
-                    total_leads += int(m_lead.group(1))
-                except Exception:
-                    pass
+    if total_convs == 0:
+        total_convs = messages + leads
 
-            m_spend = spend_pattern.search(line)
-            if m_spend:
-                try:
-                    total_spend = float(m_spend.group(1).replace(",", "."))
-                except Exception:
-                    pass
-
-        messages = messages or total_msg
-        leads = leads or total_leads
-        spend = spend or total_spend
-
-    total_convs = messages + leads
     cpa = None
     if total_convs > 0 and spend > 0:
         cpa = spend / total_convs
@@ -117,21 +115,27 @@ def _build_day_period(day: datetime) -> Tuple[Dict[str, str], str]:
 
 
 def _iter_days_for_mode(mode: str) -> List[datetime]:
+    """
+    Теперь по-честному включаем СЕГОДНЯ в "последние X дней".
+
+    mode:
+      "7"    -> последние 7 календарных дней, включая сегодня
+      "14"   -> последние 14 календарных дней, включая сегодня
+      "month"-> текущий календарный месяц до сегодня включительно
+    """
     now = datetime.now(ALMATY_TZ)
-    yesterday = (now - timedelta(days=1)).replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
     if mode == "14":
         days = 14
-        return [yesterday - timedelta(days=i) for i in range(days)][::-1]
+        return [today - timedelta(days=i) for i in range(days)][::-1]
     elif mode == "month":
-        first_of_month = yesterday.replace(day=1)
-        days_delta = (yesterday - first_of_month).days + 1
+        first_of_month = today.replace(day=1)
+        days_delta = (today - first_of_month).days + 1
         return [first_of_month + timedelta(days=i) for i in range(days_delta)]
     else:
         days = 7
-        return [yesterday - timedelta(days=i) for i in range(days)][::-1]
+        return [today - timedelta(days=i) for i in range(days)][::-1]
 
 
 def _load_daily_totals_for_account(
@@ -139,6 +143,14 @@ def _load_daily_totals_for_account(
     mode: str,
     get_cached_report,
 ) -> List[Dict[str, Optional[float]]]:
+    """
+    Для каждого дня периода берём кэш отчёта по аккаунту
+    и парсим:
+      - messages
+      - leads
+      - total_conversions (заявки = 💬 + лиды)
+      - spend
+    """
     days = _iter_days_for_mode(mode)
     result: List[Dict[str, Optional[float]]] = []
 
@@ -181,6 +193,13 @@ def _heat_symbol(
     convs: int,
     max_convs: int,
 ) -> str:
+    """
+    0      -> ⬜
+    >0..25%   -> ▢
+    >25..50%  -> ▤
+    >50..75%  -> ▦
+    >75..100% -> ▩
+    """
     if max_convs <= 0:
         return "⬜"
     if convs <= 0:
@@ -212,6 +231,12 @@ def build_heatmap_for_account(
     get_cached_report,
     mode: str = "7",
 ) -> str:
+    """
+    Тепловая карта по дням:
+
+    - заявки считаем как 💬 + лиды (из текста отчёта)
+    - период реально соответствует надписи (7/14 дней, месяц с сегодня)
+    """
     acc_name = get_account_name(aid)
     mode_label = _mode_label(mode)
 
@@ -243,7 +268,7 @@ def build_heatmap_for_account(
 
     lines.append(
         f"Итого за период: {total_convs_all} заявок "
-        f"(💬 {total_msgs_all} + ♿️ {total_leads_all}), "
+        f"(💬 {total_msgs_all} + 📩 {total_leads_all}), "
         f"затраты: {total_spend_all:.2f} $"
     )
     if days_with_data > 0:
@@ -252,7 +277,7 @@ def build_heatmap_for_account(
         )
     lines.append("")
 
-    header = "Дата       Инт.  Заявки  💬   ♿️   💵"
+    header = "Дата       Инт.  Заявки  💬   📩   💵"
     lines.append(header)
     lines.append("-" * len(header))
 
