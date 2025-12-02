@@ -24,8 +24,6 @@ from .constants import (
     DEFAULT_REPORT_CHAT,
     ALLOWED_USER_IDS,
     ALLOWED_CHAT_IDS,
-    usd_to_kzt,
-    kzt_round_up_1000,
 )
 from .storage import (
     load_accounts,
@@ -34,8 +32,10 @@ from .storage import (
     get_enabled_accounts_in_order,
     human_last_sync,
     upsert_from_bm,
+    metrics_flags,
 )
 from .reporting import (
+    fmt_int,
     get_cached_report,
     build_comparison_report,
     send_period_report,
@@ -47,7 +47,6 @@ from .adsets import send_adset_report
 from .billing import send_billing, send_billing_forecast, billing_digest_job
 from .jobs import full_daily_scan_job, daily_report_job, schedule_cpa_alerts
 
-# === АВТОПИЛАТ ===
 from autopilat.engine import get_recommendations_ui
 from autopilat.ui import (
     autopilot_main_menu,
@@ -62,7 +61,6 @@ from autopilat.actions import (
 )
 
 
-# ============ PRIVACY ============
 def _allowed(update: Update) -> bool:
     chat_id = str(update.effective_chat.id) if update.effective_chat else ""
     user_id = update.effective_user.id if update.effective_user else None
@@ -73,7 +71,6 @@ def _allowed(update: Update) -> bool:
     return False
 
 
-# ======= SAFE EDIT =======
 async def safe_edit_message(q, text: str, **kwargs):
     try:
         return await q.edit_message_text(text=text, **kwargs)
@@ -83,7 +80,6 @@ async def safe_edit_message(q, text: str, **kwargs):
         raise
 
 
-# ============ UI ============
 def main_menu() -> InlineKeyboardMarkup:
     last_sync = human_last_sync()
     return InlineKeyboardMarkup(
@@ -92,18 +88,12 @@ def main_menu() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("Биллинг", callback_data="billing")],
             [
                 InlineKeyboardButton(
-                    "Отчёт по аккаунту", callback_data="choose_acc_report"
+                    "Отчёт индивидуальный", callback_data="rep_individual_menu"
                 )
             ],
-            [
-                InlineKeyboardButton("Тепловая карта", callback_data="hm_menu")
-            ],
-            [
-                InlineKeyboardButton("Настройки", callback_data="choose_acc_settings")
-            ],
-            [
-                InlineKeyboardButton("🤖 Автопилат", callback_data="ap_main")
-            ],
+            [InlineKeyboardButton("Тепловая карта", callback_data="hm_menu")],
+            [InlineKeyboardButton("Настройки", callback_data="choose_acc_settings")],
+            [InlineKeyboardButton("🤖 Автопилат", callback_data="ap_main")],
             [
                 InlineKeyboardButton(
                     f"Синк BM (посл. {last_sync})",
@@ -132,6 +122,24 @@ def all_reports_menu() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("Вчера", callback_data="rep_yday"),
             ],
             [InlineKeyboardButton("Прошедшая неделя", callback_data="rep_week")],
+            [InlineKeyboardButton("⬅️ В меню", callback_data="menu")],
+        ]
+    )
+
+
+def individual_reports_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "Отчёт по аккаунту", callback_data="choose_acc_report"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "Отчёт по адсетам", callback_data="adsets_menu"
+                )
+            ],
             [InlineKeyboardButton("⬅️ В меню", callback_data="menu")],
         ]
     )
@@ -278,17 +286,19 @@ def compare_kb_for(aid: str) -> InlineKeyboardMarkup:
     )
 
 
-def account_report_kind_kb(aid: str) -> InlineKeyboardMarkup:
+def account_report_mode_kb(aid: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton(
-                    "Отчёт по аккаунту", callback_data=f"rep_acc|{aid}"
+                    "📊 Отчёт по аккаунту",
+                    callback_data=f"one_mode_acc|{aid}",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    "Отчёт по адсетам", callback_data=f"rep_adsets|{aid}"
+                    "📂 Отчёт по адсетам",
+                    callback_data=f"one_mode_adsets|{aid}",
                 )
             ],
             [InlineKeyboardButton("⬅️ К аккаунтам", callback_data="choose_acc_report")],
@@ -296,7 +306,6 @@ def account_report_kind_kb(aid: str) -> InlineKeyboardMarkup:
     )
 
 
-# ======== COMMANDS ============
 async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id if update.effective_chat else None
     user_id = update.effective_user.id if update.effective_user else None
@@ -393,7 +402,6 @@ async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ Ошибка синка: {e}")
 
 
-# ============ CALLBACKS ДЛЯ АВТОПИЛАТА ============
 async def on_cb_autopilot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -539,7 +547,6 @@ async def on_cb_autopilot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
-# ============ ОБЩИЕ CALLBACK'и ============
 async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -558,7 +565,13 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("Выберите период:", reply_markup=all_reports_menu())
         return
 
-    # ===== ОТЧЁТ ПО АДСЕТАМ (из главного меню) =====
+    if data == "rep_individual_menu":
+        await q.edit_message_text(
+            "Выберите тип индивидуального отчёта:",
+            reply_markup=individual_reports_menu(),
+        )
+        return
+
     if data == "adsets_menu":
         await q.edit_message_text(
             "Выберите аккаунт для отчёта по адсетам:",
@@ -575,7 +588,6 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_adset_report(context, chat_id, aid)
         return
 
-    # ===== ОБЩИЕ ОТЧЁТЫ =====
     if data == "rep_today":
         label = datetime.now(ALMATY_TZ).strftime("%d.%m.%Y")
         await q.edit_message_text(f"Готовлю отчёт за {label}…")
@@ -600,7 +612,6 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_period_report(context, chat_id, period, label)
         return
 
-    # ===== ТЕПЛОВАЯ КАРТА =====
     if data == "hm_menu":
         await q.edit_message_text(
             "Выберите аккаунт для тепловой карты:",
@@ -635,22 +646,22 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(heat, parse_mode="HTML")
         return
 
-    # ===== БИЛЛИНГ =====
     if data == "billing":
         await q.edit_message_text(
             "Что показать по биллингу?", reply_markup=billing_menu()
         )
         return
+
     if data == "billing_current":
         await q.edit_message_text("📋 Биллинги (неактивные аккаунты):")
         await send_billing(context, chat_id)
         return
+
     if data == "billing_forecast":
         await q.edit_message_text("🔮 Считаю прогноз списаний…")
         await send_billing_forecast(context, chat_id)
         return
 
-    # ===== СИНК BM =====
     if data == "sync_bm":
         try:
             res = upsert_from_bm()
@@ -668,37 +679,35 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    # ===== ОТЧЁТ ПО АККАУНТУ (ИНДИВИДУАЛЬНЫЙ) =====
     if data == "choose_acc_report":
         await q.edit_message_text(
-            "Выберите аккаунт:", reply_markup=accounts_kb("rep_choose")
+            "Выберите аккаунт:", reply_markup=accounts_kb("rep1")
         )
         return
 
-    if data.startswith("rep_choose|"):
+    if data.startswith("rep1|"):
         aid = data.split("|", 1)[1]
         await q.edit_message_text(
-            f"Отчёт индивидуальный:\n"
-            f"Выберите вид отчёта для {get_account_name(aid)}:",
-            reply_markup=account_report_kind_kb(aid),
+            f"Отчёт по: {get_account_name(aid)}\nВыберите тип отчёта:",
+            reply_markup=account_report_mode_kb(aid),
         )
         return
 
-    if data.startswith("rep_adsets|"):
+    if data.startswith("one_mode_acc|"):
+        aid = data.split("|", 1)[1]
+        await q.edit_message_text(
+            f"Отчёт по: {get_account_name(aid)}\nВыбери период:",
+            reply_markup=period_kb_for(aid),
+        )
+        return
+
+    if data.startswith("one_mode_adsets|"):
         aid = data.split("|", 1)[1]
         await q.edit_message_text(
             f"Готовлю отчёт по адсетам для {get_account_name(aid)} "
             f"за последние 7 дней…"
         )
         await send_adset_report(context, chat_id, aid)
-        return
-
-    if data.startswith("rep_acc|"):
-        aid = data.split("|", 1)[1]
-        await q.edit_message_text(
-            f"Отчёт по: {get_account_name(aid)}\nВыбери период:",
-            reply_markup=period_kb_for(aid),
-        )
         return
 
     if data.startswith("one_today|"):
@@ -758,7 +767,6 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ===== СРАВНЕНИЕ ПЕРИОДОВ =====
     if data.startswith("cmp_menu|"):
         aid = data.split("|", 1)[1]
         await q.edit_message_text(
@@ -790,8 +798,8 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "since": since2.strftime("%Y-%m-%d"),
             "until": until2.strftime("%Y-%m-%d"),
         }
-        label1 = f"{since1.strftime('%d.%m')}-{until1.strftime('%d.%m')}"
-        label2 = f"{since2.strftime('%d.%m')}-{until2.strftime('%d.%m')}"
+        label1 = f"{since1.strftime('%d.%м')}-{until1.strftime('%d.%м')}"
+        label2 = f"{since2.strftime('%d.%м')}-{until2.strftime('%d.%м')}"
         await q.edit_message_text(f"Сравниваю {label1} vs {label2}…")
         txt = build_comparison_report(aid, period1, label1, period2, label2)
         await context.bot.send_message(chat_id, txt, parse_mode="HTML")
@@ -808,7 +816,6 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ===== НАСТРОЙКИ =====
     if data == "choose_acc_settings":
         await q.edit_message_text(
             "Выберите аккаунт для настроек:",
@@ -901,7 +908,6 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
-# ============ TEXT INPUT ============
 async def on_text_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _allowed(update):
         return
@@ -912,7 +918,6 @@ async def on_text_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = update.message.text.strip()
 
-    # кастомный диапазон для одного периода
     if "await_range_for" in context.user_data:
         aid = context.user_data.pop("await_range_for")
         parsed = parse_range(text)
@@ -929,7 +934,6 @@ async def on_text_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # сравнение двух диапазонов
     if "await_cmp_for" in context.user_data:
         aid = context.user_data.pop("await_cmp_for")
         parsed = parse_two_ranges(text)
@@ -944,7 +948,6 @@ async def on_text_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(txt, parse_mode="HTML")
         return
 
-    # ввод target CPA
     if "await_cpa_for" in context.user_data:
         aid = context.user_data.pop("await_cpa_for")
         try:
@@ -975,7 +978,6 @@ async def on_text_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    # ручной ввод для автопилата
     if "await_manual_input" in context.user_data:
         entity_id = context.user_data.pop("await_manual_input")
         percent = parse_manual_input(text)
@@ -996,7 +998,6 @@ async def on_text_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
-# ============ APP ============
 def build_app() -> Application:
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
@@ -1011,7 +1012,6 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(on_cb))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_any))
 
-    # Джобы
     app.job_queue.run_daily(
         full_daily_scan_job,
         time=time(hour=9, minute=20, tzinfo=ALMATY_TZ),
@@ -1024,7 +1024,7 @@ def build_app() -> Application:
 
     app.job_queue.run_daily(
         billing_digest_job,
-        time=time(hour=9, minute=0, tzinfo=ALMATY_TZ),
+        time=time(hour=9, minute=31, tzinfo=ALMATY_TZ),
     )
 
     schedule_cpa_alerts(app)
@@ -1033,8 +1033,8 @@ def build_app() -> Application:
         app,
         get_enabled_accounts=get_enabled_accounts_in_order,
         get_account_name=get_account_name,
-        usd_to_kzt=usd_to_kzt,
-        kzt_round_up_1000=kzt_round_up_1000,
+        usd_to_kzt=None,
+        kzt_round_up_1000=None,
         owner_id=253181449,
         group_chat_id=str(DEFAULT_REPORT_CHAT),
     )

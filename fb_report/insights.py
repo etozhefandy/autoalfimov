@@ -1,276 +1,206 @@
 # fb_report/insights.py
-import json
-import os
+
 from datetime import datetime, timedelta
+from typing import Dict, List, Tuple, Optional
 
-from pytz import timezone
-from facebook_business.adobjects.adaccount import AdAccount
-
-ALMATY_TZ = timezone("Asia/Almaty")
-
-# ========= ПУТИ / ХРАНИЛИЩЕ ИНСАЙТОВ =========
-
-DATA_DIR = os.getenv("DATA_DIR", "/data")
-INSIGHTS_DIR = os.path.join(DATA_DIR, "insights")
-os.makedirs(INSIGHTS_DIR, exist_ok=True)
+from .constants import ALMATY_TZ
+from .reporting import get_cached_report
+from .jobs import _parse_totals_from_report_text
 
 
-def _insights_path(aid: str) -> str:
-    safe = aid.replace(":", "_").replace("/", "_")
-    return os.path.join(INSIGHTS_DIR, f"{safe}.json")
+def _build_day_period(day: datetime) -> Tuple[Dict[str, str], str]:
+    """Формирует period/label для одного дня (как в дневном отчёте)."""
+    day = day.replace(hour=0, minute=0, second=0, microsecond=0)
+    period = {
+        "since": day.strftime("%Y-%m-%d"),
+        "until": day.strftime("%Y-%m-%d"),
+    }
+    label = day.strftime("%d.%m.%Y")
+    return period, label
 
 
-def _atomic_write_json(path: str, obj: dict):
-    tmp = f"{path}.tmp"
-    bak = f"{path}.bak"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    try:
-        if os.path.exists(path):
-            os.replace(path, bak)
-    except Exception:
-        pass
-    os.replace(tmp, path)
-
-
-# ========= ПУБЛИЧНЫЕ ХЕЛПЕРЫ ДЛЯ ЛОКАЛЬНОГО КЭША =========
-
-def load_local_insights(aid: str) -> dict:
-    path = _insights_path(aid)
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-
-def save_local_insights(aid: str, data: dict):
-    path = _insights_path(aid)
-    _atomic_write_json(path, data)
-
-
-# ========= ОБРАБОТКА ACTIONS И СВОДНЫХ МЕТРИК =========
-
-def extract_actions(row: dict) -> dict:
-    res: dict[str, float] = {}
-    actions = row.get("actions") or []
-    for a in actions:
-        at = a.get("action_type")
-        if not at:
-            continue
-        try:
-            v = float(a.get("value", 0) or 0)
-        except Exception:
-            v = 0.0
-        res[at] = res.get(at, 0.0) + v
-    return res
-
-
-def _extract_leads(acts: dict) -> int:
-    keys = [
-        "Website Submit Applications",
-        "offsite_conversion.fb_pixel_submit_application",
-        "offsite_conversion.fb_pixel_lead",
-        "lead",
-    ]
-    for k in keys:
-        v = acts.get(k)
-        if v:
-            try:
-                return int(v)
-            except Exception:
-                return 0
-    return 0
-
-
-def _blend_totals(row: dict):
-    try:
-        spend = float(row.get("spend", 0) or 0)
-    except Exception:
-        spend = 0.0
-
-    acts = extract_actions(row)
-
-    msgs = int(
-        acts.get("onsite_conversion.messaging_conversation_started_7d", 0) or 0
+def _iter_days_for_mode(mode: str) -> List[datetime]:
+    """
+    mode: "7" | "14" | "month"
+    Возвращает список дат (datetime) ДЛЯ ПРОШЕДШИХ дней
+    (с вчерашнего назад до нужного количества).
+    """
+    now = datetime.now(ALMATY_TZ)
+    yesterday = (now - timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0
     )
-    leads = _extract_leads(acts)
 
-    total = msgs + leads
-    blended = (spend / total) if total > 0 else None
-
-    return spend, msgs, leads, total, blended
-
-
-# ========= ВСПОМОГАТЕЛЬНОЕ ДЛЯ ПЕРИОДОВ =========
-
-def _date_range_for_mode(mode: str):
-    now = datetime.now(ALMATY_TZ).date()
-    if mode == "7":
-        until = now - timedelta(days=1)
-        since = until - timedelta(days=6)
-    elif mode == "14":
-        until = now - timedelta(days=1)
-        since = until - timedelta(days=13)
-    else:  # "month"
-        until = now - timedelta(days=1)
-        since = until.replace(day=1)
-    return since, until
+    if mode == "14":
+        days = 14
+        return [yesterday - timedelta(days=i) for i in range(days)][::-1]
+    elif mode == "month":
+        first_of_month = yesterday.replace(day=1)
+        days_delta = (yesterday - first_of_month).days + 1
+        return [first_of_month + timedelta(days=i) for i in range(days_delta)]
+    else:
+        # по умолчанию 7 дней
+        days = 7
+        return [yesterday - timedelta(days=i) for i in range(days)][::-1]
 
 
-def _heat_emoji(cpa: float | None) -> str:
-    if cpa is None:
-        return "⚪️"
-    if cpa <= 2:
-        return "🟢"
-    if cpa <= 4:
-        return "🟡"
-    return "🔴"
-
-
-def _cpa_bar(cpa: float | None) -> str:
+def _load_daily_totals_for_account(
+    aid: str, mode: str
+) -> List[Dict[str, Optional[float]]]:
     """
-    4-ступенчатый индикатор:
-    ⬜ — нет заявок / нет CPA
-    ▢ — дорогой
-    ▦ — средний
-    ▩ — дешёвый
+    Для каждого дня периода вытаскивает кэш отчёта по аккаунту
+    и парсит из него:
+    - messages
+    - leads
+    - total_conversions (💬+📩)
+    - spend
     """
-    if cpa is None:
+    days = _iter_days_for_mode(mode)
+    result: List[Dict[str, Optional[float]]] = []
+
+    for day in days:
+        period, label = _build_day_period(day)
+        try:
+            txt = get_cached_report(aid, period, label)
+        except Exception:
+            txt = None
+
+        if not txt:
+            result.append(
+                {
+                    "date": day,
+                    "messages": 0,
+                    "leads": 0,
+                    "total_conversions": 0,
+                    "spend": 0.0,
+                }
+            )
+            continue
+
+        totals = _parse_totals_from_report_text(txt) or {}
+        result.append(
+            {
+                "date": day,
+                "messages": int(totals.get("messages") or 0),
+                "leads": int(totals.get("leads") or 0),
+                "total_conversions": int(totals.get("total_conversions") or 0),
+                "spend": float(totals.get("spend") or 0.0),
+            }
+        )
+
+    return result
+
+
+def _heat_symbol(
+    convs: int,
+    max_convs: int,
+) -> str:
+    """
+    4 стадии «теплоты» + пустой квадрат при 0:
+    0      -> ⬜
+    >0..25%   -> ▢
+    >25..50%  -> ▤
+    >50..75%  -> ▦
+    >75..100% -> ▩
+    """
+    if max_convs <= 0:
         return "⬜"
-    if cpa > 4:
+    if convs <= 0:
+        return "⬜"
+
+    ratio = convs / max_convs
+
+    if ratio <= 0.25:
         return "▢"
-    if cpa > 2:
+    elif ratio <= 0.50:
+        return "▤"
+    elif ratio <= 0.75:
         return "▦"
-    return "▩"
+    else:
+        return "▩"
 
 
-# ========= ТЕПЛОВАЯ КАРТА АДСЕТОВ =========
+def _mode_label(mode: str) -> str:
+    if mode == "14":
+        return "последние 14 дней"
+    if mode == "month":
+        return "текущий месяц"
+    return "последние 7 дней"
+
 
 def build_heatmap_for_account(
     aid: str,
     get_account_name,
     mode: str = "7",
-    period: dict | None = None,
 ) -> str:
     """
-    mode: "7" | "14" | "month"
-    или period={"since": "YYYY-MM-DD", "until": "YYYY-MM-DD"} для кастомного диапазона.
+    Строит «тепловую карту» по дням для аккаунта:
+    - берёт дневные отчёты из кэша
+    - парсит заявки (💬+📩)
+    - отображает интенсивность по 4 уровням
+    - показывает средние заявки в день
     """
-    if period is not None:
-        from datetime import date
-        try:
-            since = datetime.strptime(period["since"], "%Y-%m-%d").date()
-            until = datetime.strptime(period["until"], "%Y-%m-%d").date()
-        except Exception:
-            since, until = _date_range_for_mode("7")
-    else:
-        since, until = _date_range_for_mode(mode)
+    acc_name = get_account_name(aid)
+    mode_label = _mode_label(mode)
 
-    acc = AdAccount(aid)
-    params = {
-        "level": "adset",
-        "time_range": {
-            "since": since.strftime("%Y-%m-%d"),
-            "until": until.strftime("%Y-%m-%d"),
-        },
-    }
-    fields = [
-        "adset_id",
-        "adset_name",
-        "impressions",
-        "clicks",
-        "spend",
-        "actions",
-    ]
+    daily = _load_daily_totals_for_account(aid, mode)
 
-    try:
-        data = acc.get_insights(fields=fields, params=params)
-    except Exception as e:
-        return (
-            f"⚠️ Ошибка при получении данных для {get_account_name(aid)}:\n"
-            f"{e}"
-        )
+    if not daily:
+        return f"🔥 Тепловая карта — {acc_name}\nЗа период ({mode_label}) нет данных."
 
-    if not data:
-        return (
-            f"По {get_account_name(aid)} нет данных по адсетам "
-            f"за {since.strftime('%d.%m')}–{until.strftime('%d.%m')}"
-        )
+    max_convs = max(d["total_conversions"] for d in daily) or 0
+    total_convs_all = sum(d["total_conversions"] for d in daily)
+    total_msgs_all = sum(d["messages"] for d in daily)
+    total_leads_all = sum(d["leads"] for d in daily)
+    total_spend_all = sum(d["spend"] for d in daily)
 
-    agg: dict[str, dict] = {}
+    days_with_data = len([d for d in daily if d["total_conversions"] > 0])
+    avg_convs = (
+        total_convs_all / days_with_data if days_with_data > 0 else 0.0
+    )
 
-    for row in data:
-        ad_id = row.get("adset_id") or "unknown"
-        ad_name = row.get("adset_name") or ad_id
+    lines: List[str] = []
 
-        spend, msgs, leads, total, blended = _blend_totals(row)
-        impr = int(row.get("impressions", 0) or 0)
-        clicks = int(row.get("clicks", 0) or 0)
+    lines.append(f"🔥 Тепловая карта заявок (💬+📩) — {acc_name}")
+    lines.append(f"Период: {mode_label}")
+    lines.append("")
 
-        slot = agg.setdefault(
-            ad_id,
-            {
-                "id": ad_id,
-                "name": ad_name,
-                "spend": 0.0,
-                "impr": 0,
-                "clicks": 0,
-                "msgs": 0,
-                "leads": 0,
-                "total": 0,
-            },
-        )
-        slot["spend"] += spend
-        slot["impr"] += impr
-        slot["clicks"] += clicks
-        slot["msgs"] += msgs
-        slot["leads"] += leads
-        slot["total"] += total
-
-    items = list(agg.values())
-    for it in items:
-        if it["total"] > 0:
-            it["cpa"] = it["spend"] / it["total"]
-        else:
-            it["cpa"] = None
-
-    items.sort(key=lambda x: x["spend"], reverse=True)
-    items = items[:15]
-
-    header = [
-        "🔥 <b>Тепловая карта по адсетам</b>",
-        f"Аккаунт: <b>{get_account_name(aid)}</b>",
-        f"Период: {since.strftime('%d.%m.%Y')}–{until.strftime('%d.%m.%Y')}",
-        "",
-        "Чем ближе к 🟢 — тем дешевле заявка (по сумме переписок+лидов).",
-        "",
-    ]
-
-    lines: list[str] = header
-
-    if not items:
-        lines.append("Нет активных адсетов за выбранный период.")
+    if total_convs_all == 0:
+        lines.append("За выбранный период нет заявок (💬+📩).")
         return "\n".join(lines)
 
-    for it in items:
-        cpa = it["cpa"]
-        emoji = _heat_emoji(cpa)
-        bar = _cpa_bar(cpa)
+    lines.append(
+        f"Итого за период: {total_convs_all} заявок "
+        f"(💬 {total_msgs_all} + ♿️ {total_leads_all}), "
+        f"затраты: {total_spend_all:.2f} $"
+    )
+    if days_with_data > 0:
+        lines.append(f"Среднее заявок в день (по дням с трафиком): {avg_convs:.2f}")
+    lines.append("")
 
-        if cpa is None:
-            cpa_txt = "—"
-        else:
-            cpa_txt = f"{cpa:.2f} $"
+    header = "Дата       Инт.  Заявки  💬   ♿️   💵"
+    lines.append(header)
+    lines.append("-" * len(header))
 
-        line = (
-            f"{emoji} <b>{it['name']}</b>\n"
-            f"   💵 {it['spend']:.2f} $  |  👁 {it['impr']}  |  🖱 {it['clicks']}\n"
-            f"   💬 {it['msgs']}  |  📩 {it['leads']}  |  🧮 {it['total']}  |  🎯 CPA: {cpa_txt}\n"
-            f"   ▪️ Индикатор: {bar}"
+    for row in daily:
+        day = row["date"]
+        convs = row["total_conversions"]
+        msgs = row["messages"]
+        leads = row["leads"]
+        spend = row["spend"]
+
+        symbol = _heat_symbol(convs, max_convs)
+        date_str = day.strftime("%d.%m")
+
+        lines.append(
+            f"{date_str:<10} {symbol}   {convs:>3}   {msgs:>3}  {leads:>3}  {spend:>6.2f} $"
         )
-        lines.append(line)
 
-    return "\n\n".join(lines)
+    lines.append("")
+    lines.append("Легенда интенсивности:")
+    lines.append("⬜ — нет заявок")
+    lines.append("▢ — низкая активность")
+    lines.append("▤ — средняя активность")
+    lines.append("▦ — высокая активность")
+    lines.append("▩ — пиковая активность")
+
+    return "\n".join(lines)
