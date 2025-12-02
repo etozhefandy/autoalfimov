@@ -88,7 +88,7 @@ def main_menu() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("Биллинг", callback_data="billing")],
             [
                 InlineKeyboardButton(
-                    "Отчёт индивидуальный", callback_data="rep_individual_menu"
+                    "Отчёт по аккаунту", callback_data="choose_acc_report"
                 )
             ],
             [InlineKeyboardButton("Тепловая карта", callback_data="hm_menu")],
@@ -127,24 +127,6 @@ def all_reports_menu() -> InlineKeyboardMarkup:
     )
 
 
-def individual_reports_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "Отчёт по аккаунту", callback_data="choose_acc_report"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "Отчёт по адсетам", callback_data="adsets_menu"
-                )
-            ],
-            [InlineKeyboardButton("⬅️ В меню", callback_data="menu")],
-        ]
-    )
-
-
 def heatmap_menu(aid: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
@@ -178,7 +160,9 @@ def accounts_kb(prefix: str) -> InlineKeyboardMarkup:
     store = load_accounts()
     if store:
         enabled_ids = [aid for aid, row in store.items() if row.get("enabled", True)]
-        disabled_ids = [aid for aid, row in store.items() if not row.get("enabled", True)]
+        disabled_ids = [
+            aid for aid, row in store.items() if not row.get("enabled", True)
+        ]
         ids = enabled_ids + disabled_ids
     else:
         from .constants import AD_ACCOUNTS_FALLBACK
@@ -565,13 +549,6 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("Выберите период:", reply_markup=all_reports_menu())
         return
 
-    if data == "rep_individual_menu":
-        await q.edit_message_text(
-            "Выберите тип индивидуального отчёта:",
-            reply_markup=individual_reports_menu(),
-        )
-        return
-
     if data == "adsets_menu":
         await q.edit_message_text(
             "Выберите аккаунт для отчёта по адсетам:",
@@ -630,19 +607,19 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("hm7|"):
         aid = data.split("|")[1]
-        heat = build_heatmap_for_account(aid, get_account_name, mode="7")
+        heat = build_heatmap_for_account(aid, get_account_name, get_cached_report, mode="7")
         await q.edit_message_text(heat, parse_mode="HTML")
         return
 
     if data.startswith("hm14|"):
         aid = data.split("|")[1]
-        heat = build_heatmap_for_account(aid, get_account_name, mode="14")
+        heat = build_heatmap_for_account(aid, get_account_name, get_cached_report, mode="14")
         await q.edit_message_text(heat, parse_mode="HTML")
         return
 
     if data.startswith("hmmonth|"):
         aid = data.split("|")[1]
-        heat = build_heatmap_for_account(aid, get_account_name, mode="month")
+        heat = build_heatmap_for_account(aid, get_account_name, get_cached_report, mode="month")
         await q.edit_message_text(heat, parse_mode="HTML")
         return
 
@@ -651,12 +628,10 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Что показать по биллингу?", reply_markup=billing_menu()
         )
         return
-
     if data == "billing_current":
         await q.edit_message_text("📋 Биллинги (неактивные аккаунты):")
         await send_billing(context, chat_id)
         return
-
     if data == "billing_forecast":
         await q.edit_message_text("🔮 Считаю прогноз списаний…")
         await send_billing_forecast(context, chat_id)
@@ -712,7 +687,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("one_today|"):
         aid = data.split("|", 1)[1]
-        label = datetime.now(ALMATY_TZ).strftime("%d.%m.%Y")
+        label = datetime.now(ALMATY_TZ).strftime("%d.%м.%Y")
         await q.edit_message_text(
             f"Отчёт по {get_account_name(aid)} за {label}:"
         )
@@ -798,8 +773,8 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "since": since2.strftime("%Y-%m-%d"),
             "until": until2.strftime("%Y-%m-%d"),
         }
-        label1 = f"{since1.strftime('%d.%м')}-{until1.strftime('%d.%м')}"
-        label2 = f"{since2.strftime('%d.%м')}-{until2.strftime('%d.%м')}"
+        label1 = f"{since1.strftime('%d.%m')}-{until1.strftime('%d.%m')}"
+        label2 = f"{since2.strftime('%d.%m')}-{until2.strftime('%d.%m')}"
         await q.edit_message_text(f"Сравниваю {label1} vs {label2}…")
         txt = build_comparison_report(aid, period1, label1, period2, label2)
         await context.bot.send_message(chat_id, txt, parse_mode="HTML")
@@ -1024,7 +999,7 @@ def build_app() -> Application:
 
     app.job_queue.run_daily(
         billing_digest_job,
-        time=time(hour=9, minute=31, tzinfo=ALMATY_TZ),
+        time=time(hour=9, minute=0, tzinfo=ALMATY_TZ),
     )
 
     schedule_cpa_alerts(app)
