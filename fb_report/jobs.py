@@ -56,23 +56,18 @@ def _parse_totals_from_report_text(txt: str):
     leads = 0
     spend = 0.0
 
-    msg_pattern = re.compile(r"💬[^0-9]*?(\d+)")
-    lead_pattern = re.compile(r"[📩♿️][^0-9]*?(\d+)")
+    msg_pattern = re.compile(r"[💬✉️][^0-9]*?(\d+)")
+    lead_pattern = re.compile(r"[♿️📩][^0-9]*?(\d+)")
     spend_pattern = re.compile(r"💵[^0-9]*?([0-9]+[.,]?[0-9]*)")
+    total_pattern = re.compile(r"Итого[^0-9]*?([0-9]+)\s+заяв", re.IGNORECASE)
 
+    total_convs = 0
     for line in txt.splitlines():
         if "Итого" in line:
-            m_msg = msg_pattern.search(line)
-            if m_msg:
+            m_total = total_pattern.search(line)
+            if m_total:
                 try:
-                    messages = int(m_msg.group(1))
-                except Exception:
-                    pass
-
-            m_lead = lead_pattern.search(line)
-            if m_lead:
-                try:
-                    leads = int(m_lead.group(1))
+                    total_convs = int(m_total.group(1))
                 except Exception:
                     pass
 
@@ -83,10 +78,11 @@ def _parse_totals_from_report_text(txt: str):
                 except Exception:
                     pass
 
-    if messages == 0 and leads == 0:
+    if total_convs == 0:
         total_msg = 0
         total_leads = 0
         total_spend = 0.0
+
         for line in txt.splitlines():
             m_msg = msg_pattern.search(line)
             if m_msg:
@@ -105,15 +101,38 @@ def _parse_totals_from_report_text(txt: str):
             m_spend = spend_pattern.search(line)
             if m_spend:
                 try:
-                    total_spend += float(m_spend.group(1).replace(",", "."))
+                    total_spend = float(m_spend.group(1).replace(",", "."))
                 except Exception:
                     pass
 
-        messages = messages or total_msg
-        leads = leads or total_leads
+        messages = total_msg
+        leads = total_leads
         spend = spend or total_spend
+        total_convs = messages + leads
+    else:
+        for line in txt.splitlines():
+            m_msg = msg_pattern.search(line)
+            if m_msg:
+                try:
+                    messages += int(m_msg.group(1))
+                except Exception:
+                    pass
 
-    total_convs = messages + leads
+            m_lead = lead_pattern.search(line)
+            if m_lead:
+                try:
+                    leads += int(m_lead.group(1))
+                except Exception:
+                    pass
+
+            if spend == 0.0:
+                m_spend = spend_pattern.search(line)
+                if m_spend:
+                    try:
+                        spend = float(m_spend.group(1).replace(",", "."))
+                    except Exception:
+                        pass
+
     cpa = None
     if total_convs > 0 and spend > 0:
         cpa = spend / total_convs
@@ -158,9 +177,6 @@ async def _cpa_alerts_job(context: ContextTypes.DEFAULT_TYPE):
         if not cpa or total_convs == 0 or spend == 0:
             continue
 
-        if cpa <= target_cpl:
-            continue
-
         acc_name = get_account_name(aid)
 
         header = f"⚠️ {acc_name} — Итого (💬+📩)"
@@ -176,7 +192,7 @@ async def _cpa_alerts_job(context: ContextTypes.DEFAULT_TYPE):
 
         try:
             await context.bot.send_message(chat_id, text)
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(1.0)
         except Exception:
             continue
 
