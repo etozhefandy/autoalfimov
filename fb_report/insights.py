@@ -6,16 +6,11 @@ from typing import Dict, List, Tuple, Optional, Any
 from .constants import ALMATY_TZ
 
 
-# ============================================================
-# ЗАГЛУШКИ ДЛЯ СТАРОГО КОДА reporting.py
-# (чтобы не было ошибок circular import)
-# ============================================================
 def load_local_insights(
     aid: str,
     period: Dict[str, str],
     label: str,
 ) -> Optional[Dict[str, Any]]:
-    """Раньше инсайты сохранялись локально — сейчас отключено."""
     return None
 
 
@@ -25,13 +20,13 @@ def save_local_insights(
     label: str,
     data: Dict[str, Any],
 ):
-    """Старый API сохранения инсайтов — сейчас игнорируем."""
     return None
 
 
-# ============================================================
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-# ============================================================
+def extract_actions(insights: Optional[Dict[str, Any]]) -> List[str]:
+    return []
+
+
 def _build_day_period(day: datetime) -> Tuple[Dict[str, str], str]:
     day = day.replace(hour=0, minute=0, second=0, microsecond=0)
     period = {
@@ -62,12 +57,11 @@ def _load_daily_totals_for_account(
     aid: str,
     mode: str,
 ) -> List[Dict[str, Optional[float]]]:
-
     from .reporting import get_cached_report
     from .jobs import _parse_totals_from_report_text
 
     days = _iter_days_for_mode(mode)
-    result = []
+    result: List[Dict[str, Optional[float]]] = []
 
     for day in days:
         period, label = _build_day_period(day)
@@ -118,10 +112,11 @@ def _heat_symbol(convs: int, max_convs: int) -> str:
 
 
 def _mode_label(mode: str) -> str:
-    return {
-        "14": "последние 14 дней",
-        "month": "текущий месяц",
-    }.get(mode, "последние 7 дней")
+    if mode == "14":
+        return "последние 14 дней"
+    if mode == "month":
+        return "текущий месяц"
+    return "последние 7 дней"
 
 
 def build_heatmap_for_account(
@@ -129,7 +124,6 @@ def build_heatmap_for_account(
     get_account_name,
     mode: str = "7",
 ) -> str:
-
     acc_name = get_account_name(aid)
     mode_label = _mode_label(mode)
 
@@ -147,15 +141,24 @@ def build_heatmap_for_account(
     valid_days = len([d for d in daily if d["total_conversions"] > 0])
     avg_daily = total_convs / valid_days if valid_days else 0
 
-    lines = []
-    lines.append(f"🔥 Тепловая карта заявок — {acc_name}")
+    lines: List[str] = []
+    lines.append(f"🔥 Тепловая карта заявок (💬+📩) — {acc_name}")
     lines.append(f"Период: {mode_label}")
     lines.append("")
-    lines.append(f"Итого: {total_convs} заявок (💬 {total_msgs} + ♿️ {total_leads}), затраты {total_spend:.2f} $")
-    lines.append(f"Среднее/день: {avg_daily:.2f}")
+    if total_convs == 0:
+        lines.append("За выбранный период нет заявок (💬+📩).")
+        return "\n".join(lines)
+
+    lines.append(
+        f"Итого: {total_convs} заявок "
+        f"(💬 {total_msgs} + ♿️ {total_leads}), "
+        f"затраты {total_spend:.2f} $"
+    )
+    lines.append(f"Среднее заявок/день (по дням с трафиком): {avg_daily:.2f}")
     lines.append("")
-    lines.append("Дата       Инт.  Заявки  💬   ♿️   💵")
-    lines.append("---------------------------------------")
+    header = "Дата       Инт.  Заявки  💬   ♿️   💵"
+    lines.append(header)
+    lines.append("-" * len(header))
 
     for row in daily:
         d = row["date"].strftime("%d.%m")
