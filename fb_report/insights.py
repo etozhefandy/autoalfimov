@@ -1,9 +1,21 @@
 # fb_report/insights.py
 
 from datetime import datetime, timedelta
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Any
 
 from .constants import ALMATY_TZ
+
+
+def load_local_insights(
+    aid: str,
+    period: Dict[str, str],
+    label: str,
+) -> Optional[Dict[str, Any]]:
+    """
+    Заглушка для старого импорта из reporting.py.
+    Локальные инсайты сейчас не используем, поэтому всегда None.
+    """
+    return None
 
 
 def _build_day_period(day: datetime) -> Tuple[Dict[str, str], str]:
@@ -159,7 +171,7 @@ def build_heatmap_for_account(
         spend = row["spend"]
 
         symbol = _heat_symbol(convs, max_convs)
-        date_str = day.strftime("%d.%m")
+        date_str = day.strftime("%d.%м")
 
         lines.append(
             f"{date_str:<10} {symbol}   {convs:>3}   {msgs:>3}  {leads:>3}  {spend:>6.2f} $"
