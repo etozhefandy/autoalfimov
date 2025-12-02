@@ -52,94 +52,64 @@ async def daily_report_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 def _parse_totals_from_report_text(txt: str):
-    messages = 0
-    leads = 0
+    """
+    Парсим ОДИН текстовый отчёт по аккаунту и вытаскиваем:
+    - messages (✉️ / 💬)
+    - leads (📩 / ♿️)
+    - total_conversions (из строки 'Итого: N заявок', если есть)
+    - spend (💵)
+    """
+    total_messages = 0
+    total_leads = 0
     spend = 0.0
+    total_from_line = None
 
-    msg_pattern = re.compile(r"[💬✉️][^0-9]*?(\d+)")
-    lead_pattern = re.compile(r"[♿️📩][^0-9]*?(\d+)")
+    msg_pattern = re.compile(r"(?:💬|✉️)[^0-9]*?(\d+)")
+    lead_pattern = re.compile(r"(?:📩|♿️)[^0-9]*?(\d+)")
     spend_pattern = re.compile(r"💵[^0-9]*?([0-9]+[.,]?[0-9]*)")
-    total_pattern = re.compile(r"Итого[^0-9]*?([0-9]+)\s+заяв", re.IGNORECASE)
+    total_pattern = re.compile(r"Итого:\s*([0-9]+)\s+заяв", re.IGNORECASE)
 
-    total_convs = 0
     for line in txt.splitlines():
-        if "Итого" in line:
-            m_total = total_pattern.search(line)
-            if m_total:
-                try:
-                    total_convs = int(m_total.group(1))
-                except Exception:
-                    pass
+        m_msg = msg_pattern.search(line)
+        if m_msg:
+            try:
+                total_messages += int(m_msg.group(1))
+            except Exception:
+                pass
 
-            m_spend = spend_pattern.search(line)
-            if m_spend:
-                try:
-                    spend = float(m_spend.group(1).replace(",", "."))
-                except Exception:
-                    pass
+        m_lead = lead_pattern.search(line)
+        if m_lead:
+            try:
+                total_leads += int(m_lead.group(1))
+            except Exception:
+                pass
 
-    if total_convs == 0:
-        total_msg = 0
-        total_leads = 0
-        total_spend = 0.0
+        m_spend = spend_pattern.search(line)
+        if m_spend:
+            try:
+                spend = float(m_spend.group(1).replace(",", "."))
+            except Exception:
+                pass
 
-        for line in txt.splitlines():
-            m_msg = msg_pattern.search(line)
-            if m_msg:
-                try:
-                    total_msg += int(m_msg.group(1))
-                except Exception:
-                    pass
+        m_total = total_pattern.search(line)
+        if m_total:
+            try:
+                total_from_line = int(m_total.group(1))
+            except Exception:
+                pass
 
-            m_lead = lead_pattern.search(line)
-            if m_lead:
-                try:
-                    total_leads += int(m_lead.group(1))
-                except Exception:
-                    pass
+    total_convs = total_messages + total_leads
 
-            m_spend = spend_pattern.search(line)
-            if m_spend:
-                try:
-                    total_spend = float(m_spend.group(1).replace(",", "."))
-                except Exception:
-                    pass
-
-        messages = total_msg
-        leads = total_leads
-        spend = spend or total_spend
-        total_convs = messages + leads
-    else:
-        for line in txt.splitlines():
-            m_msg = msg_pattern.search(line)
-            if m_msg:
-                try:
-                    messages += int(m_msg.group(1))
-                except Exception:
-                    pass
-
-            m_lead = lead_pattern.search(line)
-            if m_lead:
-                try:
-                    leads += int(m_lead.group(1))
-                except Exception:
-                    pass
-
-            if spend == 0.0:
-                m_spend = spend_pattern.search(line)
-                if m_spend:
-                    try:
-                        spend = float(m_spend.group(1).replace(",", "."))
-                    except Exception:
-                        pass
+    if total_from_line is not None and total_from_line > 0:
+        total_convs = total_from_line
 
     cpa = None
     if total_convs > 0 and spend > 0:
         cpa = spend / total_convs
 
     return {
-        "messages": messages,
-        "leads": leads,
+        "messages": total_messages,
+        "leads": total_leads,
         "total_conversions": total_convs,
         "spend": spend,
         "cpa": cpa,
