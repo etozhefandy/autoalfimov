@@ -4,12 +4,9 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional
 
 from .constants import ALMATY_TZ
-from .reporting import get_cached_report
-from .jobs import _parse_totals_from_report_text
 
 
 def _build_day_period(day: datetime) -> Tuple[Dict[str, str], str]:
-    """Формирует period/label для одного дня (как в дневном отчёте)."""
     day = day.replace(hour=0, minute=0, second=0, microsecond=0)
     period = {
         "since": day.strftime("%Y-%m-%d"),
@@ -20,11 +17,6 @@ def _build_day_period(day: datetime) -> Tuple[Dict[str, str], str]:
 
 
 def _iter_days_for_mode(mode: str) -> List[datetime]:
-    """
-    mode: "7" | "14" | "month"
-    Возвращает список дат (datetime) ДЛЯ ПРОШЕДШИХ дней
-    (с вчерашнего назад до нужного количества).
-    """
     now = datetime.now(ALMATY_TZ)
     yesterday = (now - timedelta(days=1)).replace(
         hour=0, minute=0, second=0, microsecond=0
@@ -38,22 +30,17 @@ def _iter_days_for_mode(mode: str) -> List[datetime]:
         days_delta = (yesterday - first_of_month).days + 1
         return [first_of_month + timedelta(days=i) for i in range(days_delta)]
     else:
-        # по умолчанию 7 дней
         days = 7
         return [yesterday - timedelta(days=i) for i in range(days)][::-1]
 
 
 def _load_daily_totals_for_account(
-    aid: str, mode: str
+    aid: str,
+    mode: str,
 ) -> List[Dict[str, Optional[float]]]:
-    """
-    Для каждого дня периода вытаскивает кэш отчёта по аккаунту
-    и парсит из него:
-    - messages
-    - leads
-    - total_conversions (💬+📩)
-    - spend
-    """
+    from .reporting import get_cached_report
+    from .jobs import _parse_totals_from_report_text
+
     days = _iter_days_for_mode(mode)
     result: List[Dict[str, Optional[float]]] = []
 
@@ -94,14 +81,6 @@ def _heat_symbol(
     convs: int,
     max_convs: int,
 ) -> str:
-    """
-    4 стадии «теплоты» + пустой квадрат при 0:
-    0      -> ⬜
-    >0..25%   -> ▢
-    >25..50%  -> ▤
-    >50..75%  -> ▦
-    >75..100% -> ▩
-    """
     if max_convs <= 0:
         return "⬜"
     if convs <= 0:
@@ -132,13 +111,6 @@ def build_heatmap_for_account(
     get_account_name,
     mode: str = "7",
 ) -> str:
-    """
-    Строит «тепловую карту» по дням для аккаунта:
-    - берёт дневные отчёты из кэша
-    - парсит заявки (💬+📩)
-    - отображает интенсивность по 4 уровням
-    - показывает средние заявки в день
-    """
     acc_name = get_account_name(aid)
     mode_label = _mode_label(mode)
 
@@ -154,9 +126,7 @@ def build_heatmap_for_account(
     total_spend_all = sum(d["spend"] for d in daily)
 
     days_with_data = len([d for d in daily if d["total_conversions"] > 0])
-    avg_convs = (
-        total_convs_all / days_with_data if days_with_data > 0 else 0.0
-    )
+    avg_convs = total_convs_all / days_with_data if days_with_data > 0 else 0.0
 
     lines: List[str] = []
 
