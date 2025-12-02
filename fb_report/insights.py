@@ -6,18 +6,32 @@ from typing import Dict, List, Tuple, Optional, Any
 from .constants import ALMATY_TZ
 
 
+# ============================================================
+# ЗАГЛУШКИ ДЛЯ СТАРОГО КОДА reporting.py
+# (чтобы не было ошибок circular import)
+# ============================================================
 def load_local_insights(
     aid: str,
     period: Dict[str, str],
     label: str,
 ) -> Optional[Dict[str, Any]]:
-    """
-    Заглушка для старого импорта из reporting.py.
-    Локальные инсайты сейчас не используем, поэтому всегда None.
-    """
+    """Раньше инсайты сохранялись локально — сейчас отключено."""
     return None
 
 
+def save_local_insights(
+    aid: str,
+    period: Dict[str, str],
+    label: str,
+    data: Dict[str, Any],
+):
+    """Старый API сохранения инсайтов — сейчас игнорируем."""
+    return None
+
+
+# ============================================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ============================================================
 def _build_day_period(day: datetime) -> Tuple[Dict[str, str], str]:
     day = day.replace(hour=0, minute=0, second=0, microsecond=0)
     period = {
@@ -35,26 +49,25 @@ def _iter_days_for_mode(mode: str) -> List[datetime]:
     )
 
     if mode == "14":
-        days = 14
-        return [yesterday - timedelta(days=i) for i in range(days)][::-1]
+        return [yesterday - timedelta(days=i) for i in range(14)][::-1]
     elif mode == "month":
-        first_of_month = yesterday.replace(day=1)
-        days_delta = (yesterday - first_of_month).days + 1
-        return [first_of_month + timedelta(days=i) for i in range(days_delta)]
+        first = yesterday.replace(day=1)
+        count = (yesterday - first).days + 1
+        return [first + timedelta(days=i) for i in range(count)]
     else:
-        days = 7
-        return [yesterday - timedelta(days=i) for i in range(days)][::-1]
+        return [yesterday - timedelta(days=i) for i in range(7)][::-1]
 
 
 def _load_daily_totals_for_account(
     aid: str,
     mode: str,
 ) -> List[Dict[str, Optional[float]]]:
+
     from .reporting import get_cached_report
     from .jobs import _parse_totals_from_report_text
 
     days = _iter_days_for_mode(mode)
-    result: List[Dict[str, Optional[float]]] = []
+    result = []
 
     for day in days:
         period, label = _build_day_period(day)
@@ -89,33 +102,26 @@ def _load_daily_totals_for_account(
     return result
 
 
-def _heat_symbol(
-    convs: int,
-    max_convs: int,
-) -> str:
-    if max_convs <= 0:
-        return "⬜"
-    if convs <= 0:
+def _heat_symbol(convs: int, max_convs: int) -> str:
+    if max_convs <= 0 or convs <= 0:
         return "⬜"
 
-    ratio = convs / max_convs
+    r = convs / max_convs
 
-    if ratio <= 0.25:
+    if r <= 0.25:
         return "▢"
-    elif ratio <= 0.50:
+    elif r <= 0.50:
         return "▤"
-    elif ratio <= 0.75:
+    elif r <= 0.75:
         return "▦"
-    else:
-        return "▩"
+    return "▩"
 
 
 def _mode_label(mode: str) -> str:
-    if mode == "14":
-        return "последние 14 дней"
-    if mode == "month":
-        return "текущий месяц"
-    return "последние 7 дней"
+    return {
+        "14": "последние 14 дней",
+        "month": "текущий месяц",
+    }.get(mode, "последние 7 дней")
 
 
 def build_heatmap_for_account(
@@ -123,66 +129,48 @@ def build_heatmap_for_account(
     get_account_name,
     mode: str = "7",
 ) -> str:
+
     acc_name = get_account_name(aid)
     mode_label = _mode_label(mode)
 
     daily = _load_daily_totals_for_account(aid, mode)
 
     if not daily:
-        return f"🔥 Тепловая карта — {acc_name}\nЗа период ({mode_label}) нет данных."
+        return f"🔥 Тепловая карта — {acc_name}\n(нет данных)"
 
     max_convs = max(d["total_conversions"] for d in daily) or 0
-    total_convs_all = sum(d["total_conversions"] for d in daily)
-    total_msgs_all = sum(d["messages"] for d in daily)
-    total_leads_all = sum(d["leads"] for d in daily)
-    total_spend_all = sum(d["spend"] for d in daily)
+    total_msgs = sum(d["messages"] for d in daily)
+    total_leads = sum(d["leads"] for d in daily)
+    total_convs = sum(d["total_conversions"] for d in daily)
+    total_spend = sum(d["spend"] for d in daily)
 
-    days_with_data = len([d for d in daily if d["total_conversions"] > 0])
-    avg_convs = total_convs_all / days_with_data if days_with_data > 0 else 0.0
+    valid_days = len([d for d in daily if d["total_conversions"] > 0])
+    avg_daily = total_convs / valid_days if valid_days else 0
 
-    lines: List[str] = []
-
-    lines.append(f"🔥 Тепловая карта заявок (💬+📩) — {acc_name}")
+    lines = []
+    lines.append(f"🔥 Тепловая карта заявок — {acc_name}")
     lines.append(f"Период: {mode_label}")
     lines.append("")
-
-    if total_convs_all == 0:
-        lines.append("За выбранный период нет заявок (💬+📩).")
-        return "\n".join(lines)
-
-    lines.append(
-        f"Итого за период: {total_convs_all} заявок "
-        f"(💬 {total_msgs_all} + ♿️ {total_leads_all}), "
-        f"затраты: {total_spend_all:.2f} $"
-    )
-    if days_with_data > 0:
-        lines.append(f"Среднее заявок в день (по дням с трафиком): {avg_convs:.2f}")
+    lines.append(f"Итого: {total_convs} заявок (💬 {total_msgs} + ♿️ {total_leads}), затраты {total_spend:.2f} $")
+    lines.append(f"Среднее/день: {avg_daily:.2f}")
     lines.append("")
-
-    header = "Дата       Инт.  Заявки  💬   ♿️   💵"
-    lines.append(header)
-    lines.append("-" * len(header))
+    lines.append("Дата       Инт.  Заявки  💬   ♿️   💵")
+    lines.append("---------------------------------------")
 
     for row in daily:
-        day = row["date"]
-        convs = row["total_conversions"]
-        msgs = row["messages"]
-        leads = row["leads"]
-        spend = row["spend"]
-
-        symbol = _heat_symbol(convs, max_convs)
-        date_str = day.strftime("%d.%м")
-
+        d = row["date"].strftime("%d.%m")
+        symbol = _heat_symbol(row["total_conversions"], max_convs)
         lines.append(
-            f"{date_str:<10} {symbol}   {convs:>3}   {msgs:>3}  {leads:>3}  {spend:>6.2f} $"
+            f"{d:<10} {symbol}   "
+            f"{row['total_conversions']:>3}   {row['messages']:>3}  "
+            f"{row['leads']:>3}  {row['spend']:>6.2f} $"
         )
 
     lines.append("")
-    lines.append("Легенда интенсивности:")
     lines.append("⬜ — нет заявок")
     lines.append("▢ — низкая активность")
     lines.append("▤ — средняя активность")
     lines.append("▦ — высокая активность")
-    lines.append("▩ — пиковая активность")
+    lines.append("▩ — пик")
 
     return "\n".join(lines)
