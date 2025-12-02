@@ -1,56 +1,32 @@
-# fb_report/jobs.py
+# fb_report/insights.py
 
 from datetime import datetime, timedelta
-import asyncio
+from typing import Dict, List, Tuple, Optional
 import re
 
-from telegram.ext import ContextTypes, Application
-
-from .constants import ALMATY_TZ, DEFAULT_REPORT_CHAT
-from .storage import load_accounts, get_account_name
+from .constants import ALMATY_TZ
 
 
-def _yesterday_period():
-    now = datetime.now(ALMATY_TZ)
-    until = now - timedelta(days=1)
-    since = until
-    period = {
-        "since": since.strftime("%Y-%m-%d"),
-        "until": until.strftime("%Y-%m-%d"),
-    }
-    label = until.strftime("%d.%m.%Y")
-    return period, label
+# ===== Заглушки под старый API, чтобы reporting.py не падал =====
+
+def load_local_insights(*args, **kwargs):
+    return {}
 
 
-async def full_daily_scan_job(context: ContextTypes.DEFAULT_TYPE):
-    from .reporting import send_period_report
-
-    chat_id = str(DEFAULT_REPORT_CHAT)
-    period, label = _yesterday_period()
-
-    try:
-        await send_period_report(context, chat_id, period, label)
-    except Exception as e:
-        await context.bot.send_message(
-            chat_id,
-            f"⚠️ full_daily_scan_job: ошибка скана: {e}",
-        )
+def save_local_insights(*args, **kwargs):
+    return None
 
 
-async def daily_report_job(context: ContextTypes.DEFAULT_TYPE):
-    from .reporting import send_period_report
+def extract_actions(*args, **kwargs):
+    return {}
 
-    chat_id = str(DEFAULT_REPORT_CHAT)
-    period, label = _yesterday_period()
 
-    try:
-        await send_period_report(context, chat_id, period, label)
-    except Exception as e:
-        await context.bot.send_message(
-            chat_id,
-            f"⚠️ daily_report_job: ошибка дневного отчёта: {e}",
-        )
+def _blend_totals(*args, **kwargs):
+    # если вдруг где-то вызывается, просто отдаём первый аргумент
+    return args[0] if args else {}
 
+
+# ===== Локальный парсер итогов (скопирован из jobs.py, чтобы не было импортов) =====
 
 def _parse_totals_from_report_text(txt: str):
     messages = 0
@@ -128,65 +104,178 @@ def _parse_totals_from_report_text(txt: str):
     }
 
 
-async def _cpa_alerts_job(context: ContextTypes.DEFAULT_TYPE):
-    from .reporting import get_cached_report
+# ===== Вспомогательные функции для тепловой карты =====
 
-    accounts = load_accounts() or {}
-    chat_id = str(DEFAULT_REPORT_CHAT)
+def _build_day_period(day: datetime) -> Tuple[Dict[str, str], str]:
+    day = day.replace(hour=0, minute=0, second=0, microsecond=0)
+    period = {
+        "since": day.strftime("%Y-%m-%d"),
+        "until": day.strftime("%Y-%m-%d"),
+    }
+    label = day.strftime("%d.%m.%Y")
+    return period, label
 
-    period, label = _yesterday_period()
 
-    for aid, row in accounts.items():
-        alerts = (row or {}).get("alerts") or {}
-        target_cpl = float(alerts.get("target_cpl", 0.0) or 0.0)
-        enabled = bool(alerts.get("enabled", False)) and target_cpl > 0
+def _iter_days_for_mode(mode: str) -> List[datetime]:
+    now = datetime.now(ALMATY_TZ)
+    yesterday = (now - timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
 
-        if not enabled:
-            continue
+    if mode == "14":
+        days = 14
+        return [yesterday - timedelta(days=i) for i in range(days)][::-1]
+    elif mode == "month":
+        first_of_month = yesterday.replace(day=1)
+        days_delta = (yesterday - first_of_month).days + 1
+        return [first_of_month + timedelta(days=i) for i in range(days_delta)]
+    else:
+        days = 7
+        return [yesterday - timedelta(days=i) for i in range(days)][::-1]
 
+
+def _load_daily_totals_for_account(
+    aid: str,
+    mode: str,
+    get_cached_report,
+) -> List[Dict[str, Optional[float]]]:
+    days = _iter_days_for_mode(mode)
+    result: List[Dict[str, Optional[float]]] = []
+
+    for day in days:
+        period, label = _build_day_period(day)
         try:
             txt = get_cached_report(aid, period, label)
         except Exception:
             txt = None
 
         if not txt:
+            result.append(
+                {
+                    "date": day,
+                    "messages": 0,
+                    "leads": 0,
+                    "total_conversions": 0,
+                    "spend": 0.0,
+                }
+            )
             continue
 
-        totals = _parse_totals_from_report_text(txt)
+        totals = _parse_totals_from_report_text(txt) or {}
+        result.append(
+            {
+                "date": day,
+                "messages": int(totals.get("messages") or 0),
+                "leads": int(totals.get("leads") or 0),
+                "total_conversions": int(
+                    totals.get("total_conversions") or 0
+                ),
+                "spend": float(totals.get("spend") or 0.0),
+            }
+        )
 
-        total_convs = totals["total_conversions"]
-        spend = totals["spend"]
-        cpa = totals["cpa"]
-
-        if not cpa or total_convs == 0 or spend == 0:
-            continue
-
-        if cpa <= target_cpl:
-            continue
-
-        acc_name = get_account_name(aid)
-
-        header = f"⚠️ {acc_name} — Итого (💬+📩)"
-        body_lines = [
-            f"💵 Затраты: {spend:.2f} $",
-            f"📊 Заявки (💬+📩): {total_convs}",
-            f"🎯 Таргет CPA: {target_cpl:.2f} $",
-            f"🧾 Причина: CPA {cpa:.2f}$ > таргета {target_cpl:.2f}$",
-        ]
-        body = "\n".join(body_lines)
-
-        text = f"{header}\n{body}"
-
-        try:
-            await context.bot.send_message(chat_id, text)
-            await asyncio.sleep(1.0)
-        except Exception:
-            continue
+    return result
 
 
-def schedule_cpa_alerts(app: Application):
-    app.job_queue.run_repeating(
-        _cpa_alerts_job,
-        interval=timedelta(hours=1),
-        first=timedelta(minutes=15),
+def _heat_symbol(
+    convs: int,
+    max_convs: int,
+) -> str:
+    if max_convs <= 0:
+        return "⬜"
+    if convs <= 0:
+        return "⬜"
+
+    ratio = convs / max_convs
+
+    if ratio <= 0.25:
+        return "▢"
+    elif ratio <= 0.50:
+        return "▤"
+    elif ratio <= 0.75:
+        return "▦"
+    else:
+        return "▩"
+
+
+def _mode_label(mode: str) -> str:
+    if mode == "14":
+        return "последние 14 дней"
+    if mode == "month":
+        return "текущий месяц"
+    return "последние 7 дней"
+
+
+def build_heatmap_for_account(
+    aid: str,
+    get_account_name,
+    get_cached_report,
+    mode: str = "7",
+) -> str:
+    acc_name = get_account_name(aid)
+    mode_label = _mode_label(mode)
+
+    daily = _load_daily_totals_for_account(aid, mode, get_cached_report)
+
+    if not daily:
+        return f"🔥 Тепловая карта — {acc_name}\nЗа период ({mode_label}) нет данных."
+
+    max_convs = max(d["total_conversions"] for d in daily) or 0
+    total_convs_all = sum(d["total_conversions"] for d in daily)
+    total_msgs_all = sum(d["messages"] for d in daily)
+    total_leads_all = sum(d["leads"] for d in daily)
+    total_spend_all = sum(d["spend"] for d in daily)
+
+    days_with_data = len([d for d in daily if d["total_conversions"] > 0])
+    avg_convs = (
+        total_convs_all / days_with_data if days_with_data > 0 else 0.0
     )
+
+    lines: List[str] = []
+
+    lines.append(f"🔥 Тепловая карта заявок (💬+📩) — {acc_name}")
+    lines.append(f"Период: {mode_label}")
+    lines.append("")
+
+    if total_convs_all == 0:
+        lines.append("За выбранный период нет заявок (💬+📩).")
+        return "\n".join(lines)
+
+    lines.append(
+        f"Итого за период: {total_convs_all} заявок "
+        f"(💬 {total_msgs_all} + ♿️ {total_leads_all}), "
+        f"затраты: {total_spend_all:.2f} $"
+    )
+    if days_with_data > 0:
+        lines.append(
+            f"Среднее заявок в день (по дням с трафиком): {avg_convs:.2f}"
+        )
+    lines.append("")
+
+    header = "Дата       Инт.  Заявки  💬   ♿️   💵"
+    lines.append(header)
+    lines.append("-" * len(header))
+
+    for row in daily:
+        day = row["date"]
+        convs = row["total_conversions"]
+        msgs = row["messages"]
+        leads = row["leads"]
+        spend = row["spend"]
+
+        symbol = _heat_symbol(convs, max_convs)
+        date_str = day.strftime("%d.%m")
+
+        lines.append(
+            f"{date_str:<10} {symbol}   {convs:>3}   {msgs:>3}  {leads:>3}  {spend:>6.2f} $"
+        )
+
+    lines.append("")
+    lines.append("Легенда интенсивности:")
+    lines.append("⬜ — нет заявок")
+    lines.append("▢ — низкая активность")
+    lines.append("▤ — средняя активность")
+    lines.append("▦ — высокая активность")
+    lines.append("▩ — пиковая активность")
+
+    return "\n".join(lines)
