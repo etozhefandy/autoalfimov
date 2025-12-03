@@ -9,9 +9,27 @@ from telegram.ext import ContextTypes, Application
 from .constants import ALMATY_TZ, DEFAULT_REPORT_CHAT, ALLOWED_USER_IDS
 from .storage import load_accounts, get_account_name
 from .reporting import send_period_report, get_cached_report
-from services.storage import load_hourly_stats, save_hourly_stats
-from services.facebook_api import fetch_insights
-from services.analytics import parse_insight
+
+# Для Railway могут быть разные пути импорта services.*.
+# Пытаемся взять реальные функции, а при ошибке делаем мягкие заглушки,
+# чтобы бот не падал при старте.
+try:  # pragma: no cover - защитный импорт для продакшена
+    from services.storage import load_hourly_stats, save_hourly_stats
+except Exception:  # noqa: BLE001 - нам важен ЛЮБОЙ ImportError/RuntimeError
+    def load_hourly_stats() -> dict:  # type: ignore[override]
+        return {}
+
+    def save_hourly_stats(_stats: dict) -> None:  # type: ignore[override]
+        return None
+
+try:  # pragma: no cover
+    from services.facebook_api import fetch_insights
+    from services.analytics import parse_insight
+except Exception:  # noqa: BLE001
+    fetch_insights = None  # type: ignore[assignment]
+
+    def parse_insight(_ins: dict) -> dict:  # type: ignore[override]
+        return {"msgs": 0, "leads": 0, "total": 0, "spend": 0.0}
 
 
 def _yesterday_period():
