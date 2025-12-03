@@ -1,8 +1,118 @@
-# fb_report/billing_watch.py
+"""Простой watcher биллингов.
 
-from typing import Callable, Iterable, Optional
+Логика аналогична старому скрипту:
+- каждые 10 минут опрашиваем аккаунты;
+- если account_status меняется с 1 (ACTIVE) на любое другое значение,
+  отправляем тревожное сообщение в групповой чат;
+- через ~20 минут после первого алёрта по аккаунту опрашиваем баланс ещё раз
+  и шлём уточнённую сумму.
+"""
 
-from telegram.ext import Application
+from typing import Callable, Iterable, Optional, Dict, Any
+from datetime import datetime, timedelta
+
+from facebook_business.adobjects.adaccount import AdAccount
+from telegram.ext import Application, ContextTypes
+
+from autoalfimov.fb_report.constants import ALMATY_TZ
+
+
+_last_status: Dict[str, Any] = {}
+_pending_recheck: Dict[str, Dict[str, Any]] = {}
+
+
+async def _billing_watch_job(
+    context: ContextTypes.DEFAULT_TYPE,
+    get_enabled_accounts: Callable[[], Iterable[str]],
+    get_account_name: Callable[[str], str],
+    usd_to_kzt,
+    kzt_round_up_1000,
+    group_chat_id: Optional[str],
+) -> None:
+    if not group_chat_id:
+        return
+
+    global _last_status, _pending_recheck
+
+    now = datetime.now(ALMATY_TZ)
+
+    for aid in get_enabled_accounts():
+        try:
+            acc = AdAccount(aid)
+            info = acc.api_get(fields=["name", "account_status", "balance"])
+        except Exception:
+            continue
+
+        status = info.get("account_status")
+        name = info.get("name", get_account_name(aid))
+        balance_usd = float(info.get("balance", 0) or 0) / 100.0
+
+        prev_status = _last_status.get(aid)
+        _last_status[aid] = status
+
+        # Переход из ACTIVE (1) в любой другой статус → алёрт о первичной сумме биллинга
+        if prev_status == 1 and status != 1:
+            parts = [
+                "🚨 Ахтунг!",
+                f"{name}! у нас биллинг",
+                f"Предварительная сумма: {balance_usd:.2f} $",
+            ]
+
+            if usd_to_kzt and kzt_round_up_1000:
+                try:
+                    rate = float(usd_to_kzt())
+                    kzt = kzt_round_up_1000(balance_usd * rate)
+                    parts.append(f"≈ {kzt} ₸")
+                except Exception:
+                    pass
+
+            text = " — ".join(parts)
+            await context.bot.send_message(chat_id=group_chat_id, text=text)
+
+            # Запланировать уточнение через ~20 минут
+            _pending_recheck[aid] = {
+                "at": now + timedelta(minutes=20),
+                "first_usd": balance_usd,
+                "name": name,
+            }
+
+    # Вторая фаза: уточнения
+    for aid, meta in list(_pending_recheck.items()):
+        ts = meta.get("at")
+        if not ts or now < ts:
+            continue
+
+        name = meta.get("name", get_account_name(aid))
+        first_usd = float(meta.get("first_usd", 0.0) or 0.0)
+
+        try:
+            acc = AdAccount(aid)
+            info = acc.api_get(fields=["balance"])
+            cur_usd = float(info.get("balance", 0) or 0) / 100.0
+        except Exception:
+            cur_usd = first_usd
+
+        parts = [
+            "⚠️ Внимание (уточнение по биллингу)",
+            f"{name}",
+            f"Итоговая сумма: {cur_usd:.2f} $",
+        ]
+
+        if usd_to_kzt and kzt_round_up_1000:
+            try:
+                rate = float(usd_to_kzt())
+                kzt = kzt_round_up_1000(cur_usd * rate)
+                parts.append(f"≈ {kzt} ₸")
+            except Exception:
+                pass
+
+        delta = cur_usd - first_usd
+        parts.append(f"Δ к предварительной оценке: {delta:+.2f} $")
+
+        text = " — ".join(parts)
+        await context.bot.send_message(chat_id=group_chat_id, text=text)
+
+        del _pending_recheck[aid]
 
 
 def init_billing_watch(
@@ -14,18 +124,17 @@ def init_billing_watch(
     owner_id: Optional[int] = None,
     group_chat_id: Optional[str] = None,
 ) -> None:
-    """
-    Упрощённый вариант модуля биллингового «watcher’а».
+    # Мониторинг биллингов каждые 10 минут, как в старом скрипте.
+    app.job_queue.run_repeating(
+        lambda ctx: _billing_watch_job(
+            ctx,
+            get_enabled_accounts,
+            get_account_name,
+            usd_to_kzt,
+            kzt_round_up_1000,
+            group_chat_id,
+        ),
+        interval=600,
+        first=10,
+    )
 
-    Раньше здесь была отдельная сложная логика с периодическим опросом биллингов,
-    курсами валют и т.п., которая сейчас:
-    - нам не нужна (основная логика уведомлений вынесена в billing.py);
-    - ломалась из-за того, что usd_to_kzt мог быть None.
-
-    Сейчас init_billing_watch ничего не планирует в job_queue и служит только
-    как «заглушка», чтобы не было ошибок при импорте и вызове.
-    Вся актуальная логика уведомлений по биллингу живёт в:
-      - fb_report/billing.py (send_billing, send_billing_forecast, billing_digest_job)
-      - fb_report/jobs.py (расписание billing_digest_job)
-    """
-    return

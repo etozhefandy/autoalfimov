@@ -138,6 +138,12 @@ def _parse_totals_from_report_text(txt: str):
 
 
 async def _cpa_alerts_job(context: ContextTypes.DEFAULT_TYPE):
+    # Ограничиваем отправку алёртов часовым окном, как в старом боте:
+    # каждый час с 10:00 до 22:00 по Алмате.
+    now = datetime.now(ALMATY_TZ)
+    if not (10 <= now.hour <= 22):
+        return
+
     accounts = load_accounts() or {}
     # Алёрты шлём напрямую владельцу в личку (первый ID из ALLOWED_USER_IDS).
     # Если по какой-то причине список пуст, используем дефолтный чат как фолбэк.

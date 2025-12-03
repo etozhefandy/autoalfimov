@@ -24,6 +24,10 @@ from .constants import (
     DEFAULT_REPORT_CHAT,
     ALLOWED_USER_IDS,
     ALLOWED_CHAT_IDS,
+    usd_to_kzt,
+    kzt_round_up_1000,
+    BOT_VERSION,
+    BOT_CHANGELOG,
 )
 from .storage import (
     load_accounts,
@@ -84,22 +88,25 @@ def main_menu() -> InlineKeyboardMarkup:
     last_sync = human_last_sync()
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("Отчёт по всем", callback_data="rep_all_menu")],
-            [InlineKeyboardButton("Биллинг", callback_data="billing")],
             [
                 InlineKeyboardButton(
-                    "Отчёт по аккаунту", callback_data="choose_acc_report"
+                    "📊 Отчёт по всем", callback_data="rep_all_menu"
+                ),
+                InlineKeyboardButton(
+                    "📂 Отчёт по аккаунту", callback_data="choose_acc_report"
                 )
             ],
-            [InlineKeyboardButton("Тепловая карта", callback_data="hm_menu")],
-            [InlineKeyboardButton("Настройки", callback_data="choose_acc_settings")],
+            [InlineKeyboardButton("💳 Биллинг", callback_data="billing")],
+            [InlineKeyboardButton("🔥 Тепловая карта", callback_data="hm_menu")],
+            [InlineKeyboardButton("⚙️ Настройки", callback_data="choose_acc_settings")],
             [InlineKeyboardButton("🤖 Автопилат", callback_data="ap_main")],
             [
                 InlineKeyboardButton(
-                    f"Синк BM (посл. {last_sync})",
+                    f"🔁 Синк BM (посл. {last_sync})",
                     callback_data="sync_bm",
                 )
             ],
+            [InlineKeyboardButton("ℹ️ Версия", callback_data="version")],
         ]
     )
 
@@ -396,16 +403,17 @@ async def on_cb_autopilot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
 
     if not _allowed(update):
-        await q.edit_message_text("⛔️ Нет доступа.")
+        await safe_edit_message(q, "⛔️ Нет доступа.")
         return
 
     data = q.data or ""
     chat_id = str(q.message.chat.id)
 
     if data == "ap_main":
-        await q.edit_message_text(
+        await safe_edit_message(
+            q,
             "Выберите режим автопилата:",
-            reply_markup=autopilot_main_menu()
+            reply_markup=autopilot_main_menu(),
         )
         return
 
@@ -413,10 +421,11 @@ async def on_cb_autopilot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mode = data.split("|", 1)[1]
         context.user_data["autopilot_mode"] = mode
 
-        await q.edit_message_text(
+        await safe_edit_message(
+            q,
             f"Режим: <b>{mode}</b>\nВыберите подрежим:",
             parse_mode="HTML",
-            reply_markup=autopilot_submode_menu()
+            reply_markup=autopilot_submode_menu(),
         )
         return
 
@@ -424,12 +433,13 @@ async def on_cb_autopilot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sub = data.split("|", 1)[1]
         context.user_data["autopilot_submode"] = sub
 
-        await q.edit_message_text(
+        await safe_edit_message(
+            q,
             f"Режим: <b>{context.user_data.get('autopilot_mode')}</b>\n"
             f"Подрежим: <b>{sub}</b>\n\n"
             f"Теперь выберите аккаунт:",
             parse_mode="HTML",
-            reply_markup=accounts_kb("ap_acc")
+            reply_markup=accounts_kb("ap_acc"),
         )
         return
 
@@ -456,7 +466,8 @@ async def on_cb_autopilot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("ap|"):
         parts = data.split("|")
         if len(parts) < 2:
-            await q.edit_message_text(
+            await safe_edit_message(
+                q,
                 "⚠ Ошибка кнопки: некорректный формат callback_data.",
                 parse_mode="HTML",
             )
@@ -466,14 +477,16 @@ async def on_cb_autopilot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         entity_id = rest[0] if rest else ""
 
         if action == "back":
-            await q.edit_message_text(
+            await safe_edit_message(
+                q,
                 "Выберите режим автопилата:",
                 reply_markup=autopilot_main_menu(),
             )
             return
 
         if not entity_id:
-            await q.edit_message_text(
+            await safe_edit_message(
+                q,
                 "⚠ Ошибка кнопки: не передан ID сущности.\n"
                 "Обнови рекомендации и попробуй ещё раз.",
                 parse_mode="HTML",
@@ -482,14 +495,16 @@ async def on_cb_autopilot(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if action == "manual":
             context.user_data["await_manual_input"] = entity_id
-            await q.edit_message_text(
+            await safe_edit_message(
+                q,
                 f"✍️ Введите число (например 1.2, -20, 15):\n"
                 f"ID: <code>{entity_id}</code>",
                 parse_mode="HTML",
             )
             return
 
-        await q.edit_message_text(
+        await safe_edit_message(
+            q,
             f"Подтвердить действие <b>{action}</b> для <code>{entity_id}</code>?",
             parse_mode="HTML",
             reply_markup=confirm_action_buttons(action, entity_id),
@@ -500,39 +515,41 @@ async def on_cb_autopilot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _, yesno, action, entity_id = data.split("|", 3)
 
         if yesno == "no":
-            await q.edit_message_text("Операция отменена.", parse_mode="HTML")
+            await safe_edit_message(q, "Операция отменена.", parse_mode="HTML")
             return
 
         if action in ("up20", "down20"):
             percent = 20 if action == "up20" else -20
             res = apply_budget_change(entity_id, percent)
-            await q.edit_message_text(res["message"], parse_mode="HTML")
+            await safe_edit_message(q, res["message"], parse_mode="HTML")
             return
 
         if action == "off":
             aid = context.user_data.get("ap_aid")
             if aid and not can_disable(aid, entity_id):
-                await q.edit_message_text(
+                await safe_edit_message(
+                    q,
                     "❌ Нельзя отключить этот адсет — иначе весь аккаунт останется без трафика.",
-                    parse_mode="HTML"
+                    parse_mode="HTML",
                 )
                 return
 
             res = disable_entity(entity_id)
-            await q.edit_message_text(res["message"], parse_mode="HTML")
+            await safe_edit_message(q, res["message"], parse_mode="HTML")
             return
 
         try:
             percent = float(action.replace(",", "."))
         except Exception:
-            await q.edit_message_text(
+            await safe_edit_message(
+                q,
                 "⚠ Не получилось прочитать процент изменения.",
-                parse_mode="HTML"
+                parse_mode="HTML",
             )
             return
 
         res = apply_budget_change(entity_id, percent)
-        await q.edit_message_text(res["message"], parse_mode="HTML")
+        await safe_edit_message(q, res["message"], parse_mode="HTML")
         return
 
 
@@ -547,15 +564,16 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(q.message.chat.id)
 
     if data == "menu":
-        await q.edit_message_text("🤖 Выберите действие:", reply_markup=main_menu())
+        await safe_edit_message(q, "🤖 Выберите действие:", reply_markup=main_menu())
         return
 
     if data == "rep_all_menu":
-        await q.edit_message_text("Выберите период:", reply_markup=all_reports_menu())
+        await safe_edit_message(q, "Выберите период:", reply_markup=all_reports_menu())
         return
 
     if data == "adsets_menu":
-        await q.edit_message_text(
+        await safe_edit_message(
+            q,
             "Выберите аккаунт для отчёта по адсетам:",
             reply_markup=accounts_kb("adrep"),
         )
@@ -563,16 +581,17 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("adrep|"):
         aid = data.split("|", 1)[1]
-        await q.edit_message_text(
+        await safe_edit_message(
+            q,
             f"Готовлю отчёт по адсетам для {get_account_name(aid)} "
-            f"за последние 7 дней…"
+            f"за последние 7 дней…",
         )
         await send_adset_report(context, chat_id, aid)
         return
 
     if data == "rep_today":
         label = datetime.now(ALMATY_TZ).strftime("%d.%m.%Y")
-        await q.edit_message_text(f"Готовлю отчёт за {label}…")
+        await safe_edit_message(q, f"Готовлю отчёт за {label}…")
         await send_period_report(context, chat_id, "today", label)
         return
 
@@ -595,7 +614,8 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "hm_menu":
-        await q.edit_message_text(
+        await safe_edit_message(
+            q,
             "Выберите аккаунт для тепловой карты:",
             reply_markup=accounts_kb("hmacc"),
         )
@@ -604,7 +624,8 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("hmacc|"):
         aid = data.split("|", 1)[1]
         context.user_data["heatmap_aid"] = aid
-        await q.edit_message_text(
+        await safe_edit_message(
+            q,
             f"Выберите период тепловой карты для {get_account_name(aid)}:",
             reply_markup=heatmap_menu(aid),
         )
@@ -613,7 +634,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("hm7|"):
         aid = data.split("|")[1]
         heat = build_heatmap_for_account(aid, get_account_name, mode="7")
-        await q.edit_message_text(heat, parse_mode="HTML")
+        await safe_edit_message(q, heat, parse_mode="HTML")
         return
 
     if data.startswith("hm14|"):
@@ -629,16 +650,18 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "billing":
-        await q.edit_message_text(
-            "Что показать по биллингу?", reply_markup=billing_menu()
+        await safe_edit_message(
+            q,
+            "Что показать по биллингу?",
+            reply_markup=billing_menu(),
         )
         return
     if data == "billing_current":
-        await q.edit_message_text("📋 Биллинги (неактивные аккаунты):")
+        await safe_edit_message(q, "📋 Биллинги (неактивные аккаунты):")
         await send_billing(context, chat_id)
         return
     if data == "billing_forecast":
-        await q.edit_message_text("🔮 Считаю прогноз списаний…")
+        await safe_edit_message(q, "🔮 Считаю прогноз списаний…")
         await send_billing_forecast(context, chat_id)
         return
 
@@ -646,7 +669,8 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             res = upsert_from_bm()
             last_sync_h = human_last_sync()
-            await q.edit_message_text(
+            await safe_edit_message(
+                q,
                 f"✅ Синк завершён. Добавлено: {res['added']}, "
                 f"обновлено: {res['updated']}, пропущено: {res['skipped']}. "
                 f"Всего: {res['total']}\n"
@@ -654,20 +678,25 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=main_menu(),
             )
         except Exception as e:
-            await q.edit_message_text(
-                f"⚠️ Ошибка синка: {e}", reply_markup=main_menu()
+            await safe_editMessage(
+                q,
+                f"⚠️ Ошибка синка: {e}",
+                reply_markup=main_menu(),
             )
         return
 
     if data == "choose_acc_report":
-        await q.edit_message_text(
-            "Выберите аккаунт:", reply_markup=accounts_kb("rep1")
+        await safe_edit_message(
+            q,
+            "Выберите аккаунт:",
+            reply_markup=accounts_kb("rep1"),
         )
         return
 
     if data.startswith("rep1|"):
         aid = data.split("|", 1)[1]
-        await q.edit_message_text(
+        await safe_edit_message(
+            q,
             f"Отчёт по: {get_account_name(aid)}\nВыберите тип отчёта:",
             reply_markup=account_report_mode_kb(aid),
         )
@@ -675,7 +704,8 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("one_mode_acc|"):
         aid = data.split("|", 1)[1]
-        await q.edit_message_text(
+        await safe_edit_message(
+            q,
             f"Отчёт по: {get_account_name(aid)}\nВыбери период:",
             reply_markup=period_kb_for(aid),
         )
@@ -693,8 +723,9 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("one_today|"):
         aid = data.split("|", 1)[1]
         label = datetime.now(ALMATY_TZ).strftime("%d.%m.%Y")
-        await q.edit_message_text(
-            f"Отчёт по {get_account_name(aid)} за {label}:"
+        await safe_edit_message(
+            q,
+            f"Отчёт по {get_account_name(aid)} за {label}:",
         )
         txt = get_cached_report(aid, "today", label)
         await context.bot.send_message(
@@ -741,7 +772,8 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("one_custom|"):
         aid = data.split("|", 1)[1]
         context.user_data["await_range_for"] = aid
-        await q.edit_message_text(
+        await safe_edit_message(
+            q,
             f"Введи даты для {get_account_name(aid)} форматом: 01.06.2025-07.06.2025",
             reply_markup=period_kb_for(aid),
         )
@@ -749,7 +781,8 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("cmp_menu|"):
         aid = data.split("|", 1)[1]
-        await q.edit_message_text(
+        await safe_edit_message(
+            q,
             f"Сравнение периодов для {get_account_name(aid)}:",
             reply_markup=compare_kb_for(aid),
         )
@@ -780,7 +813,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
         label1 = f"{since1.strftime('%d.%m')}-{until1.strftime('%d.%m')}"
         label2 = f"{since2.strftime('%d.%m')}-{until2.strftime('%d.%m')}"
-        await q.edit_message_text(f"Сравниваю {label1} vs {label2}…")
+        await safe_edit_message(q, f"Сравниваю {label1} vs {label2}…")
         txt = build_comparison_report(aid, period1, label1, period2, label2)
         await context.bot.send_message(chat_id, txt, parse_mode="HTML")
         return
@@ -788,7 +821,8 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("cmp_custom|"):
         aid = data.split("|", 1)[1]
         context.user_data["await_cmp_for"] = aid
-        await q.edit_message_text(
+        await safe_edit_message(
+            q,
             "Отправь два диапазона дат через ';' или с новой строки.\n"
             "Например:\n"
             "01.06.2025-07.06.2025;08.06.2025-14.06.2025",
@@ -799,14 +833,16 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("hmcustom|"):
         aid = data.split("|", 1)[1]
         context.user_data["await_heatmap_range_for"] = aid
-        await q.edit_message_text(
+        await safe_edit_message(
+            q,
             "Введи даты для тепловой карты форматом: 01.06.2025-07.06.2025",
             reply_markup=heatmap_menu(aid),
         )
         return
 
     if data == "choose_acc_settings":
-        await q.edit_message_text(
+        await safe_edit_message(
+            q,
             "Выберите аккаунт для настроек:",
             reply_markup=accounts_kb("set1"),
         )
@@ -814,7 +850,8 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("set1|"):
         aid = data.split("|", 1)[1]
-        await q.edit_message_text(
+        await safe_edit_message(
+            q,
             f"Настройки: {get_account_name(aid)}",
             reply_markup=settings_kb(aid),
         )
@@ -888,7 +925,8 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         row["alerts"] = alerts
         st[aid] = row
         save_accounts(st)
-        await q.edit_message_text(
+        await safe_edit_message(
+            q,
             f"⚠️ Текущий target CPA: {current:.2f} $.\n"
             f"Напиши в чат число (например 2.5). 0 — выключит алерты.",
             reply_markup=settings_kb(aid),
@@ -1045,8 +1083,8 @@ def build_app() -> Application:
         app,
         get_enabled_accounts=get_enabled_accounts_in_order,
         get_account_name=get_account_name,
-        usd_to_kzt=None,
-        kzt_round_up_1000=None,
+        usd_to_kzt=usd_to_kzt,
+        kzt_round_up_1000=kzt_round_up_1000,
         owner_id=253181449,
         group_chat_id=str(DEFAULT_REPORT_CHAT),
     )
