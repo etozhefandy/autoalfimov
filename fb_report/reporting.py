@@ -75,7 +75,8 @@ def fetch_insight(aid: str, period):
 
     acc = AdAccount(aid)
 
-    # ВАЖНО: НЕ запрашиваем link_clicks/link_ctr напрямую — они невалидны в некоторых конфигурациях
+    # ВАЖНО: НЕ запрашиваем link_clicks/link_ctr/results/cost_per_result напрямую —
+    # они невалидны в некоторых конфигурациях и дают warning/ошибки.
     fields = [
         "impressions",
         "cpm",
@@ -83,8 +84,6 @@ def fetch_insight(aid: str, period):
         "cpc",
         "spend",
         "actions",
-        "results",
-        "cost_per_result",
     ]
 
     params = {"level": "account"}
@@ -183,17 +182,47 @@ def build_report(aid: str, period, label: str = "") -> str:
     body.append(f"💸 CPC: {cpc_all:.2f} $")
     body.append(f"💵 Затраты: {spend:.2f} $")
 
-    # заявки
-    msgs = int(
-        acts.get("onsite_conversion.messaging_conversation_started_7d", 0) or 0
-    )
-    leads = int(
-        acts.get("Website Submit Applications", 0)
-        or acts.get("offsite_conversion.fb_pixel_submit_application", 0)
-        or acts.get("offsite_conversion.fb_pixel_lead", 0)
-        or acts.get("lead", 0)
-        or 0
-    )
+    # ===== ЗАЯВКИ: переписки + лиды =====
+
+    # 1) Явно известные ключи
+    msg_keys = [
+        "onsite_conversion.messaging_conversation_started_7d",
+        "onsite_conversion.messaging_conversation_started",
+    ]
+    msgs = 0
+    for k in msg_keys:
+        msgs += int(acts.get(k, 0) or 0)
+
+    lead_keys = [
+        "Website Submit Applications",
+        "offsite_conversion.fb_pixel_submit_application",
+        "offsite_conversion.fb_pixel_lead",
+        "lead",
+    ]
+    leads = 0
+    for k in lead_keys:
+        leads += int(acts.get(k, 0) or 0)
+
+    # 2) Фолбэк: всё, где в action_type есть "messaging_conversation" — считаем переписками,
+    # всё, где есть "submit_application" или "lead" — считаем лидами
+    if msgs == 0:
+        msgs = int(
+            sum(
+                float(v or 0)
+                for key, v in acts.items()
+                if "messaging_conversation" in str(key).lower()
+            )
+        )
+
+    if leads == 0:
+        leads = int(
+            sum(
+                float(v or 0)
+                for key, v in acts.items()
+                if "submit_application" in str(key).lower()
+                or "lead" in str(key).lower()
+            )
+        )
 
     if flags["messaging"]:
         body.append(f"✉️ Переписки: {msgs}")
