@@ -24,9 +24,10 @@ from .insights import (
     extract_actions,
     _blend_totals,
 )
-from .constants import DEFAULT_REPORT_CHAT
+from .constants import DEFAULT_REPORT_CHAT  # иногда нужно в джобах
 
 
+# ========= Утилиты форматирования =========
 def fmt_int(n) -> str:
     try:
         return f"{int(float(n)):,}".replace(",", " ")
@@ -34,6 +35,7 @@ def fmt_int(n) -> str:
         return "0"
 
 
+# ========= КЕШ ОТЧЁТОВ =========
 def _load_report_cache() -> dict:
     try:
         with open(REPORT_CACHE_FILE, "r", encoding="utf-8") as f:
@@ -43,7 +45,7 @@ def _load_report_cache() -> dict:
 
 
 def _save_report_cache(d: dict):
-    from .storage import _atomic_write_json
+    from .storage import _atomic_write_json  # локальный импорт, чтобы избежать циклов
 
     _atomic_write_json(REPORT_CACHE_FILE, d)
 
@@ -56,7 +58,14 @@ def period_key(period) -> str:
     return f"preset:{str(period)}"
 
 
+# ========== ИНСАЙТЫ ==========
 def fetch_insight(aid: str, period):
+    """
+    Достаёт инсайты:
+    - сначала из локального кэша
+    - если нет — запрашивает у Facebook
+    - важно: ВСЕГДА приводим AdsInsights к обычному dict
+    """
     store = load_local_insights(aid)
     key = period_key(period)
 
@@ -65,6 +74,8 @@ def fetch_insight(aid: str, period):
         return name, store[key]
 
     acc = AdAccount(aid)
+
+    # ВАЖНО: НЕ запрашиваем link_clicks/link_ctr напрямую — они невалидны в некоторых конфигурациях
     fields = [
         "impressions",
         "cpm",
@@ -74,9 +85,6 @@ def fetch_insight(aid: str, period):
         "actions",
         "results",
         "cost_per_result",
-        "link_clicks",
-        "ctr",
-        "link_ctr",
     ]
 
     params = {"level": "account"}
@@ -104,6 +112,10 @@ def fetch_insight(aid: str, period):
 
 
 def get_cached_report(aid: str, period, label: str = "") -> str:
+    """
+    Возвращает текст отчёта из кеша, если свежий,
+    иначе строит заново и обновляет кеш.
+    """
     key = period_key(period)
     now_ts = datetime.now().timestamp()
 
@@ -124,7 +136,7 @@ def get_cached_report(aid: str, period, label: str = "") -> str:
 
 
 def build_report(aid: str, period, label: str = "") -> str:
-    from .storage import get_account_name as _get_name
+    from .storage import get_account_name  # чтобы избежать циклов
 
     try:
         name, ins = fetch_insight(aid, period)
@@ -132,10 +144,10 @@ def build_report(aid: str, period, label: str = "") -> str:
         err = str(e)
         if "code: 200" in err or "403" in err or "permissions" in err.lower():
             return ""
-        return f"⚠ Ошибка по {_get_name(aid)}:\n\n{e}"
+        return f"⚠ Ошибка по {get_account_name(aid)}:\n\n{e}"
 
     badge = "🟢" if is_active(aid) else "🔴"
-    hdr = f"{badge} <b>{name}</b>{(' (' + label + ')') if label else ''}\n"
+    hdr = f"{badge} <b>{name}</b>{(' ('+label+')') if label else ''}\n"
     if not ins:
         return hdr + "Нет данных за выбранный период"
 
@@ -144,36 +156,34 @@ def build_report(aid: str, period, label: str = "") -> str:
     impressions = int(ins.get("impressions", 0) or 0)
     cpm = float(ins.get("cpm", 0) or 0)
     clicks_all = int(ins.get("clicks", 0) or 0)
-    cpc = float(ins.get("cpc", 0) or 0)
+    cpc_all = float(ins.get("cpc", 0) or 0)
     spend = float(ins.get("spend", 0) or 0)
-    link_clicks = int(ins.get("link_clicks", 0) or 0)
-
-    try:
-        ctr_all = float(ins.get("ctr", 0) or 0)
-    except Exception:
-        ctr_all = 0.0
-
-    try:
-        ctr_link = float(ins.get("link_ctr", 0) or 0)
-    except Exception:
-        ctr_link = 0.0
-
-    body.append(f"👁 Показы: {fmt_int(impressions)}")
-    body.append(f"🎯 CPM: {cpm:.2f} $")
-    body.append(f"🖱 Клики(все): {fmt_int(clicks_all)}")
-    body.append(f"🔗 Клики: {fmt_int(link_clicks)}")
-    body.append(f"📈 CTR(все): {ctr_all:.2f} %")
-    body.append(f"📈 CTR(клики): {ctr_link:.2f} %")
-    body.append(f"💸 CPC: {cpc:.2f} $")
-    body.append(f"💵 Затраты: {spend:.2f} $")
 
     acts = extract_actions(ins)
     flags = metrics_flags(aid)
 
-    show_msg = bool(flags.get("messaging", True))
-    show_leads = bool(flags.get("leads", False))
-    show_total = bool(flags.get("total", True))
+    # клики по ссылке достаём из actions['link_click']
+    link_clicks = int(acts.get("link_click", 0) or 0)
 
+    ctr_all = (clicks_all / impressions * 100.0) if impressions > 0 else 0.0
+    ctr_link = (link_clicks / impressions * 100.0) if impressions > 0 else 0.0
+
+    # базовые метрики
+    body.append(f"👁 Показы: {fmt_int(impressions)}")
+    body.append(f"🎯 CPM: {cpm:.2f} $")
+
+    # клики (все) + CTR по всем кликам
+    body.append(f"🖱 Клики (все): {fmt_int(clicks_all)}")
+    body.append(f"📈 CTR (все клики): {ctr_all:.2f} %")
+
+    # клики по ссылке, в тексте просто "Клики" + CTR по ссылке
+    body.append(f"🔗 Клики: {fmt_int(link_clicks)}")
+    body.append(f"📈 CTR (по ссылке): {ctr_link:.2f} %")
+
+    body.append(f"💸 CPC: {cpc_all:.2f} $")
+    body.append(f"💵 Затраты: {spend:.2f} $")
+
+    # заявки
     msgs = int(
         acts.get("onsite_conversion.messaging_conversation_started_7d", 0) or 0
     )
@@ -185,32 +195,22 @@ def build_report(aid: str, period, label: str = "") -> str:
         or 0
     )
 
-    if show_msg:
+    if flags["messaging"]:
         body.append(f"✉️ Переписки: {msgs}")
-        if msgs > 0 and spend > 0:
-            body.append(f"💬💲 Цена переписки: {spend / msgs:.2f} $")
+        if msgs > 0:
+            body.append(f"💬💲 Цена переписки: {round(spend / msgs, 2)} $")
 
-    if show_leads:
+    if flags["leads"]:
         body.append(f"📩 Лиды: {leads}")
-        if leads > 0 and spend > 0:
-            body.append(f"📩💲 Цена лида: {spend / leads:.2f} $")
+        if leads > 0:
+            body.append(f"📩💲 Цена лида: {round(spend / leads, 2)} $")
 
-    total = msgs + leads
-
-    results_raw = 0
-    try:
-        results_raw = int(ins.get("results", 0) or 0)
-    except Exception:
-        results_raw = 0
-
-    if total == 0 and results_raw > 0:
-        total = results_raw
-
-    if show_total:
+    if flags["messaging"] and flags["leads"]:
+        total = msgs + leads
         body.append("—")
-        if total > 0 and spend > 0:
-            blended = spend / total
-            body.append(f"🧮 Итого: {total} заявок, CPA = {blended:.2f} $")
+        if total > 0:
+            blended = round(spend / total, 2)
+            body.append(f"🧮 Итого: {total} заявок, CPA = {blended} $")
         else:
             body.append("🧮 Итого: 0 заявок")
 
@@ -220,6 +220,11 @@ def build_report(aid: str, period, label: str = "") -> str:
 async def send_period_report(
     ctx: ContextTypes.DEFAULT_TYPE, chat_id: str, period, label: str = ""
 ):
+    """
+    Всегда шлём отчёты ТОЛЬКО по enabled=True аккаунтам.
+    За 'today' — всегда живые данные (build_report),
+    за остальные периоды — через кеш.
+    """
     from .storage import load_accounts, get_enabled_accounts_in_order
 
     store = load_accounts()
@@ -237,9 +242,8 @@ async def send_period_report(
             await ctx.bot.send_message(chat_id=chat_id, text=txt, parse_mode="HTML")
 
 
-def build_comparison_report(
-    aid: str, period1, label1: str, period2, label2: str
-) -> str:
+# ======== Сравнение периодов =========
+def build_comparison_report(aid: str, period1, label1: str, period2, label2: str) -> str:
     from .storage import get_account_name
 
     def _extract_since(p):
@@ -318,36 +322,39 @@ def build_comparison_report(
     txt_lines.append(f"Новый период: {label2}")
     txt_lines.append("")
 
+    # 1️⃣ Старый
     txt_lines.append(f"1️⃣ <b>{label1}</b> (старый период)")
     txt_lines.append(f"   👁 Охваты: {fmt_int(s1['impr'])}")
     txt_lines.append(f"   🖱 Клики: {fmt_int(s1['clicks'])}")
     txt_lines.append(f"   💵 Затраты: {_fmt_money(s1['spend'])}")
     txt_lines.append(f"   🎯 CPM: {s1['cpm']:.2f} $")
     txt_lines.append(f"   💸 CPC: {s1['cpc']:.2f} $")
-    if flags.get("messaging", True):
+    if flags["messaging"]:
         txt_lines.append(f"   💬 Переписки: {s1['msgs']}")
-    if flags.get("leads", False):
+    if flags["leads"]:
         txt_lines.append(f"   📩 Лиды: {s1['leads']}")
-    if flags.get("messaging", True) or flags.get("leads", False):
+    if flags["messaging"] or flags["leads"]:
         txt_lines.append(f"   🧮 Заявки всего: {s1['total']}")
         txt_lines.append(f"   🎯 CPA: {_fmt_cpa(s1['cpa'])}")
     txt_lines.append("")
 
+    # 2️⃣ Новый
     txt_lines.append(f"2️⃣ <b>{label2}</b> (новый период)")
     txt_lines.append(f"   👁 Охваты: {fmt_int(s2['impr'])}")
     txt_lines.append(f"   🖱 Клики: {fmt_int(s2['clicks'])}")
     txt_lines.append(f"   💵 Затраты: {_fmt_money(s2['spend'])}")
     txt_lines.append(f"   🎯 CPM: {s2['cpm']:.2f} $")
     txt_lines.append(f"   💸 CPC: {s2['cpc']:.2f} $")
-    if flags.get("messaging", True):
+    if flags["messaging"]:
         txt_lines.append(f"   💬 Переписки: {s2['msgs']}")
-    if flags.get("leads", False):
+    if flags["leads"]:
         txt_lines.append(f"   📩 Лиды: {s2['leads']}")
-    if flags.get("messaging", True) or flags.get("leads", False):
+    if flags["messaging"] or flags["leads"]:
         txt_lines.append(f"   🧮 Заявки всего: {s2['total']}")
         txt_lines.append(f"   🎯 CPA: {_fmt_cpa(s2['cpa'])}")
     txt_lines.append("")
 
+    # 3️⃣ Сравнение
     txt_lines.append("3️⃣ <b>Сравнение (новый vs старый)</b>")
 
     def _add_diff(
@@ -381,40 +388,20 @@ def build_comparison_report(
     _add_diff("CPM", s1["cpm"], s2["cpm"], True, lambda v: f"{v:.2f} $", "🎯")
     _add_diff("CPC", s1["cpc"], s2["cpc"], True, lambda v: f"{v:.2f} $", "💸")
 
-    if flags.get("messaging", True):
-        _add_diff(
-            "Переписки",
-            s1["msgs"],
-            s2["msgs"],
-            False,
-            lambda v: str(int(v)),
-            "💬",
-        )
-    if flags.get("leads", False):
-        _add_diff(
-            "Лиды",
-            s1["leads"],
-            s2["leads"],
-            False,
-            lambda v: str(int(v)),
-            "📩",
-        )
+    if flags["messaging"]:
+        _add_diff("Переписки", s1["msgs"], s2["msgs"], False, lambda v: str(int(v)), "💬")
+    if flags["leads"]:
+        _add_diff("Лиды", s1["leads"], s2["leads"], False, lambda v: str(int(v)), "📩")
 
-    if flags.get("messaging", True) or flags.get("leads", False):
-        _add_diff(
-            "Заявки всего",
-            s1["total"],
-            s2["total"],
-            False,
-            lambda v: str(int(v)),
-            "🧮",
-        )
+    if flags["messaging"] or flags["leads"]:
+        _add_diff("Заявки всего", s1["total"], s2["total"], False, lambda v: str(int(v)), "🧮")
         if s1["cpa"] is not None and s2["cpa"] is not None:
             _add_diff("CPA", s1["cpa"], s2["cpa"], True, _fmt_cpa, "🎯")
 
     return "\n".join(txt_lines)
 
 
+# ======== парсинг дат для кастомных диапазонов =========
 _RANGE_RE = re.compile(
     r"^\s*(\d{2})\.(\d{2})\.(\d{4})\s*-\s*(\d{2})\.(\d{2})\.(\d{4})\s*$"
 )
