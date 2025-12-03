@@ -339,6 +339,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/sync_accounts — синхронизация BM\n"
         "/whoami — показать user_id/chat_id\n"
         "/heatmap <act_id> — тепловая карта адсетов за 7 дней\n"
+        "/version — показать текущую версию бота и краткое описание\n"
         "\n"
         "🚀 Функции автопилата:\n"
         "• Автоматические рекомендации по аккаунту\n"
@@ -355,6 +356,16 @@ async def cmd_billing(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Что показать по биллингу?", reply_markup=billing_menu()
     )
+
+
+async def cmd_version(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _allowed(update):
+        return
+    text = (
+        f"Версия бота: {BOT_VERSION}\n"
+        f"Основные функции: отчёты по аккаунтам, биллинг, CPA-алёрты, тепловая карта."
+    )
+    await update.message.reply_text(text, reply_markup=main_menu())
 
 
 async def cmd_heatmap(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -562,6 +573,14 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = q.data or ""
     chat_id = str(q.message.chat.id)
+
+    if data == "version":
+        text = (
+            f"Версия бота: {BOT_VERSION}\n"
+            f"Основные функции: отчёты по аккаунтам, биллинг, CPA-алёрты, тепловая карта."
+        )
+        await context.bot.send_message(chat_id, text)
+        return
 
     if data == "menu":
         await safe_edit_message(q, "🤖 Выберите действие:", reply_markup=main_menu())
