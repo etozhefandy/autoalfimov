@@ -139,6 +139,11 @@ def heatmap_menu(aid: str) -> InlineKeyboardMarkup:
                     "Текущий месяц", callback_data=f"hmmonth|{aid}"
                 )
             ],
+            [
+                InlineKeyboardButton(
+                    "🗓 Свой диапазон", callback_data=f"hmcustom|{aid}"
+                )
+            ],
             [InlineKeyboardButton("⬅️ Назад", callback_data="menu")],
         ]
     )
@@ -791,6 +796,15 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if data.startswith("hmcustom|"):
+        aid = data.split("|", 1)[1]
+        context.user_data["await_heatmap_range_for"] = aid
+        await q.edit_message_text(
+            "Введи даты для тепловой карты форматом: 01.06.2025-07.06.2025",
+            reply_markup=heatmap_menu(aid),
+        )
+        return
+
     if data == "choose_acc_settings":
         await q.edit_message_text(
             "Выберите аккаунт для настроек:",
@@ -892,6 +906,29 @@ async def on_text_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = update.message.text.strip()
+
+    # Кастомный период для тепловой карты
+    if "await_heatmap_range_for" in context.user_data:
+        aid = context.user_data.pop("await_heatmap_range_for")
+        parsed = parse_range(text)
+        if not parsed:
+            await update.message.reply_text(
+                "Формат дат: 01.06.2025-07.06.2025. Попробуй ещё раз."
+            )
+            context.user_data["await_heatmap_range_for"] = aid
+            return
+
+        period, label = parsed
+        from .insights import build_heatmap_for_account
+
+        # Пока build_heatmap_for_account умеет только пресеты (7/14/месяц),
+        # используем режим "7" и подменяем строку с периодом.
+        heat = build_heatmap_for_account(aid, get_account_name, mode="7")
+        lines = heat.splitlines()
+        if len(lines) >= 2:
+            lines[1] = f"Период: {label}"
+        await update.message.reply_text("\n".join(lines))
+        return
 
     if "await_range_for" in context.user_data:
         aid = context.user_data.pop("await_range_for")

@@ -9,6 +9,9 @@ from telegram.ext import ContextTypes, Application
 from .constants import ALMATY_TZ, DEFAULT_REPORT_CHAT, ALLOWED_USER_IDS
 from .storage import load_accounts, get_account_name
 from .reporting import send_period_report, get_cached_report
+from services.storage import load_hourly_stats, save_hourly_stats
+from services.facebook_api import fetch_insights
+from services.analytics import parse_insight
 
 
 def _yesterday_period():
@@ -175,9 +178,93 @@ async def _cpa_alerts_job(context: ContextTypes.DEFAULT_TYPE):
             continue
 
 
+async def _hourly_snapshot_job(context: ContextTypes.DEFAULT_TYPE):
+    """Раз в час снимаем инсайты за today и сохраняем дельту в hour buckets.
+
+    - один запрос fetch_insights(aid, "today") на аккаунт;
+    - дельта по messages/leads/total/spend пишется в hourly_stats.json;
+    - храним историю ~2 года по дням и часам.
+    """
+    now = datetime.now(ALMATY_TZ)
+    date_str = now.strftime("%Y-%m-%d")
+    hour_str = now.strftime("%H")
+
+    accounts = load_accounts() or {}
+    stats = load_hourly_stats() or {}
+    acc_section = stats.setdefault("_acc", {})
+
+    # Порог хранения ~2 года
+    cutoff_date = (now - timedelta(days=730)).strftime("%Y-%m-%d")
+
+    for aid, row in accounts.items():
+        if not (row or {}).get("enabled", True):
+            continue
+
+        # Инсайты за today — всегда живые, без кэша (см. fetch_insights).
+        try:
+            ins = fetch_insights(aid, "today") or {}
+        except Exception:
+            continue
+
+        metrics = parse_insight(ins)
+
+        cur_msgs = int(metrics.get("msgs", 0) or 0)
+        cur_leads = int(metrics.get("leads", 0) or 0)
+        cur_total = int(metrics.get("total", 0) or 0)
+        cur_spend = float(metrics.get("spend", 0.0) or 0.0)
+
+        prev = acc_section.get(aid, {"msgs": 0, "leads": 0, "total": 0, "spend": 0.0})
+
+        d_msgs = max(0, cur_msgs - int(prev.get("msgs", 0) or 0))
+        d_leads = max(0, cur_leads - int(prev.get("leads", 0) or 0))
+        d_total = max(0, cur_total - int(prev.get("total", 0) or 0))
+        d_spend = max(0.0, cur_spend - float(prev.get("spend", 0.0) or 0.0))
+
+        if any([d_msgs, d_leads, d_total, d_spend]):
+            acc_stats = stats.setdefault(aid, {})
+            day_stats = acc_stats.setdefault(date_str, {})
+            hour_bucket = day_stats.setdefault(
+                hour_str,
+                {"messages": 0, "leads": 0, "total": 0, "spend": 0.0},
+            )
+
+            hour_bucket["messages"] += d_msgs
+            hour_bucket["leads"] += d_leads
+            hour_bucket["total"] += d_total
+            hour_bucket["spend"] += d_spend
+
+        # Обновляем аккумулятор для следующего часа
+        acc_section[aid] = {
+            "msgs": cur_msgs,
+            "leads": cur_leads,
+            "total": cur_total,
+            "spend": cur_spend,
+        }
+
+    # Обрезаем историю старше cutoff_date
+    for aid, acc_stats in list(stats.items()):
+        if aid == "_acc":
+            continue
+        if not isinstance(acc_stats, dict):
+            continue
+        for d in list(acc_stats.keys()):
+            if d < cutoff_date:
+                del acc_stats[d]
+
+    save_hourly_stats(stats)
+
+
 def schedule_cpa_alerts(app: Application):
+    # Часовые CPA-алёрты (по вчерашнему периоду через текстовые отчёты)
     app.job_queue.run_repeating(
         _cpa_alerts_job,
         interval=timedelta(hours=1),
         first=timedelta(minutes=15),
+    )
+
+    # Часовой снимок инсайтов за today для часового кэша
+    app.job_queue.run_repeating(
+        _hourly_snapshot_job,
+        interval=timedelta(hours=1),
+        first=timedelta(minutes=5),
     )
