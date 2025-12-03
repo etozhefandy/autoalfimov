@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 from facebook_business.adobjects.adaccount import AdAccount
 from telegram.ext import Application, ContextTypes
 
-from autoalfimov.fb_report.constants import ALMATY_TZ
+from fb_report.constants import ALMATY_TZ
 
 
 _last_status: Dict[str, Any] = {}
