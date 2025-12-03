@@ -6,7 +6,7 @@ import re
 
 from telegram.ext import ContextTypes, Application
 
-from .constants import ALMATY_TZ, DEFAULT_REPORT_CHAT
+from .constants import ALMATY_TZ, DEFAULT_REPORT_CHAT, ALLOWED_USER_IDS
 from .storage import load_accounts, get_account_name
 from .reporting import send_period_report, get_cached_report
 
@@ -118,7 +118,15 @@ def _parse_totals_from_report_text(txt: str):
 
 async def _cpa_alerts_job(context: ContextTypes.DEFAULT_TYPE):
     accounts = load_accounts() or {}
-    chat_id = str(DEFAULT_REPORT_CHAT)
+    # Алёрты шлём напрямую владельцу в личку (первый ID из ALLOWED_USER_IDS).
+    # Если по какой-то причине список пуст, используем дефолтный чат как фолбэк.
+    owner_id = None
+    try:
+        owner_id = next(iter(ALLOWED_USER_IDS))
+    except StopIteration:
+        owner_id = None
+
+    chat_id = owner_id if owner_id is not None else str(DEFAULT_REPORT_CHAT)
 
     period, label = _yesterday_period()
 

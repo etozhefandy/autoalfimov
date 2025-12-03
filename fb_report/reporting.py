@@ -117,6 +117,10 @@ def get_cached_report(aid: str, period, label: str = "") -> str:
     Возвращает текст отчёта из кеша, если свежий,
     иначе строит заново и обновляет кеш.
     """
+    # Для "today" всегда считаем отчёт на лету, без использования кэша.
+    if period == "today":
+        return build_report(aid, period, label)
+
     key = period_key(period)
     now_ts = datetime.now().timestamp()
 
