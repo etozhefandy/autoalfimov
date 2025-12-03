@@ -3,28 +3,28 @@
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional
 
-from facebook_business.adobjects.adaccount import AdAccount
+from services.facebook_api import fetch_insights
+from services.storage import (
+    load_local_insights as _load_local_insights,
+    save_local_insights as _save_local_insights,
+)
 
 from .constants import ALMATY_TZ
 from .storage import get_account_name
 
 
-# ================== ЛОКАЛЬНЫЙ КЭШ ИНСАЙТОВ (заглушки) ==================
+# ================== ЛОКАЛЬНЫЙ КЭШ ИНСАЙТОВ ==================
 def load_local_insights(aid: str) -> dict:
     """
-    Заглушка для совместимости со старым кодом:
-    всегда возвращает пустой dict,
-    чтобы fetch_insight в reporting.py мог работать без падений.
+    Читает локальный файл с инсайтами аккаунта через services.storage.
+    Совместимо со старым интерфейсом fb_report.
     """
-    return {}
+    return _load_local_insights(aid) or {}
 
 
 def save_local_insights(aid: str, store: dict) -> None:
-    """
-    Заглушка: ничего не делает.
-    Нужна только, чтобы reporting.py мог безопасно вызывать эту функцию.
-    """
-    return
+    """Атомарно сохраняет инсайты аккаунта через services.storage."""
+    _save_local_insights(aid, store)
 
 
 # ================== ОБРАБОТКА ACTIONS / ЗАЯВОК ==================
@@ -121,29 +121,12 @@ def _iter_days_for_mode(mode: str) -> List[datetime]:
 def _fetch_daily_insight(aid: str, day: datetime) -> Optional[dict]:
     """
     Точечный запрос инсайта за один день для аккаунта.
-    НЕ использует reporting.py, чтобы не создавать циклы.
+    Использует общий fetch_insights из services.facebook_api,
+    который сам работает с локальным кешем инсайтов.
     """
-    since = until = day.strftime("%Y-%m-%d")
-
-    fields = ["impressions", "spend", "actions"]
-    params = {
-        "level": "account",
-        "time_range": {"since": since, "until": until},
-    }
-
-    try:
-        acc = AdAccount(aid)
-        data = acc.get_insights(fields=fields, params=params)
-    except Exception:
-        return None
-
-    if not data:
-        return None
-
-    raw = data[0]
-    if hasattr(raw, "export_all_data"):
-        return raw.export_all_data()
-    return dict(raw)
+    since_until = day.strftime("%Y-%m-%d")
+    period = {"since": since_until, "until": since_until}
+    return fetch_insights(aid, period)
 
 
 def _load_daily_totals_for_account(
