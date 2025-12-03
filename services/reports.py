@@ -12,14 +12,12 @@ from services.storage import (
     is_cache_fresh,
     period_key,
 )
-from services.storage import load_accounts
-from config import ALMATY_TZ
 
 
 # ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
 
 def fmt_int(v: Any) -> str:
-    """Форматирование чисел с пробелами."""
+    """Форматирование целых чисел с разделителями пробелами (как в старом отчёте)."""
     try:
         return f"{int(float(v)):,}".replace(",", " ")
     except Exception:
@@ -110,55 +108,79 @@ def is_active_account(ins: Dict[str, Any]) -> bool:
 
 def build_report(aid: str, period: Any, label: str = "") -> str:
     """
-    Главный отчёт по одному аккаунту:
-    - формирует строку
-    - вытаскивает инсайты
-    - форматирует основные метрики
+    Главный отчёт по одному аккаунту.
+
+    Поведение и формат текста приведены к старой рабочей версии
+    fb_report/reporting.build_report:
+    - показы, CPM
+    - клики (все) + CTR по всем кликам
+    - "Клики" по ссылке (link_click) + CTR по ссылке
+    - CPC / затраты
+    - переписки / лиды / blended CPA (💬+📩)
     """
-    ins = fetch_insights(aid, period)
     name = get_account_name(aid)
 
-    if ins is None:
-        badge = "🔴"
-        return f"{badge} <b>{name}</b> — Нет данных за выбранный период"
+    try:
+        ins = fetch_insights(aid, period)
+    except Exception as e:  # максимально бережно, как в старой реализации
+        err = str(e)
+        if "code: 200" in err or "403" in err or "permissions" in err.lower():
+            return ""
+        return f"⚠ Ошибка по {name}:\n\n{e}"
 
-    badge = "🟢" if is_active_account(ins) else "🔴"
+    badge = "🟢" if is_active_account(ins or {}) else "🔴"
+    header = f"{badge} <b>{name}</b>" + (f" ({label})" if label else "") + "\n"
 
-    lines = []
-    title = f"{badge} <b>{name}</b>"
-    if label:
-        title += f" ({label})"
-    lines.append(title)
+    if not ins:
+        return header + "Нет данных за выбранный период"
 
-    # Основные метрики
-    lines.append(f"👁 Показы: {fmt_int(ins.get('impressions', 0))}")
-    lines.append(f"🎯 CPM: {round(float(ins.get('cpm', 0) or 0), 2)} $")
-    lines.append(f"🖱 Клики: {fmt_int(ins.get('clicks', 0))}")
-    lines.append(f"💸 CPC: {round(float(ins.get('cpc', 0) or 0), 2)} $")
+    # Базовые метрики
+    impressions = int(ins.get("impressions", 0) or 0)
+    cpm = float(ins.get("cpm", 0) or 0)
+    clicks_all = int(ins.get("clicks", 0) or 0)
+    cpc = float(ins.get("cpc", 0) or 0)
+    spend, msgs, leads, total_conv, blended_cpa = blend_totals(ins)
 
-    spend, msgs, leads, total, blended = blend_totals(ins)
-    lines.append(f"💵 Затраты: {round(spend, 2)} $")
-
+    # actions → link_clicks
+    acts = extract_actions(ins)
     flags = get_metrics_flags(aid)
 
+    link_clicks = int(acts.get("link_click", 0) or 0)
+
+    # CTR'ы считаем сами
+    ctr_all = (clicks_all / impressions * 100.0) if impressions > 0 else 0.0
+    ctr_link = (link_clicks / impressions * 100.0) if impressions > 0 else 0.0
+
+    body: list[str] = []
+    body.append(f"👁 Показы: {fmt_int(impressions)}")
+    body.append(f"🎯 CPM: {cpm:.2f} $")
+    body.append(f"🖱 Клики (все): {fmt_int(clicks_all)}")
+    body.append(f"📈 CTR (все клики): {ctr_all:.2f} %")
+    body.append(f"🔗 Клики: {fmt_int(link_clicks)}")
+    body.append(f"📈 CTR (по ссылке): {ctr_link:.2f} %")
+    body.append(f"💸 CPC: {cpc:.2f} $")
+    body.append(f"💵 Затраты: {spend:.2f} $")
+
     if flags["messaging"]:
-        lines.append(f"✉️ Переписки: {msgs}")
+        body.append(f"✉️ Переписки: {msgs}")
         if msgs > 0:
-            lines.append(f"💬💲 Цена переписки: {round(spend / msgs, 2)} $")
+            body.append(f"💬💲 Цена переписки: {(spend / msgs):.2f} $")
 
     if flags["leads"]:
-        lines.append(f"📩 Лиды: {leads}")
+        body.append(f"📩 Лиды: {leads}")
         if leads > 0:
-            lines.append(f"📩💲 Цена лида: {round(spend / leads, 2)} $")
+            body.append(f"📩💲 Цена лида: {(spend / leads):.2f} $")
 
     if flags["messaging"] and flags["leads"]:
-        lines.append("—")
-        if total > 0:
-            lines.append(f"🧮 Итого: {total} заявок, CPA = {round(blended, 2)} $")
+        body.append("—")
+        if total_conv > 0:
+            body.append(
+                f"🧮 Итого: {total_conv} заявок, CPA = {blended_cpa:.2f} $"
+            )
         else:
-            lines.append("🧮 Итого: 0 заявок")
+            body.append("🧮 Итого: 0 заявок")
 
-    return "\n".join(lines)
+    return header + "\n".join(body)
 
 
 # ========== ОБЁРТКА С КЭШЕМ ==========
@@ -170,6 +192,11 @@ def get_cached_report(aid: str, period: Any, label: str = "") -> str:
     - или строит заново,
     - сохраняет в кэш.
     """
+    # Для периода "today" всегда берём живые данные без кэша,
+    # чтобы отчёт отражал текущую ситуацию.
+    if period == "today":
+        return build_report(aid, period, label)
+
     key = period_key(period)
     entry = get_cached_report_entry(aid, key)
 
@@ -186,14 +213,9 @@ def get_cached_report(aid: str, period: Any, label: str = "") -> str:
 def build_comparison_report(
     aid: str,
     period1: Any, label1: str,
-    period2: Any, label2: str
+    period2: Any, label2: str,
 ) -> str:
-    """
-    Сравнение двух периодов:
-    - старый период
-    - новый период
-    - дельта
-    """
+    """Сравнение двух периодов (поведение, как в fb_report/reporting)."""
     name = get_account_name(aid)
 
     ins1 = fetch_insights(aid, period1)
@@ -204,111 +226,151 @@ def build_comparison_report(
 
     flags = get_metrics_flags(aid)
 
-    # Маленькая функция для аккуратной статистики
     def _stat(ins: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         if not ins:
             return {
-                "impr": 0, "spend": 0, "clicks": 0, "cpm": 0, "cpc": 0,
-                "msgs": 0, "leads": 0, "total": 0, "cpa": None,
+                "impr": 0,
+                "cpm": 0.0,
+                "clicks": 0,
+                "cpc": 0.0,
+                "spend": 0.0,
+                "msgs": 0,
+                "leads": 0,
+                "total": 0,
+                "cpa": None,
             }
-        spend, msgs, leads, total, cpa = blend_totals(ins)
+        impr = int(ins.get("impressions", 0) or 0)
+        cpm = float(ins.get("cpm", 0) or 0)
+        clicks = int(ins.get("clicks", 0) or 0)
+        cpc = float(ins.get("cpc", 0) or 0)
+        spend, msgs, leads, total, blended = blend_totals(ins)
         return {
-            "impr": int(ins.get("impressions", 0) or 0),
-            "clicks": int(ins.get("clicks", 0) or 0),
-            "cpm": float(ins.get("cpm", 0) or 0),
-            "cpc": float(ins.get("cpc", 0) or 0),
+            "impr": impr,
+            "cpm": cpm,
+            "clicks": clicks,
+            "cpc": cpc,
             "spend": spend,
             "msgs": msgs,
             "leads": leads,
             "total": total,
-            "cpa": cpa,
+            "cpa": blended,
         }
 
     s1 = _stat(ins1)
     s2 = _stat(ins2)
 
-    # Функция проц. изменения
-    def pct(old: float, new: float):
+    def _fmt_money(v: float) -> str:
+        return f"{v:.2f} $"
+
+    def _fmt_cpa(cpa: Optional[float]) -> str:
+        return f"{cpa:.2f} $" if cpa is not None else "—"
+
+    def _pct(old: float, new: float) -> Optional[float]:
         if old == 0:
             return None
         return (new - old) / old * 100.0
 
-    lines = []
+    lines: list[str] = []
     lines.append(f"📊 <b>{name}</b>")
     lines.append(f"Старый период: {label1}")
     lines.append(f"Новый период: {label2}")
     lines.append("")
 
-    # Блок старого периода
-    lines.append(f"1️⃣ <b>{label1}</b>")
+    # 1️⃣ Старый
+    lines.append(f"1️⃣ <b>{label1}</b> (старый период)")
     lines.append(f"   👁 Охваты: {fmt_int(s1['impr'])}")
     lines.append(f"   🖱 Клики: {fmt_int(s1['clicks'])}")
-    lines.append(f"   💵 Затраты: {s1['spend']:.2f} $")
+    lines.append(f"   💵 Затраты: {_fmt_money(s1['spend'])}")
     lines.append(f"   🎯 CPM: {s1['cpm']:.2f} $")
     lines.append(f"   💸 CPC: {s1['cpc']:.2f} $")
-    if flags["messaging"]: lines.append(f"   💬 Переписки: {s1['msgs']}")
-    if flags["leads"]:     lines.append(f"   📩 Лиды: {s1['leads']}")
+    if flags["messaging"]:
+        lines.append(f"   💬 Переписки: {s1['msgs']}")
+    if flags["leads"]:
+        lines.append(f"   📩 Лиды: {s1['leads']}")
     if flags["messaging"] or flags["leads"]:
-        lines.append(f"   🧮 Итого заявок: {s1['total']}")
-        lines.append(f"   🎯 CPA: {s1['cpa'] if s1['cpa'] is not None else '—'}")
+        lines.append(f"   🧮 Заявки всего: {s1['total']}")
+        lines.append(f"   🎯 CPA: {_fmt_cpa(s1['cpa'])}")
     lines.append("")
 
-    # Новый период
-    lines.append(f"2️⃣ <b>{label2}</b>")
+    # 2️⃣ Новый
+    lines.append(f"2️⃣ <b>{label2}</b> (новый период)")
     lines.append(f"   👁 Охваты: {fmt_int(s2['impr'])}")
     lines.append(f"   🖱 Клики: {fmt_int(s2['clicks'])}")
-    lines.append(f"   💵 Затраты: {s2['spend']:.2f} $")
+    lines.append(f"   💵 Затраты: {_fmt_money(s2['spend'])}")
     lines.append(f"   🎯 CPM: {s2['cpm']:.2f} $")
     lines.append(f"   💸 CPC: {s2['cpc']:.2f} $")
-    if flags["messaging"]: lines.append(f"   💬 Переписки: {s2['msgs']}")
-    if flags["leads"]:     lines.append(f"   📩 Лиды: {s2['leads']}")
+    if flags["messaging"]:
+        lines.append(f"   💬 Переписки: {s2['msgs']}")
+    if flags["leads"]:
+        lines.append(f"   📩 Лиды: {s2['leads']}")
     if flags["messaging"] or flags["leads"]:
-        lines.append(f"   🧮 Итого заявок: {s2['total']}")
-        lines.append(f"   🎯 CPA: {s2['cpa'] if s2['cpa'] is not None else '—'}")
+        lines.append(f"   🧮 Заявки всего: {s2['total']}")
+        lines.append(f"   🎯 CPA: {_fmt_cpa(s2['cpa'])}")
     lines.append("")
 
-    # Дельты
-    lines.append("3️⃣ <b>Сравнение</b>")
-    fields = [
-        ("Охваты", "impr", False, "👁"),
-        ("Клики", "clicks", False, "🖱"),
-        ("Затраты", "spend", False, "💵"),
-        ("CPM", "cpm", True, "🎯"),
-        ("CPC", "cpc", True, "💸"),
-    ]
+    # 3️⃣ Сравнение (новый vs старый)
+    lines.append("3️⃣ <b>Сравнение (новый vs старый)</b>")
 
-    for label, field, lower_is_better, icon in fields:
-        old = s1[field]
-        new = s2[field]
-        base = f"{icon} {label}: {fmt_int(old)} → {fmt_int(new)}"
-        diff = pct(old, new)
+    def _add_diff(
+        label: str,
+        old_v: float,
+        new_v: float,
+        is_better_lower: bool = False,
+        fmt_func=None,
+        icon: str = "",
+    ) -> None:
+        if fmt_func is None:
+            fmt_func = lambda x: str(int(x))
+        base = f"{icon} {label}: {fmt_func(old_v)} → {fmt_func(new_v)}"
+        pct = _pct(old_v, new_v)
+        if pct is None:
+            lines.append(base + " (Δ %: н/д)")
+            return
+        if pct == 0:
+            sign = "➡️"
+        else:
+            sign = (
+                "📈"
+                if ((not is_better_lower and pct > 0) or (is_better_lower and pct < 0))
+                else "📉"
+            )
+        lines.append(f"{base}   {sign} {pct:+.1f}%")
 
-        if diff is None:
-            lines.append(base + " (Δ н/д)")
-            continue
+    _add_diff("Охваты", s1["impr"], s2["impr"], False, fmt_int, "👁")
+    _add_diff("Клики", s1["clicks"], s2["clicks"], False, fmt_int, "🖱")
+    _add_diff("Затраты", s1["spend"], s2["spend"], False, _fmt_money, "💵")
+    _add_diff("CPM", s1["cpm"], s2["cpm"], True, lambda v: f"{v:.2f} $", "🎯")
+    _add_diff("CPC", s1["cpc"], s2["cpc"], True, lambda v: f"{v:.2f} $", "💸")
 
-        sign = "📈" if ((not lower_is_better and diff > 0) or (lower_is_better and diff < 0)) else "📉"
-        lines.append(f"{base}   {sign} {diff:+.1f}%")
-
-    # заявки / CPA
     if flags["messaging"]:
-        old, new = s1["msgs"], s2["msgs"]
-        diff = pct(old, new)
-        lines.append(f"💬 Переписки: {old} → {new} ({diff:+.1f}%)" if diff else f"💬 Переписки: {old} → {new}")
-
+        _add_diff(
+            "Переписки",
+            s1["msgs"],
+            s2["msgs"],
+            False,
+            lambda v: str(int(v)),
+            "💬",
+        )
     if flags["leads"]:
-        old, new = s1["leads"], s2["leads"]
-        diff = pct(old, new)
-        lines.append(f"📩 Лиды: {old} → {new} ({diff:+.1f}%)" if diff else f"📩 Лиды: {old} → {new}")
+        _add_diff(
+            "Лиды",
+            s1["leads"],
+            s2["leads"],
+            False,
+            lambda v: str(int(v)),
+            "📩",
+        )
 
     if flags["messaging"] or flags["leads"]:
-        old, new = s1["total"], s2["total"]
-        diff = pct(old, new)
-        lines.append(f"🧮 Заявки: {old} → {new} ({diff:+.1f}%)" if diff else f"🧮 Заявки: {old} → {new}")
-
-        old_cpa, new_cpa = s1["cpa"], s2["cpa"]
-        if old_cpa is not None and new_cpa is not None:
-            diff = pct(old_cpa, new_cpa)
-            lines.append(f"🎯 CPA: {old_cpa:.2f} $ → {new_cpa:.2f} $ ({diff:+.1f}%)")
+        _add_diff(
+            "Заявки всего",
+            s1["total"],
+            s2["total"],
+            False,
+            lambda v: str(int(v)),
+            "🧮",
+        )
+        if s1["cpa"] is not None and s2["cpa"] is not None:
+            _add_diff("CPA", s1["cpa"], s2["cpa"], True, _fmt_cpa, "🎯")
 
     return "\n".join(lines)

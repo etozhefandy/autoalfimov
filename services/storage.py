@@ -46,6 +46,40 @@ def _atomic_write_json(path: str, obj: Any) -> None:
     os.replace(tmp, path)
 
 
+# ========= ЧАСОВОЙ КЭШ (ДЕНЬ × ЧАС) =========
+
+HOURLY_STATS_FILE = os.path.join(DATA_DIR, "hourly_stats.json")
+
+
+def load_hourly_stats() -> Dict[str, Any]:
+    """Читает часовой кэш (hourly_stats.json), при ошибке возвращает {}.
+
+    Структура файла:
+    {
+      "act_123": {
+        "2025-06-01": {
+          "13": {"messages": 0, "leads": 0, "total": 0, "spend": 0.0},
+          ...
+        },
+        ...
+      },
+      "_acc": {  # служебный раздел для аккумуляторов
+        "act_123": {"messages": 0, "leads": 0, "total": 0, "spend": 0.0}
+      }
+    }
+    """
+    try:
+        with open(HOURLY_STATS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_hourly_stats(stats: Dict[str, Any]) -> None:
+    """Сохраняет часовой кэш атомарно."""
+    _atomic_write_json(HOURLY_STATS_FILE, stats)
+
+
 # ========= ACCOUNTS.JSON И МЕТА =========
 
 def ensure_accounts_file(repo_accounts_path: str | None = None) -> None:

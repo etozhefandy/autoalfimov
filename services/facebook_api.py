@@ -88,7 +88,11 @@ def fetch_insights(aid: str, period: Any) -> Optional[Dict[str, Any]]:
     store = load_local_insights(aid)
     pkey = period_key(period)
 
-    if pkey in store:
+    # Для периода "today" всегда берём свежие данные из API,
+    # игнорируя уже существующий кэш, но после запроса обновляем его.
+    use_cache = not (isinstance(period, str) and period == "today")
+
+    if use_cache and pkey in store:
         return store[pkey]  # может быть dict или None
 
     # --- 2. FACEBOOK API REQUEST ---
