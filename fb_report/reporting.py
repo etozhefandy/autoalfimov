@@ -1,8 +1,9 @@
 # fb_report/reporting.py
+
 import json
-from datetime import datetime, timedelta
+from datetime import datetime
 import re
-from typing import Tuple, Dict, Any
+from typing import Any
 
 from facebook_business.adobjects.adaccount import AdAccount
 from telegram.ext import ContextTypes
@@ -11,6 +12,7 @@ from .constants import (
     ALMATY_TZ,
     REPORT_CACHE_FILE,
     REPORT_CACHE_TTL,
+    DEFAULT_REPORT_CHAT,
 )
 from .storage import (
     get_account_name,
@@ -24,7 +26,6 @@ from .insights import (
     extract_actions,
     _blend_totals,
 )
-from .constants import DEFAULT_REPORT_CHAT  # иногда нужно в джобах
 
 
 # ========= Утилиты форматирования =========
@@ -45,12 +46,18 @@ def _load_report_cache() -> dict:
 
 
 def _save_report_cache(d: dict):
-    from .storage import _atomic_write_json  # локальный импорт, чтобы избежать циклов
+    # локальный импорт, чтобы не создавать циклы
+    from .storage import _atomic_write_json
 
     _atomic_write_json(REPORT_CACHE_FILE, d)
 
 
 def period_key(period) -> str:
+    """
+    Единый ключ для любых периодов:
+    - dict с since/until → range:YYYY-MM-DD:YYYY-MM-DD
+    - пресет ("today", "yesterday", "last_7d" etc) → preset:NAME
+    """
     if isinstance(period, dict):
         since = period.get("since", "")
         until = period.get("until", "")
@@ -58,15 +65,18 @@ def period_key(period) -> str:
     return f"preset:{str(period)}"
 
 
-# ========== ИНСАЙТЫ ==========
+# ========== ИНСАЙТЫ (сырые данные) ==========
 def fetch_insight(aid: str, period):
     """
     Достаёт инсайты:
-    - сначала из локального кэша
+    - сначала из локального кэша (load_local_insights)
     - если нет — запрашивает у Facebook
     - важно: ВСЕГДА приводим AdsInsights к обычному dict
+
+    ВНИМАНИЕ: тут НЕТ полей link_clicks / link_ctr / results / cost_per_result,
+    чтобы не ловить (#100) от Graph API.
     """
-    store = load_local_insights(aid)
+    store = load_local_insights(aid) or {}
     key = period_key(period)
 
     if key in store:
@@ -74,19 +84,10 @@ def fetch_insight(aid: str, period):
         return name, store[key]
 
     acc = AdAccount(aid)
+    # минимальный набор полей, с которыми у нас всё работает
+    fields = ["impressions", "cpm", "clicks", "cpc", "spend", "actions"]
 
-    # ВАЖНО: НЕ запрашиваем link_clicks/link_ctr/results/cost_per_result напрямую —
-    # они невалидны в некоторых конфигурациях и дают warning/ошибки.
-    fields = [
-        "impressions",
-        "cpm",
-        "clicks",
-        "cpc",
-        "spend",
-        "actions",
-    ]
-
-    params = {"level": "account"}
+    params: dict[str, Any] = {"level": "account"}
     if isinstance(period, dict):
         params["time_range"] = period
     else:
@@ -110,6 +111,7 @@ def fetch_insight(aid: str, period):
     return name, ins_dict
 
 
+# ========== КЭШ ТЕКСТОВЫХ ОТЧЁТОВ ==========
 def get_cached_report(aid: str, period, label: str = "") -> str:
     """
     Возвращает текст отчёта из кеша, если свежий,
@@ -134,9 +136,16 @@ def get_cached_report(aid: str, period, label: str = "") -> str:
     return text
 
 
+# ========== СБОРКА ОТЧЁТА ПО АККАУНТУ ==========
 def build_report(aid: str, period, label: str = "") -> str:
-    from .storage import get_account_name  # чтобы избежать циклов
-
+    """
+    Базовый отчёт по аккаунту:
+    - показы, CPM
+    - клики (все) + CTR по всем кликам
+    - "Клики" по ссылке (link_click) + CTR по ссылке
+    - CPC / затраты
+    - переписки / лиды / blended CPA (как в старом боте)
+    """
     try:
         name, ins = fetch_insight(aid, period)
     except Exception as e:
@@ -146,100 +155,60 @@ def build_report(aid: str, period, label: str = "") -> str:
         return f"⚠ Ошибка по {get_account_name(aid)}:\n\n{e}"
 
     badge = "🟢" if is_active(aid) else "🔴"
-    hdr = f"{badge} <b>{name}</b>{(' ('+label+')') if label else ''}\n"
+    hdr = f"{badge} <b>{name}</b>{(' (' + label + ')') if label else ''}\n"
     if not ins:
         return hdr + "Нет данных за выбранный период"
 
-    body = []
-
+    # Базовые метрики
     impressions = int(ins.get("impressions", 0) or 0)
     cpm = float(ins.get("cpm", 0) or 0)
     clicks_all = int(ins.get("clicks", 0) or 0)
-    cpc_all = float(ins.get("cpc", 0) or 0)
+    cpc = float(ins.get("cpc", 0) or 0)
     spend = float(ins.get("spend", 0) or 0)
 
     acts = extract_actions(ins)
     flags = metrics_flags(aid)
 
-    # клики по ссылке достаём из actions['link_click']
+    # link_click берём из actions (action_type="link_click"),
+    # не трогая fields=... у запроса, чтобы не ломать insights.
     link_clicks = int(acts.get("link_click", 0) or 0)
 
+    # CTR'ы считаем сами
     ctr_all = (clicks_all / impressions * 100.0) if impressions > 0 else 0.0
     ctr_link = (link_clicks / impressions * 100.0) if impressions > 0 else 0.0
 
-    # базовые метрики
+    # Заявки (как в старом боте)
+    # msgs + leads и blended CPA рассчитываем через _blend_totals
+    # (он уже использует те же action_type, что и раньше).
+    _, msgs, leads, total_conv, blended_cpa = _blend_totals(ins)
+
+    body = []
     body.append(f"👁 Показы: {fmt_int(impressions)}")
     body.append(f"🎯 CPM: {cpm:.2f} $")
-
-    # клики (все) + CTR по всем кликам
     body.append(f"🖱 Клики (все): {fmt_int(clicks_all)}")
     body.append(f"📈 CTR (все клики): {ctr_all:.2f} %")
-
-    # клики по ссылке, в тексте просто "Клики" + CTR по ссылке
     body.append(f"🔗 Клики: {fmt_int(link_clicks)}")
     body.append(f"📈 CTR (по ссылке): {ctr_link:.2f} %")
-
-    body.append(f"💸 CPC: {cpc_all:.2f} $")
+    body.append(f"💸 CPC: {cpc:.2f} $")
     body.append(f"💵 Затраты: {spend:.2f} $")
-
-    # ===== ЗАЯВКИ: переписки + лиды =====
-
-    # 1) Явно известные ключи
-    msg_keys = [
-        "onsite_conversion.messaging_conversation_started_7d",
-        "onsite_conversion.messaging_conversation_started",
-    ]
-    msgs = 0
-    for k in msg_keys:
-        msgs += int(acts.get(k, 0) or 0)
-
-    lead_keys = [
-        "Website Submit Applications",
-        "offsite_conversion.fb_pixel_submit_application",
-        "offsite_conversion.fb_pixel_lead",
-        "lead",
-    ]
-    leads = 0
-    for k in lead_keys:
-        leads += int(acts.get(k, 0) or 0)
-
-    # 2) Фолбэк: всё, где в action_type есть "messaging_conversation" — считаем переписками,
-    # всё, где есть "submit_application" или "lead" — считаем лидами
-    if msgs == 0:
-        msgs = int(
-            sum(
-                float(v or 0)
-                for key, v in acts.items()
-                if "messaging_conversation" in str(key).lower()
-            )
-        )
-
-    if leads == 0:
-        leads = int(
-            sum(
-                float(v or 0)
-                for key, v in acts.items()
-                if "submit_application" in str(key).lower()
-                or "lead" in str(key).lower()
-            )
-        )
 
     if flags["messaging"]:
         body.append(f"✉️ Переписки: {msgs}")
         if msgs > 0:
-            body.append(f"💬💲 Цена переписки: {round(spend / msgs, 2)} $")
+            body.append(f"💬💲 Цена переписки: {(spend / msgs):.2f} $")
 
     if flags["leads"]:
         body.append(f"📩 Лиды: {leads}")
         if leads > 0:
-            body.append(f"📩💲 Цена лида: {round(spend / leads, 2)} $")
+            body.append(f"📩💲 Цена лида: {(spend / leads):.2f} $")
 
+    # Итоговая строка при обеих метриках (как было раньше)
     if flags["messaging"] and flags["leads"]:
-        total = msgs + leads
         body.append("—")
-        if total > 0:
-            blended = round(spend / total, 2)
-            body.append(f"🧮 Итого: {total} заявок, CPA = {blended} $")
+        if total_conv > 0:
+            body.append(
+                f"🧮 Итого: {total_conv} заявок, CPA = {blended_cpa:.2f} $"
+            )
         else:
             body.append("🧮 Итого: 0 заявок")
 
@@ -247,7 +216,10 @@ def build_report(aid: str, period, label: str = "") -> str:
 
 
 async def send_period_report(
-    ctx: ContextTypes.DEFAULT_TYPE, chat_id: str, period, label: str = ""
+    ctx: ContextTypes.DEFAULT_TYPE,
+    chat_id: str,
+    period,
+    label: str = "",
 ):
     """
     Всегда шлём отчёты ТОЛЬКО по enabled=True аккаунтам.
@@ -268,11 +240,17 @@ async def send_period_report(
             txt = get_cached_report(aid, period, label)
 
         if txt:
-            await ctx.bot.send_message(chat_id=chat_id, text=txt, parse_mode="HTML")
+            await ctx.bot.send_message(
+                chat_id=chat_id,
+                text=txt,
+                parse_mode="HTML",
+            )
 
 
 # ======== Сравнение периодов =========
-def build_comparison_report(aid: str, period1, label1: str, period2, label2: str) -> str:
+def build_comparison_report(
+    aid: str, period1, label1: str, period2, label2: str
+) -> str:
     from .storage import get_account_name
 
     def _extract_since(p):
@@ -418,12 +396,33 @@ def build_comparison_report(aid: str, period1, label1: str, period2, label2: str
     _add_diff("CPC", s1["cpc"], s2["cpc"], True, lambda v: f"{v:.2f} $", "💸")
 
     if flags["messaging"]:
-        _add_diff("Переписки", s1["msgs"], s2["msgs"], False, lambda v: str(int(v)), "💬")
+        _add_diff(
+            "Переписки",
+            s1["msgs"],
+            s2["msgs"],
+            False,
+            lambda v: str(int(v)),
+            "💬",
+        )
     if flags["leads"]:
-        _add_diff("Лиды", s1["leads"], s2["leads"], False, lambda v: str(int(v)), "📩")
+        _add_diff(
+            "Лиды",
+            s1["leads"],
+            s2["leads"],
+            False,
+            lambda v: str(int(v)),
+            "📩",
+        )
 
     if flags["messaging"] or flags["leads"]:
-        _add_diff("Заявки всего", s1["total"], s2["total"], False, lambda v: str(int(v)), "🧮")
+        _add_diff(
+            "Заявки всего",
+            s1["total"],
+            s2["total"],
+            False,
+            lambda v: str(int(v)),
+            "🧮",
+        )
         if s1["cpa"] is not None and s2["cpa"] is not None:
             _add_diff("CPA", s1["cpa"], s2["cpa"], True, _fmt_cpa, "🎯")
 

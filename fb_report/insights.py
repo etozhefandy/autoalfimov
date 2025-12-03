@@ -2,109 +2,89 @@
 
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional
-import re
+
+from facebook_business.adobjects.adaccount import AdAccount
 
 from .constants import ALMATY_TZ
+from .storage import get_account_name
 
 
-# ===== Заглушки под старый API, чтобы reporting.py не падал =====
-
-def load_local_insights(*args, **kwargs):
+# ================== ЛОКАЛЬНЫЙ КЭШ ИНСАЙТОВ (заглушки) ==================
+def load_local_insights(aid: str) -> dict:
+    """
+    Заглушка для совместимости со старым кодом:
+    всегда возвращает пустой dict,
+    чтобы fetch_insight в reporting.py мог работать без падений.
+    """
     return {}
 
 
-def save_local_insights(*args, **kwargs):
-    return None
-
-
-def extract_actions(*args, **kwargs):
-    return {}
-
-
-def _blend_totals(*args, **kwargs):
-    return args[0] if args else {}
-
-
-# ===== Локальный парсер итогов из текстового отчёта =====
-
-def _parse_totals_from_report_text(txt: str):
+def save_local_insights(aid: str, store: dict) -> None:
     """
-    Парсим итоговые значения из текстового отчёта по аккаунту.
-
-    Ориентируемся НЕ на эмодзи, а на текст:
-      - "Переписки" -> сообщения
-      - "Лиды"      -> лиды
-      - "Затраты"   -> spend
-      - "Итого: X заявок" -> total_conversions
-
-    Если строки "Итого" нет, считаем total_conversions = messages + leads.
+    Заглушка: ничего не делает.
+    Нужна только, чтобы reporting.py мог безопасно вызывать эту функцию.
     """
-
-    messages = 0
-    leads = 0
-    spend = 0.0
-    total_convs = 0
-
-    # любые числа после слов "Переписки" / "Лиды" / "Затраты"
-    line_msg_pattern = re.compile(r"Переписк[аеи][^0-9]*?(\d+)")
-    line_lead_pattern = re.compile(r"Лид[ыа][^0-9]*?(\d+)")
-    line_spend_pattern = re.compile(r"Затраты[^0-9]*?([0-9]+[.,]?[0-9]*)")
-
-    # строка формата "Итого: 12 заявок"
-    total_conv_pattern = re.compile(r"Итого[^0-9]*?(\d+)\s+заяв", re.IGNORECASE)
-
-    for line in txt.splitlines():
-        # Итого X заявок
-        m_total = total_conv_pattern.search(line)
-        if m_total:
-            try:
-                total_convs = int(m_total.group(1))
-            except Exception:
-                pass
-
-        # Переписки
-        m_msg = line_msg_pattern.search(line)
-        if m_msg:
-            try:
-                messages = int(m_msg.group(1))
-            except Exception:
-                pass
-
-        # Лиды
-        m_lead = line_lead_pattern.search(line)
-        if m_lead:
-            try:
-                leads = int(m_lead.group(1))
-            except Exception:
-                pass
-
-        # Затраты
-        m_spend = line_spend_pattern.search(line)
-        if m_spend:
-            try:
-                spend = float(m_spend.group(1).replace(",", "."))
-            except Exception:
-                pass
-
-    if total_convs == 0:
-        total_convs = messages + leads
-
-    cpa = None
-    if total_convs > 0 and spend > 0:
-        cpa = spend / total_convs
-
-    return {
-        "messages": messages,
-        "leads": leads,
-        "total_conversions": total_convs,
-        "spend": spend,
-        "cpa": cpa,
-    }
+    return
 
 
-# ===== Вспомогательные функции для тепловой карты =====
+# ================== ОБРАБОТКА ACTIONS / ЗАЯВОК ==================
+def extract_actions(insight: dict) -> Dict[str, float]:
+    """
+    Старое поведение: берём массив actions и делаем dict {action_type: value}.
+    Это 1-в-1 логика из твоего старого fb_report.py.
+    """
+    acts = insight.get("actions", []) or []
+    out: Dict[str, float] = {}
+    for a in acts:
+        at = a.get("action_type")
+        if not at:
+            continue
+        try:
+            val = float(a.get("value", 0) or 0)
+        except Exception:
+            val = 0.0
+        out[at] = val
+    return out
 
+
+def _blend_totals(ins: dict):
+    """
+    Полностью как в старом боте:
+
+    - msgs = onsite_conversion.messaging_conversation_started_7d
+    - leads = Website Submit Applications
+              или offsite_conversion.fb_pixel_submit_application
+              или offsite_conversion.fb_pixel_lead
+              или lead
+    - total = msgs + leads
+    - blended = spend / total (если total > 0), иначе None
+
+    Возвращает (spend, msgs, leads, total, blended).
+    """
+    acts = extract_actions(ins)
+    spend = float(ins.get("spend", 0) or 0)
+
+    msgs = int(
+        acts.get("onsite_conversion.messaging_conversation_started_7d", 0) or 0
+    )
+
+    leads = int(
+        acts.get("Website Submit Applications", 0)
+        or acts.get("offsite_conversion.fb_pixel_submit_application", 0)
+        or acts.get("offsite_conversion.fb_pixel_lead", 0)
+        or acts.get("lead", 0)
+        or 0
+    )
+
+    total = msgs + leads
+    blended = (spend / total) if total > 0 else None
+
+    return spend, msgs, leads, total, blended
+
+
+# ================== ВСПОМОГАТЕЛЬНОЕ ДЛЯ ДНЕЙ ==================
 def _build_day_period(day: datetime) -> Tuple[Dict[str, str], str]:
+    """Формирует period/label для одного дня (как в дневном отчёте)."""
     day = day.replace(hour=0, minute=0, second=0, microsecond=0)
     period = {
         "since": day.strftime("%Y-%m-%d"),
@@ -116,52 +96,74 @@ def _build_day_period(day: datetime) -> Tuple[Dict[str, str], str]:
 
 def _iter_days_for_mode(mode: str) -> List[datetime]:
     """
-    Теперь по-честному включаем СЕГОДНЯ в "последние X дней".
-
-    mode:
-      "7"    -> последние 7 календарных дней, включая сегодня
-      "14"   -> последние 14 календарных дней, включая сегодня
-      "month"-> текущий календарный месяц до сегодня включительно
+    mode: "7" | "14" | "month"
+    Возвращает список дат (datetime) ДЛЯ ПРОШЕДШИХ дней
+    (с вчерашнего назад до нужного количества).
     """
     now = datetime.now(ALMATY_TZ)
-    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    yesterday = (now - timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
 
     if mode == "14":
         days = 14
-        return [today - timedelta(days=i) for i in range(days)][::-1]
+        return [yesterday - timedelta(days=i) for i in range(days)][::-1]
     elif mode == "month":
-        first_of_month = today.replace(day=1)
-        days_delta = (today - first_of_month).days + 1
+        first_of_month = yesterday.replace(day=1)
+        days_delta = (yesterday - first_of_month).days + 1
         return [first_of_month + timedelta(days=i) for i in range(days_delta)]
     else:
+        # по умолчанию 7 дней
         days = 7
-        return [today - timedelta(days=i) for i in range(days)][::-1]
+        return [yesterday - timedelta(days=i) for i in range(days)][::-1]
+
+
+def _fetch_daily_insight(aid: str, day: datetime) -> Optional[dict]:
+    """
+    Точечный запрос инсайта за один день для аккаунта.
+    НЕ использует reporting.py, чтобы не создавать циклы.
+    """
+    since = until = day.strftime("%Y-%m-%d")
+
+    fields = ["impressions", "spend", "actions"]
+    params = {
+        "level": "account",
+        "time_range": {"since": since, "until": until},
+    }
+
+    try:
+        acc = AdAccount(aid)
+        data = acc.get_insights(fields=fields, params=params)
+    except Exception:
+        return None
+
+    if not data:
+        return None
+
+    raw = data[0]
+    if hasattr(raw, "export_all_data"):
+        return raw.export_all_data()
+    return dict(raw)
 
 
 def _load_daily_totals_for_account(
-    aid: str,
-    mode: str,
-    get_cached_report,
+    aid: str, mode: str
 ) -> List[Dict[str, Optional[float]]]:
     """
-    Для каждого дня периода берём кэш отчёта по аккаунту
-    и парсим:
-      - messages
-      - leads
-      - total_conversions (заявки = 💬 + лиды)
-      - spend
+    Для каждого дня периода вытаскивает инсайты по аккаунту
+    и парсит из них:
+    - messages
+    - leads
+    - total_conversions (💬+📩)
+    - spend
     """
     days = _iter_days_for_mode(mode)
     result: List[Dict[str, Optional[float]]] = []
 
     for day in days:
-        period, label = _build_day_period(day)
-        try:
-            txt = get_cached_report(aid, period, label)
-        except Exception:
-            txt = None
+        ins = _fetch_daily_insight(aid, day)
 
-        if not txt:
+        if not ins:
             result.append(
                 {
                     "date": day,
@@ -173,32 +175,29 @@ def _load_daily_totals_for_account(
             )
             continue
 
-        totals = _parse_totals_from_report_text(txt) or {}
+        spend, msgs, leads, total, _ = _blend_totals(ins)
         result.append(
             {
                 "date": day,
-                "messages": int(totals.get("messages") or 0),
-                "leads": int(totals.get("leads") or 0),
-                "total_conversions": int(
-                    totals.get("total_conversions") or 0
-                ),
-                "spend": float(totals.get("spend") or 0.0),
+                "messages": msgs,
+                "leads": leads,
+                "total_conversions": total,
+                "spend": spend,
             }
         )
 
     return result
 
 
-def _heat_symbol(
-    convs: int,
-    max_convs: int,
-) -> str:
+# ================== ВИЗУАЛ ТЕПЛОВОЙ КАРТЫ ==================
+def _heat_symbol(convs: int, max_convs: int) -> str:
     """
-    0      -> ⬜
-    >0..25%   -> ▢
-    >25..50%  -> ▤
-    >50..75%  -> ▦
-    >75..100% -> ▩
+    4 стадии «теплоты» + пустой квадрат при 0:
+    0          -> ⬜
+    >0..25%    -> ▢
+    >25..50%   -> ▤
+    >50..75%   -> ▦
+    >75..100%  -> ▩
     """
     if max_convs <= 0:
         return "⬜"
@@ -227,20 +226,20 @@ def _mode_label(mode: str) -> str:
 
 def build_heatmap_for_account(
     aid: str,
-    get_account_name,
-    get_cached_report,
+    get_account_name_fn=get_account_name,
     mode: str = "7",
 ) -> str:
     """
-    Тепловая карта по дням:
-
-    - заявки считаем как 💬 + лиды (из текста отчёта)
-    - период реально соответствует надписи (7/14 дней, месяц с сегодня)
+    Строит «тепловую карту» по дням для аккаунта:
+    - берёт инсайты за каждый день периода
+    - считает заявки через старый _blend_totals (💬+📩)
+    - отображает интенсивность по 4 уровням
+    - показывает средние заявки в день
     """
-    acc_name = get_account_name(aid)
+    acc_name = get_account_name_fn(aid)
     mode_label = _mode_label(mode)
 
-    daily = _load_daily_totals_for_account(aid, mode, get_cached_report)
+    daily = _load_daily_totals_for_account(aid, mode)
 
     if not daily:
         return f"🔥 Тепловая карта — {acc_name}\nЗа период ({mode_label}) нет данных."
@@ -268,16 +267,14 @@ def build_heatmap_for_account(
 
     lines.append(
         f"Итого за период: {total_convs_all} заявок "
-        f"(💬 {total_msgs_all} + 📩 {total_leads_all}), "
+        f"(💬 {total_msgs_all} + ♿️ {total_leads_all}), "
         f"затраты: {total_spend_all:.2f} $"
     )
     if days_with_data > 0:
-        lines.append(
-            f"Среднее заявок в день (по дням с трафиком): {avg_convs:.2f}"
-        )
+        lines.append(f"Среднее заявок в день (по дням с трафиком): {avg_convs:.2f}")
     lines.append("")
 
-    header = "Дата       Инт.  Заявки  💬   📩   💵"
+    header = "Дата       Инт.  Заявки  💬   ♿️   💵"
     lines.append(header)
     lines.append("-" * len(header))
 

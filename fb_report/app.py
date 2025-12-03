@@ -687,7 +687,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("one_today|"):
         aid = data.split("|", 1)[1]
-        label = datetime.now(ALMATY_TZ).strftime("%d.%м.%Y")
+        label = datetime.now(ALMATY_TZ).strftime("%d.%m.%Y")
         await q.edit_message_text(
             f"Отчёт по {get_account_name(aid)} за {label}:"
         )
