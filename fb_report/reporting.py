@@ -79,7 +79,11 @@ def fetch_insight(aid: str, period):
     store = load_local_insights(aid) or {}
     key = period_key(period)
 
-    if key in store:
+    # Для периода "today" всегда берём свежие данные из API,
+    # игнорируя имеющуюся запись в локальном кеше.
+    use_cache = not (isinstance(period, str) and period == "today")
+
+    if use_cache and key in store:
         name = get_account_name(aid)
         return name, store[key]
 

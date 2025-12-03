@@ -607,19 +607,19 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("hm7|"):
         aid = data.split("|")[1]
-        heat = build_heatmap_for_account(aid, get_account_name, get_cached_report, mode="7")
+        heat = build_heatmap_for_account(aid, get_account_name, mode="7")
         await q.edit_message_text(heat, parse_mode="HTML")
         return
 
     if data.startswith("hm14|"):
         aid = data.split("|")[1]
-        heat = build_heatmap_for_account(aid, get_account_name, get_cached_report, mode="14")
+        heat = build_heatmap_for_account(aid, get_account_name, mode="14")
         await q.edit_message_text(heat, parse_mode="HTML")
         return
 
     if data.startswith("hmmonth|"):
         aid = data.split("|")[1]
-        heat = build_heatmap_for_account(aid, get_account_name, get_cached_report, mode="month")
+        heat = build_heatmap_for_account(aid, get_account_name, mode="month")
         await q.edit_message_text(heat, parse_mode="HTML")
         return
 
