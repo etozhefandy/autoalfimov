@@ -714,6 +714,9 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        from .storage import metrics_flags
+
+        flags = metrics_flags(aid)
         lines = [f"📊 Кампании — {name} (посл. 7 дней)"]
         for idx, c in enumerate(camps, start=1):
             spend = c.get("spend", 0.0) or 0.0
@@ -721,15 +724,25 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             clicks = c.get("clicks", 0) or 0
             msgs = c.get("msgs", 0) or 0
             leads = c.get("leads", 0) or 0
-            total = c.get("total", 0) or 0
-            cpa = c.get("cpa")
-            cpa_txt = f"{cpa:.2f}$" if cpa is not None else "—"
 
-            lines.append(
-                f"{idx}. {c.get('name')}\n"
-                f"   👀 {impr}  🔍 {clicks}  💵 {spend:.2f} $\n"
-                f"   💬 {msgs}  📩 {leads}  Итого: {total}  CPA: {cpa_txt}"
-            )
+            # Учитываем настройки метрик аккаунта
+            eff_msgs = msgs if flags.get("messaging") else 0
+            eff_leads = leads if flags.get("leads") else 0
+            eff_total = eff_msgs + eff_leads
+            cpa_eff = (spend / eff_total) if eff_total > 0 else None
+
+            parts = [
+                f"{idx}. {c.get('name')}",
+                f"   👀 {impr}  🔍 {clicks}  💵 {spend:.2f} $",
+            ]
+            if flags.get("messaging"):
+                parts.append(f"   💬 {msgs}")
+            if flags.get("leads"):
+                parts.append(f"   📩 {leads}")
+            if flags.get("messaging") or flags.get("leads"):
+                parts.append(f"   Итого: {eff_total}  CPA: {cpa_eff:.2f}$" if cpa_eff is not None else f"   Итого: {eff_total}  CPA: —")
+
+            lines.append("\n".join(parts))
 
         await context.bot.send_message(chat_id, "\n".join(lines))
         return
@@ -752,6 +765,9 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # сортируем по spend по убыванию
         adsets_sorted = sorted(adsets, key=lambda x: x.get("spend", 0.0), reverse=True)
 
+        from .storage import metrics_flags
+
+        flags = metrics_flags(aid)
         lines = [f"📊 Адсеты — {name} (посл. 7 дней)"]
         for idx, a in enumerate(adsets_sorted, start=1):
             spend = a.get("spend", 0.0) or 0.0
@@ -759,15 +775,24 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             clicks = a.get("clicks", 0) or 0
             msgs = a.get("msgs", 0) or 0
             leads = a.get("leads", 0) or 0
-            total = a.get("total", 0) or 0
-            cpa = a.get("cpa")
-            cpa_txt = f"{cpa:.2f}$" if cpa is not None else "—"
 
-            lines.append(
-                f"{idx}. {a.get('name')}\n"
-                f"   👀 {impr}  🔍 {clicks}  💵 {spend:.2f} $\n"
-                f"   💬 {msgs}  📩 {leads}  Итого: {total}  CPA: {cpa_txt}"
-            )
+            eff_msgs = msgs if flags.get("messaging") else 0
+            eff_leads = leads if flags.get("leads") else 0
+            eff_total = eff_msgs + eff_leads
+            cpa_eff = (spend / eff_total) if eff_total > 0 else None
+
+            parts = [
+                f"{idx}. {a.get('name')}",
+                f"   👀 {impr}  🔍 {clicks}  💵 {spend:.2f} $",
+            ]
+            if flags.get("messaging"):
+                parts.append(f"   💬 {msgs}")
+            if flags.get("leads"):
+                parts.append(f"   📩 {leads}")
+            if flags.get("messaging") or flags.get("leads"):
+                parts.append(f"   Итого: {eff_total}  CPA: {cpa_eff:.2f}$" if cpa_eff is not None else f"   Итого: {eff_total}  CPA: —")
+
+            lines.append("\n".join(parts))
 
         await context.bot.send_message(chat_id, "\n".join(lines))
         return

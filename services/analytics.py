@@ -149,6 +149,9 @@ def analyze_adsets(aid: str, days: int = 7) -> List[Dict[str, Any]]:
         ins = fetch_insights_by_level(aid, adset_id, period, level="adset")
 
         parsed = parse_insight(ins or {})
+        # Пропускаем адсеты с нулевым spend, чтобы не засорять отчёты
+        if (parsed.get("spend") or 0.0) <= 0:
+            continue
         parsed["adset_id"] = adset_id
         parsed["name"] = adset["name"]
         parsed["daily_budget"] = adset["daily_budget"]
@@ -187,6 +190,9 @@ def analyze_campaigns(aid: str, days: int = 7) -> List[Dict[str, Any]]:
 
         ins = fetch_insights_by_level(aid, cid, period, level="campaign")
         parsed = parse_insight(ins or {})
+        # Пропускаем кампании с нулевым spend
+        if (parsed.get("spend") or 0.0) <= 0:
+            continue
         parsed["campaign_id"] = cid
         parsed["name"] = camp.get("name", "<без названия>")
         parsed["status"] = camp.get("status")
