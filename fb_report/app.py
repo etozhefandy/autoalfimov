@@ -121,6 +121,65 @@ def main_menu() -> InlineKeyboardMarkup:
     )
 
 
+def account_reports_level_kb(aid: str) -> InlineKeyboardMarkup:
+    """Выбор уровня отчёта по аккаунту: общий, кампании, адсеты."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "Общий отчёт",
+                    callback_data=f"rep_acc_mode|{aid}|general",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "По кампаниям",
+                    callback_data=f"rep_acc_mode|{aid}|campaigns",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "По адсетам",
+                    callback_data=f"rep_acc_mode|{aid}|adsets",
+                )
+            ],
+            [InlineKeyboardButton("⬅️ К аккаунтам", callback_data="report_one")],
+        ]
+    )
+
+
+def account_reports_periods_kb(aid: str, mode: str) -> InlineKeyboardMarkup:
+    """Выбор периода для отчёта по аккаунту на выбранном уровне.
+
+    Пункты: Сегодня, Вчера, Прошлая неделя, Сравнение периодов, Назад.
+    """
+    base = f"rep_acc_p|{aid}|{mode}"
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Сегодня", callback_data=f"{base}|today"),
+                InlineKeyboardButton("Вчера", callback_data=f"{base}|yday"),
+            ],
+            [
+                InlineKeyboardButton(
+                    "Прошлая неделя", callback_data=f"{base}|week"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "Сравнение периодов", callback_data=f"{base}|compare"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "⬅️ Назад",
+                    callback_data=f"rep_acc_back|{aid}|{mode}",
+                )
+            ],
+        ]
+    )
+
+
 def reports_accounts_kb(prefix: str) -> InlineKeyboardMarkup:
     """Клавиатура выбора аккаунтов для раздела "Отчёты".
 
@@ -166,10 +225,8 @@ def billing_menu() -> InlineKeyboardMarkup:
 def reports_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("Отчёт по всем", callback_data="report_all")],
+            [InlineKeyboardButton("Общий отчёт", callback_data="report_all")],
             [InlineKeyboardButton("Отчёт по аккаунту", callback_data="report_one")],
-            [InlineKeyboardButton("Отчёт по кампаниям", callback_data="report_campaigns")],
-            [InlineKeyboardButton("Отчёт по адсетам", callback_data="report_adsets")],
             [InlineKeyboardButton("⬅️ В меню", callback_data="menu")],
         ]
     )
@@ -666,22 +723,6 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if data == "report_campaigns":
-        await safe_edit_message(
-            q,
-            "Выберите аккаунт для отчёта по кампаниям:",
-            reply_markup=reports_accounts_kb("rep_camp_acc"),
-        )
-        return
-
-    if data == "report_adsets":
-        await safe_edit_message(
-            q,
-            "Выберите аккаунт для отчёта по адсетам:",
-            reply_markup=reports_accounts_kb("rep_adset_acc"),
-        )
-        return
-
     if data == "adsets_menu":
         await safe_edit_message(
             q,
@@ -694,108 +735,215 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         aid = data.split("|", 1)[1]
         await safe_edit_message(
             q,
-            f"Отчёт по: {get_account_name(aid)}\nВыбери период:",
-            reply_markup=period_kb_for(aid),
+            f"Отчёт по: {get_account_name(aid)}\nВыберите уровень отчёта:",
+            reply_markup=account_reports_level_kb(aid),
+        )
+        return
+    
+    if data.startswith("rep_acc_mode|"):
+        _, aid, mode = data.split("|", 2)
+        await safe_edit_message(
+            q,
+            f"Отчёт по: {get_account_name(aid)}\nВыберите период:",
+            reply_markup=account_reports_periods_kb(aid, mode),
         )
         return
 
-    if data.startswith("rep_camp_acc|"):
-        aid = data.split("|", 1)[1]
-        name = get_account_name(aid)
+    if data.startswith("rep_acc_back|"):
+        _, aid, _mode = data.split("|", 2)
         await safe_edit_message(
             q,
-            f"Готовлю отчёт по кампаниям для {name} за последние 7 дней…",
+            f"Отчёт по: {get_account_name(aid)}\nВыберите уровень отчёта:",
+            reply_markup=account_reports_level_kb(aid),
         )
-        camps = analyze_campaigns(aid, days=7)
-        if not camps:
-            await context.bot.send_message(
-                chat_id,
-                f"Нет данных по кампаниям для {name} за последние 7 дней.",
-            )
-            return
+        return
 
+    if data.startswith("rep_acc_p|"):
+        # Формат: rep_acc_p|{aid}|{mode}|{kind}
+        _, aid, mode, kind = data.split("|", 3)
+
+        # Общий отчёт по аккаунту — используем существующую логику one_*.
+        if mode == "general":
+            if kind == "today":
+                label = datetime.now(ALMATY_TZ).strftime("%d.%m.%Y")
+                await safe_edit_message(
+                    q,
+                    f"Отчёт по {get_account_name(aid)} за {label}:",
+                )
+                txt = get_cached_report(aid, "today", label)
+                await context.bot.send_message(
+                    chat_id,
+                    txt or "Нет данных/нет доступа.",
+                    parse_mode="HTML",
+                )
+                return
+
+            if kind == "yday":
+                label = (datetime.now(ALMATY_TZ) - timedelta(days=1)).strftime(
+                    "%d.%m.%Y"
+                )
+                await safe_edit_message(
+                    q,
+                    f"Отчёт по {get_account_name(aid)} за {label}:",
+                )
+                txt = get_cached_report(aid, "yesterday", label)
+                await context.bot.send_message(
+                    chat_id,
+                    txt or "Нет данных/нет доступа.",
+                    parse_mode="HTML",
+                )
+                return
+
+            if kind == "week":
+                until = datetime.now(ALMATY_TZ) - timedelta(days=1)
+                since = until - timedelta(days=6)
+                period = {
+                    "since": since.strftime("%Y-%m-%d"),
+                    "until": until.strftime("%Y-%m-%d"),
+                }
+                label = f"{since.strftime('%d.%m')}-{until.strftime('%d.%m')}"
+                await safe_edit_message(
+                    q,
+                    f"Отчёт по {get_account_name(aid)} за {label}:",
+                )
+                txt = get_cached_report(aid, period, label)
+                await context.bot.send_message(
+                    chat_id,
+                    txt or "Нет данных/нет доступа.",
+                    parse_mode="HTML",
+                )
+                return
+
+            if kind == "compare":
+                await safe_edit_message(
+                    q,
+                    f"Сравнение периодов для {get_account_name(aid)}:",
+                    reply_markup=compare_kb_for(aid),
+                )
+                return
+
+        # Кампании / адсеты: используем analyze_campaigns/analyze_adsets
+        # и выбранный пресет периода.
         from .storage import metrics_flags
 
         flags = metrics_flags(aid)
-        lines = [f"📊 Кампании — {name} (посл. 7 дней)"]
-        for idx, c in enumerate(camps, start=1):
-            spend = c.get("spend", 0.0) or 0.0
-            impr = c.get("impr", 0) or 0
-            clicks = c.get("clicks", 0) or 0
-            msgs = c.get("msgs", 0) or 0
-            leads = c.get("leads", 0) or 0
 
-            # Учитываем настройки метрик аккаунта
-            eff_msgs = msgs if flags.get("messaging") else 0
-            eff_leads = leads if flags.get("leads") else 0
-            eff_total = eff_msgs + eff_leads
-            cpa_eff = (spend / eff_total) if eff_total > 0 else None
-
-            parts = [
-                f"{idx}. {c.get('name')}",
-                f"   👀 {impr}  🔍 {clicks}  💵 {spend:.2f} $",
-            ]
-            if flags.get("messaging"):
-                parts.append(f"   💬 {msgs}")
-            if flags.get("leads"):
-                parts.append(f"   📩 {leads}")
-            if flags.get("messaging") or flags.get("leads"):
-                parts.append(f"   Итого: {eff_total}  CPA: {cpa_eff:.2f}$" if cpa_eff is not None else f"   Итого: {eff_total}  CPA: —")
-
-            lines.append("\n".join(parts))
-
-        await context.bot.send_message(chat_id, "\n".join(lines))
-        return
-
-    if data.startswith("rep_adset_acc|"):
-        aid = data.split("|", 1)[1]
-        name = get_account_name(aid)
-        await safe_edit_message(
-            q,
-            f"Готовлю отчёт по адсетам для {name} за последние 7 дней…",
-        )
-        adsets = analyze_adsets(aid, days=7)
-        if not adsets:
-            await context.bot.send_message(
-                chat_id,
-                f"Нет данных по адсетам для {name} за последние 7 дней.",
+        # Определяем количество дней и человекочитаемый лейбл
+        if kind == "today":
+            days = 1
+            label = "сегодня"
+        elif kind == "yday":
+            days = 1
+            label = "вчера"
+        elif kind == "week":
+            days = 7
+            label = "последние 7 дней"
+        else:
+            # Для кампаний/адсетов сравнение периодов пока не поддерживаем
+            await safe_edit_message(
+                q,
+                "Сравнение периодов пока доступно только для общего отчёта по аккаунту.",
             )
             return
 
-        # сортируем по spend по убыванию
-        adsets_sorted = sorted(adsets, key=lambda x: x.get("spend", 0.0), reverse=True)
+        name = get_account_name(aid)
 
-        from .storage import metrics_flags
+        if mode == "campaigns":
+            await safe_edit_message(
+                q,
+                f"Готовлю отчёт по кампаниям для {name} ({label})…",
+            )
+            camps = analyze_campaigns(aid, days=days)
+            if not camps:
+                await context.bot.send_message(
+                    chat_id,
+                    f"Нет данных по кампаниям для {name} ({label}).",
+                )
+                return
 
-        flags = metrics_flags(aid)
-        lines = [f"📊 Адсеты — {name} (посл. 7 дней)"]
-        for idx, a in enumerate(adsets_sorted, start=1):
-            spend = a.get("spend", 0.0) or 0.0
-            impr = a.get("impr", 0) or 0
-            clicks = a.get("clicks", 0) or 0
-            msgs = a.get("msgs", 0) or 0
-            leads = a.get("leads", 0) or 0
+            lines = [f"📊 Кампании — {name} ({label})"]
+            for idx, c in enumerate(camps, start=1):
+                spend = c.get("spend", 0.0) or 0.0
+                impr = c.get("impr", 0) or 0
+                clicks = c.get("clicks", 0) or 0
+                msgs = c.get("msgs", 0) or 0
+                leads = c.get("leads", 0) or 0
 
-            eff_msgs = msgs if flags.get("messaging") else 0
-            eff_leads = leads if flags.get("leads") else 0
-            eff_total = eff_msgs + eff_leads
-            cpa_eff = (spend / eff_total) if eff_total > 0 else None
+                eff_msgs = msgs if flags.get("messaging") else 0
+                eff_leads = leads if flags.get("leads") else 0
+                eff_total = eff_msgs + eff_leads
+                cpa_eff = (spend / eff_total) if eff_total > 0 else None
 
-            parts = [
-                f"{idx}. {a.get('name')}",
-                f"   👀 {impr}  🔍 {clicks}  💵 {spend:.2f} $",
-            ]
-            if flags.get("messaging"):
-                parts.append(f"   💬 {msgs}")
-            if flags.get("leads"):
-                parts.append(f"   📩 {leads}")
-            if flags.get("messaging") or flags.get("leads"):
-                parts.append(f"   Итого: {eff_total}  CPA: {cpa_eff:.2f}$" if cpa_eff is not None else f"   Итого: {eff_total}  CPA: —")
+                parts = [
+                    f"{idx}. {c.get('name')}",
+                    f"   👀 {impr}  🔍 {clicks}  💵 {spend:.2f} $",
+                ]
+                if flags.get("messaging"):
+                    parts.append(f"   💬 {msgs}")
+                if flags.get("leads"):
+                    parts.append(f"   📩 {leads}")
+                if flags.get("messaging") or flags.get("leads"):
+                    parts.append(
+                        f"   Итого: {eff_total}  CPA: {cpa_eff:.2f}$"
+                        if cpa_eff is not None
+                        else f"   Итого: {eff_total}  CPA: —"
+                    )
 
-            lines.append("\n".join(parts))
+                lines.append("\n".join(parts))
 
-        await context.bot.send_message(chat_id, "\n".join(lines))
-        return
+            await context.bot.send_message(chat_id, "\n".join(lines))
+            return
+
+        if mode == "adsets":
+            await safe_edit_message(
+                q,
+                f"Готовлю отчёт по адсетам для {name} ({label})…",
+            )
+            adsets = analyze_adsets(aid, days=days)
+            if not adsets:
+                await context.bot.send_message(
+                    chat_id,
+                    f"Нет данных по адсетам для {name} ({label}).",
+                )
+                return
+
+            # сортируем по spend по убыванию
+            adsets_sorted = sorted(
+                adsets, key=lambda x: x.get("spend", 0.0), reverse=True
+            )
+
+            lines = [f"📊 Адсеты — {name} ({label})"]
+            for idx, a in enumerate(adsets_sorted, start=1):
+                spend = a.get("spend", 0.0) or 0.0
+                impr = a.get("impr", 0) or 0
+                clicks = a.get("clicks", 0) or 0
+                msgs = a.get("msgs", 0) or 0
+                leads = a.get("leads", 0) or 0
+
+                eff_msgs = msgs if flags.get("messaging") else 0
+                eff_leads = leads if flags.get("leads") else 0
+                eff_total = eff_msgs + eff_leads
+                cpa_eff = (spend / eff_total) if eff_total > 0 else None
+
+                parts = [
+                    f"{idx}. {a.get('name')}",
+                    f"   👀 {impr}  🔍 {clicks}  💵 {spend:.2f} $",
+                ]
+                if flags.get("messaging"):
+                    parts.append(f"   💬 {msgs}")
+                if flags.get("leads"):
+                    parts.append(f"   📩 {leads}")
+                if flags.get("messaging") or flags.get("leads"):
+                    parts.append(
+                        f"   Итого: {eff_total}  CPA: {cpa_eff:.2f}$"
+                        if cpa_eff is not None
+                        else f"   Итого: {eff_total}  CPA: —"
+                    )
+
+                lines.append("\n".join(parts))
+
+            await context.bot.send_message(chat_id, "\n".join(lines))
+            return
 
     if data.startswith("adrep|"):
         aid = data.split("|", 1)[1]
