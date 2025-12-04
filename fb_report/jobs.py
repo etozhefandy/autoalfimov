@@ -155,7 +155,10 @@ async def _cpa_alerts_job(context: ContextTypes.DEFAULT_TYPE):
 
     chat_id = owner_id if owner_id is not None else str(DEFAULT_REPORT_CHAT)
 
-    period, label = _yesterday_period()
+    # Для алёрта берём текущее состояние за today,
+    # чтобы видеть актуальный CPA на момент часа.
+    period = "today"
+    label = now.strftime("%d.%m.%Y")
 
     for aid, row in accounts.items():
         alerts = (row or {}).get("alerts") or {}
