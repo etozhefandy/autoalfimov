@@ -52,9 +52,9 @@ async def _billing_watch_job(
 
         # Переход из ACTIVE (1) в любой другой статус → алёрт о первичной сумме биллинга
         if prev_status == 1 and status != 1:
-            parts = [
-                "🚨 Ахтунг!",
-                f"{name}! у нас биллинг",
+            # Первый алёрт: подчёркиваем, что это предварительная сумма
+            lines = [
+                "⚠️ ⚠️ ⚠️ Ахтунг! Биллинг в {name}".format(name=name),
                 f"Предварительная сумма: {balance_usd:.2f} $",
             ]
 
@@ -62,11 +62,13 @@ async def _billing_watch_job(
                 try:
                     rate = float(usd_to_kzt())
                     kzt = kzt_round_up_1000(balance_usd * rate)
-                    parts.append(f"≈ {kzt} ₸")
+                    lines.append(f"Примерно: ≈ {kzt} ₸")
                 except Exception:
                     pass
 
-            text = " — ".join(parts)
+            lines.append("Через 20 минут выдам сумму с корректировками.")
+
+            text = "\n".join(lines)
             await context.bot.send_message(chat_id=group_chat_id, text=text)
 
             # Запланировать уточнение через ~20 минут
@@ -93,8 +95,7 @@ async def _billing_watch_job(
             cur_usd = first_usd
 
         parts = [
-            "⚠️ Внимание (уточнение по биллингу)",
-            f"{name}",
+            f"🚨 {name}! у нас биллинг",
             f"Итоговая сумма: {cur_usd:.2f} $",
         ]
 
@@ -105,9 +106,6 @@ async def _billing_watch_job(
                 parts.append(f"≈ {kzt} ₸")
             except Exception:
                 pass
-
-        delta = cur_usd - first_usd
-        parts.append(f"Δ к предварительной оценке: {delta:+.2f} $")
 
         text = " — ".join(parts)
         await context.bot.send_message(chat_id=group_chat_id, text=text)
