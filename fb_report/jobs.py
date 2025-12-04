@@ -279,11 +279,16 @@ async def _hourly_snapshot_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 def schedule_cpa_alerts(app: Application):
-    # Часовые CPA-алёрты (по вчерашнему периоду через текстовые отчёты)
+    # Часовые CPA-алёрты (по вчерашнему периоду через текстовые отчёты).
+    # Выравниваем запуск по началу часа, чтобы алёрты приходили в 10:00, 11:00, ...
+    # (сам _cpa_alerts_job дополнительно фильтрует часы 10–22 по ALMATY_TZ).
+    now = datetime.now(ALMATY_TZ)
+    first_run = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+
     app.job_queue.run_repeating(
         _cpa_alerts_job,
         interval=timedelta(hours=1),
-        first=timedelta(minutes=15),
+        first=first_run,
     )
 
     # Часовой снимок инсайтов за today для часового кэша
