@@ -120,6 +120,38 @@ def main_menu() -> InlineKeyboardMarkup:
     )
 
 
+def reports_accounts_kb(prefix: str) -> InlineKeyboardMarkup:
+    """Клавиатура выбора аккаунтов для раздела "Отчёты".
+
+    Отличается от общей accounts_kb только кнопкой "Назад", которая
+    возвращает в подменю отчётов, а не сразу в главное меню.
+    """
+    store = load_accounts()
+    if store:
+        enabled_ids = [aid for aid, row in store.items() if row.get("enabled", True)]
+        disabled_ids = [
+            aid for aid, row in store.items() if not row.get("enabled", True)
+        ]
+        ids = enabled_ids + disabled_ids
+    else:
+        from .constants import AD_ACCOUNTS_FALLBACK
+
+        ids = AD_ACCOUNTS_FALLBACK
+
+    rows = []
+    for aid in ids:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"{_flag_line(aid)}  {get_account_name(aid)}",
+                    callback_data=f"{prefix}|{aid}",
+                )
+            ]
+        )
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="reports_menu")])
+    return InlineKeyboardMarkup(rows)
+
+
 def billing_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
@@ -629,7 +661,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit_message(
             q,
             "Выберите аккаунт для отчёта по аккаунту:",
-            reply_markup=accounts_kb("rep_one_acc"),
+            reply_markup=reports_accounts_kb("rep_one_acc"),
         )
         return
 
@@ -637,7 +669,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit_message(
             q,
             "Выберите аккаунт для отчёта по кампаниям:",
-            reply_markup=accounts_kb("rep_camp_acc"),
+            reply_markup=reports_accounts_kb("rep_camp_acc"),
         )
         return
 
@@ -645,7 +677,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit_message(
             q,
             "Выберите аккаунт для отчёта по адсетам:",
-            reply_markup=accounts_kb("rep_adset_acc"),
+            reply_markup=reports_accounts_kb("rep_adset_acc"),
         )
         return
 
