@@ -84,6 +84,18 @@ async def safe_edit_message(q, text: str, **kwargs):
         raise
 
 
+def _build_version_text() -> str:
+    """Текст для команды /version и кнопки "Версия".
+
+    Использует BOT_VERSION и BOT_CHANGELOG: базовые функции + последние значимые
+    обновления. Косметические вещи можно не добавлять в BOT_CHANGELOG, тогда
+    они не попадут в этот текст автоматически.
+    """
+    lines = [f"Версия бота: {BOT_VERSION}", ""]
+    lines.extend(BOT_CHANGELOG)
+    return "\n".join(lines)
+
+
 def main_menu() -> InlineKeyboardMarkup:
     last_sync = human_last_sync()
     return InlineKeyboardMarkup(
@@ -361,10 +373,7 @@ async def cmd_billing(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_version(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _allowed(update):
         return
-    text = (
-        f"Версия бота: {BOT_VERSION}\n"
-        f"Основные функции: отчёты по аккаунтам, биллинг, CPA-алёрты, тепловая карта."
-    )
+    text = _build_version_text()
     await update.message.reply_text(text, reply_markup=main_menu())
 
 
@@ -575,10 +584,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(q.message.chat.id)
 
     if data == "version":
-        text = (
-            f"Версия бота: {BOT_VERSION}\n"
-            f"Основные функции: отчёты по аккаунтам, биллинг, CPA-алёрты, тепловая карта."
-        )
+        text = _build_version_text()
         await context.bot.send_message(chat_id, text)
         return
 
@@ -1080,11 +1086,6 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(on_cb_autopilot, pattern="^ap"))
     app.add_handler(CallbackQueryHandler(on_cb))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_any))
-
-    app.job_queue.run_daily(
-        full_daily_scan_job,
-        time=time(hour=9, minute=20, tzinfo=ALMATY_TZ),
-    )
 
     app.job_queue.run_daily(
         daily_report_job,
