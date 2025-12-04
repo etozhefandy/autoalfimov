@@ -102,11 +102,8 @@ def main_menu() -> InlineKeyboardMarkup:
         [
             [
                 InlineKeyboardButton(
-                    "📊 Отчёт по всем", callback_data="rep_all_menu"
+                    "📊 Отчёты", callback_data="reports_menu"
                 ),
-                InlineKeyboardButton(
-                    "📂 Отчёт по аккаунту", callback_data="choose_acc_report"
-                )
             ],
             [InlineKeyboardButton("💳 Биллинг", callback_data="billing")],
             [InlineKeyboardButton("🔥 Тепловая карта", callback_data="hm_menu")],
@@ -133,15 +130,32 @@ def billing_menu() -> InlineKeyboardMarkup:
     )
 
 
-def all_reports_menu() -> InlineKeyboardMarkup:
+def reports_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Отчёт по всем", callback_data="report_all")],
+            [InlineKeyboardButton("Отчёт по кампаниям", callback_data="report_campaigns")],
+            [InlineKeyboardButton("Отчёт по адсетам", callback_data="report_adsets")],
+            [InlineKeyboardButton("⬅️ В меню", callback_data="menu")],
+        ]
+    )
+
+
+def reports_periods_kb(prefix: str) -> InlineKeyboardMarkup:
+    """Клавиатура выбора периода для раздела "Отчёты".
+
+    prefix задаёт основу callback'ов, например "rep_all" → rep_all_today, ...
+    """
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("Сегодня", callback_data="rep_today"),
-                InlineKeyboardButton("Вчера", callback_data="rep_yday"),
+                InlineKeyboardButton("Сегодня", callback_data=f"{prefix}_today"),
+                InlineKeyboardButton("Вчера", callback_data=f"{prefix}_yday"),
             ],
-            [InlineKeyboardButton("Прошедшая неделя", callback_data="rep_week")],
-            [InlineKeyboardButton("⬅️ В меню", callback_data="menu")],
+            [InlineKeyboardButton("Прошедшая неделя", callback_data=f"{prefix}_week")],
+            [InlineKeyboardButton("Свой диапазон", callback_data=f"{prefix}_custom")],
+            [InlineKeyboardButton("Сравнить периоды", callback_data=f"{prefix}_compare")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="reports_menu")],
         ]
     )
 
@@ -592,8 +606,22 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit_message(q, "🤖 Выберите действие:", reply_markup=main_menu())
         return
 
-    if data == "rep_all_menu":
-        await safe_edit_message(q, "Выберите период:", reply_markup=all_reports_menu())
+    if data == "reports_menu":
+        await safe_edit_message(
+            q,
+            "Выберите тип отчёта:",
+            reply_markup=reports_menu_kb(),
+        )
+        return
+
+    # ======= НОВЫЙ РАЗДЕЛ "ОТЧЁТЫ" =======
+    # Совместимость: старый callback rep_all_menu ведём в новый report_all.
+    if data in {"report_all", "rep_all_menu"}:
+        await safe_edit_message(
+            q,
+            "Выберите период:",
+            reply_markup=reports_periods_kb("rep_all"),
+        )
         return
 
     if data == "adsets_menu":
@@ -614,19 +642,21 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_adset_report(context, chat_id, aid)
         return
 
-    if data == "rep_today":
+    # Старые callback'и rep_today/rep_yday/rep_week считаем синонимами
+    # новых rep_all_today/rep_all_yday/rep_all_week.
+    if data in {"rep_all_today", "rep_today"}:
         label = datetime.now(ALMATY_TZ).strftime("%d.%m.%Y")
         await safe_edit_message(q, f"Готовлю отчёт за {label}…")
         await send_period_report(context, chat_id, "today", label)
         return
 
-    if data == "rep_yday":
+    if data in {"rep_all_yday", "rep_yday"}:
         label = (datetime.now(ALMATY_TZ) - timedelta(days=1)).strftime("%d.%m.%Y")
         await q.edit_message_text(f"Готовлю отчёт за {label}…")
         await send_period_report(context, chat_id, "yesterday", label)
         return
 
-    if data == "rep_week":
+    if data in {"rep_all_week", "rep_week"}:
         until = datetime.now(ALMATY_TZ) - timedelta(days=1)
         since = until - timedelta(days=6)
         period = {
@@ -636,6 +666,25 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         label = f"{since.strftime('%d.%m')}-{until.strftime('%d.%m')}"
         await q.edit_message_text(f"Готовлю отчёт за {label}…")
         await send_period_report(context, chat_id, period, label)
+        return
+
+    if data == "rep_all_custom":
+        context.user_data["await_all_range_for"] = True
+        await safe_edit_message(
+            q,
+            "Введи даты форматом: 01.06.2025-07.06.2025",
+            reply_markup=reports_periods_kb("rep_all"),
+        )
+        return
+
+    if data == "rep_all_compare":
+        context.user_data["await_all_cmp_for"] = True
+        await safe_edit_message(
+            q,
+            "Отправь два диапазона дат через ';' или с новой строки.\n"
+            "Пример: 01.06.2025-07.06.2025;08.06.2025-14.06.2025",
+            reply_markup=reports_periods_kb("rep_all"),
+        )
         return
 
     if data == "hm_menu":
@@ -969,6 +1018,41 @@ async def on_text_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = update.message.text.strip()
+
+    # Кастомный диапазон для отчёта "по всем" (rep_all_custom)
+    if context.user_data.get("await_all_range_for"):
+        context.user_data.pop("await_all_range_for", None)
+        parsed = parse_range(text)
+        if not parsed:
+            await update.message.reply_text(
+                "Формат дат: 01.06.2025-07.06.2025. Попробуй ещё раз."
+            )
+            context.user_data["await_all_range_for"] = True
+            return
+
+        period, label = parsed
+        await update.message.reply_text(f"Готовлю отчёт за {label}…")
+        await send_period_report(context, str(DEFAULT_REPORT_CHAT), period, label)
+        return
+
+    # Сравнение периодов для отчёта "по всем" (rep_all_compare)
+    if context.user_data.get("await_all_cmp_for"):
+        context.user_data.pop("await_all_cmp_for", None)
+        parsed = parse_two_ranges(text)
+        if not parsed:
+            await update.message.reply_text(
+                "Не распознал форматы дат.\n"
+                "Пример: 01.06.2025-07.06.2025;08.06.2025-14.06.2025"
+            )
+            context.user_data["await_all_cmp_for"] = True
+            return
+
+        (p1, label1), (p2, label2) = parsed
+        await update.message.reply_text(f"Готовлю отчёты за {label1} и {label2}…")
+        # Отправляем два отдельных отчёта по всем аккаунтам.
+        await send_period_report(context, str(DEFAULT_REPORT_CHAT), p1, label1)
+        await send_period_report(context, str(DEFAULT_REPORT_CHAT), p2, label2)
+        return
 
     # Кастомный период для тепловой карты
     if "await_heatmap_range_for" in context.user_data:
