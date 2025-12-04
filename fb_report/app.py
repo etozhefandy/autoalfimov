@@ -63,6 +63,7 @@ from autopilat.actions import (
     parse_manual_input,
     can_disable,
 )
+from services.analytics import analyze_campaigns, analyze_adsets
 
 
 def _allowed(update: Update) -> bool:
@@ -700,20 +701,75 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("rep_camp_acc|"):
         aid = data.split("|", 1)[1]
+        name = get_account_name(aid)
         await safe_edit_message(
             q,
-            "Отчёт по кампаниям для выбранного аккаунта пока в разработке.",
-            reply_markup=reports_menu_kb(),
+            f"Готовлю отчёт по кампаниям для {name} за последние 7 дней…",
         )
+        camps = analyze_campaigns(aid, days=7)
+        if not camps:
+            await context.bot.send_message(
+                chat_id,
+                f"Нет данных по кампаниям для {name} за последние 7 дней.",
+            )
+            return
+
+        lines = [f"📊 Кампании — {name} (посл. 7 дней)"]
+        for idx, c in enumerate(camps, start=1):
+            spend = c.get("spend", 0.0) or 0.0
+            impr = c.get("impr", 0) or 0
+            clicks = c.get("clicks", 0) or 0
+            msgs = c.get("msgs", 0) or 0
+            leads = c.get("leads", 0) or 0
+            total = c.get("total", 0) or 0
+            cpa = c.get("cpa")
+            cpa_txt = f"{cpa:.2f}$" if cpa is not None else "—"
+
+            lines.append(
+                f"{idx}. {c.get('name')}\n"
+                f"   👀 {impr}  🔍 {clicks}  💵 {spend:.2f} $\n"
+                f"   💬 {msgs}  📩 {leads}  Итого: {total}  CPA: {cpa_txt}"
+            )
+
+        await context.bot.send_message(chat_id, "\n".join(lines))
         return
 
     if data.startswith("rep_adset_acc|"):
         aid = data.split("|", 1)[1]
+        name = get_account_name(aid)
         await safe_edit_message(
             q,
-            "Отчёт по адсетам для выбранного аккаунта пока в разработке.",
-            reply_markup=reports_menu_kb(),
+            f"Готовлю отчёт по адсетам для {name} за последние 7 дней…",
         )
+        adsets = analyze_adsets(aid, days=7)
+        if not adsets:
+            await context.bot.send_message(
+                chat_id,
+                f"Нет данных по адсетам для {name} за последние 7 дней.",
+            )
+            return
+
+        # сортируем по spend по убыванию
+        adsets_sorted = sorted(adsets, key=lambda x: x.get("spend", 0.0), reverse=True)
+
+        lines = [f"📊 Адсеты — {name} (посл. 7 дней)"]
+        for idx, a in enumerate(adsets_sorted, start=1):
+            spend = a.get("spend", 0.0) or 0.0
+            impr = a.get("impr", 0) or 0
+            clicks = a.get("clicks", 0) or 0
+            msgs = a.get("msgs", 0) or 0
+            leads = a.get("leads", 0) or 0
+            total = a.get("total", 0) or 0
+            cpa = a.get("cpa")
+            cpa_txt = f"{cpa:.2f}$" if cpa is not None else "—"
+
+            lines.append(
+                f"{idx}. {a.get('name')}\n"
+                f"   👀 {impr}  🔍 {clicks}  💵 {spend:.2f} $\n"
+                f"   💬 {msgs}  📩 {leads}  Итого: {total}  CPA: {cpa_txt}"
+            )
+
+        await context.bot.send_message(chat_id, "\n".join(lines))
         return
 
     if data.startswith("adrep|"):

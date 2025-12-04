@@ -7,6 +7,7 @@ from services.facebook_api import (
     fetch_insights,
     fetch_adsets,
     fetch_ads,
+    fetch_campaigns,
 )
 from services.storage import load_accounts
 from config import ALMATY_TZ
@@ -160,6 +161,41 @@ def analyze_adsets(aid: str, days: int = 7) -> List[Dict[str, Any]]:
         return cpa if cpa is not None else 999_999
 
     results.sort(key=score)
+    return results
+
+
+def analyze_campaigns(aid: str, days: int = 7) -> List[Dict[str, Any]]:
+    """Аналитика кампаний за последние days дней.
+
+    Для каждой кампании считаем стандартные метрики через parse_insight и
+    сортируем кампании по spend (затратам) по убыванию.
+    """
+    camps = fetch_campaigns(aid)
+    results: List[Dict[str, Any]] = []
+
+    until = (datetime.now(ALMATY_TZ) - timedelta(days=1)).date()
+    since = until - timedelta(days=days - 1)
+    period = {
+        "since": since.strftime("%Y-%m-%d"),
+        "until": until.strftime("%Y-%m-%d"),
+    }
+
+    for camp in camps:
+        cid = camp.get("id")
+        if not cid:
+            continue
+
+        ins = fetch_insights_by_level(aid, cid, period, level="campaign")
+        parsed = parse_insight(ins or {})
+        parsed["campaign_id"] = cid
+        parsed["name"] = camp.get("name", "<без названия>")
+        parsed["status"] = camp.get("status")
+        parsed["effective_status"] = camp.get("effective_status")
+
+        results.append(parsed)
+
+    # сортируем по затратам по убыванию
+    results.sort(key=lambda x: x.get("spend", 0.0), reverse=True)
     return results
 
 
