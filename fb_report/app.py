@@ -134,6 +134,7 @@ def reports_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("Отчёт по всем", callback_data="report_all")],
+            [InlineKeyboardButton("Отчёт по аккаунту", callback_data="report_one")],
             [InlineKeyboardButton("Отчёт по кампаниям", callback_data="report_campaigns")],
             [InlineKeyboardButton("Отчёт по адсетам", callback_data="report_adsets")],
             [InlineKeyboardButton("⬅️ В меню", callback_data="menu")],
@@ -624,11 +625,62 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if data == "report_one":
+        await safe_edit_message(
+            q,
+            "Выберите аккаунт для отчёта по аккаунту:",
+            reply_markup=accounts_kb("rep_one_acc"),
+        )
+        return
+
+    if data == "report_campaigns":
+        await safe_edit_message(
+            q,
+            "Выберите аккаунт для отчёта по кампаниям:",
+            reply_markup=accounts_kb("rep_camp_acc"),
+        )
+        return
+
+    if data == "report_adsets":
+        await safe_edit_message(
+            q,
+            "Выберите аккаунт для отчёта по адсетам:",
+            reply_markup=accounts_kb("rep_adset_acc"),
+        )
+        return
+
     if data == "adsets_menu":
         await safe_edit_message(
             q,
             "Выберите аккаунт для отчёта по адсетам:",
             reply_markup=accounts_kb("adrep"),
+        )
+        return
+
+    if data.startswith("rep_one_acc|"):
+        aid = data.split("|", 1)[1]
+        await safe_edit_message(
+            q,
+            f"Отчёт по: {get_account_name(aid)}\nВыбери период:",
+            reply_markup=period_kb_for(aid),
+        )
+        return
+
+    if data.startswith("rep_camp_acc|"):
+        aid = data.split("|", 1)[1]
+        await safe_edit_message(
+            q,
+            "Отчёт по кампаниям для выбранного аккаунта пока в разработке.",
+            reply_markup=reports_menu_kb(),
+        )
+        return
+
+    if data.startswith("rep_adset_acc|"):
+        aid = data.split("|", 1)[1]
+        await safe_edit_message(
+            q,
+            "Отчёт по адсетам для выбранного аккаунта пока в разработке.",
+            reply_markup=reports_menu_kb(),
         )
         return
 
