@@ -106,6 +106,11 @@ def main_menu() -> InlineKeyboardMarkup:
                     "📊 Отчёты", callback_data="reports_menu"
                 ),
             ],
+            [
+                InlineKeyboardButton(
+                    "📈 Мониторинг", callback_data="monitoring_menu"
+                )
+            ],
             [InlineKeyboardButton("💳 Биллинг", callback_data="billing")],
             [InlineKeyboardButton("🔥 Тепловая карта", callback_data="hm_menu")],
             [InlineKeyboardButton("⚙️ Настройки", callback_data="choose_acc_settings")],
@@ -117,6 +122,23 @@ def main_menu() -> InlineKeyboardMarkup:
                 )
             ],
             [InlineKeyboardButton("ℹ️ Версия", callback_data="version")],
+        ]
+    )
+
+
+def monitoring_menu_kb() -> InlineKeyboardMarkup:
+    """Подменю раздела мониторинга.
+
+    Пока содержит только заглушку "План заявок".
+    """
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "📈 План заявок (скоро)", callback_data="leads_plan_soon"
+                )
+            ],
+            [InlineKeyboardButton("⬅️ В меню", callback_data="menu")],
         ]
     )
 
@@ -697,6 +719,14 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit_message(q, "🤖 Выберите действие:", reply_markup=main_menu())
         return
 
+    if data == "monitoring_menu":
+        await safe_edit_message(
+            q,
+            "Раздел мониторинга. Выберите пункт:",
+            reply_markup=monitoring_menu_kb(),
+        )
+        return
+
     if data == "reports_menu":
         await safe_edit_message(
             q,
@@ -1047,9 +1077,25 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit_message(q, "📋 Биллинги (неактивные аккаунты):")
         await send_billing(context, chat_id)
         return
+    if data == "monitoring":
+        await safe_edit_message(
+            q,
+            "Мониторинг:",
+            reply_markup=monitoring_menu_kb(),
+        )
     if data == "billing_forecast":
         await safe_edit_message(q, "🔮 Считаю прогноз списаний…")
         await send_billing_forecast(context, chat_id)
+        return
+
+    if data == "leads_plan_soon":
+        text = (
+            "📈 План заявок\n\n"
+            "В этом разделе позже будет аналитика: план заявок на месяц/неделю и "
+            "сравнение с фактом — на сколько отстаём или перевыполняем план.\n\n"
+            "Пока это информационная кнопка, функционал в разработке."
+        )
+        await safe_edit_message(q, text, reply_markup=monitoring_menu_kb())
         return
 
     if data == "sync_bm":
