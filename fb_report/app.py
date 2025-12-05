@@ -108,7 +108,7 @@ def main_menu() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
-                    "📈 Мониторинг", callback_data="monitoring_menu"
+                    "🆘 Мониторинг", callback_data="monitoring_menu"
                 )
             ],
             [InlineKeyboardButton("💳 Биллинг", callback_data="billing")],
@@ -129,10 +129,38 @@ def main_menu() -> InlineKeyboardMarkup:
 def monitoring_menu_kb() -> InlineKeyboardMarkup:
     """Подменю раздела мониторинга.
 
-    Пока содержит только заглушку "План заявок".
+    Основные режимы сравнения + настройки мониторинга и заглушка плана заявок.
     """
     return InlineKeyboardMarkup(
         [
+            [
+                InlineKeyboardButton(
+                    "Вчера vs позавчера", callback_data="mon_yday_vs_byday"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "Прошлая неделя vs позапрошлая",
+                    callback_data="mon_lastweek_vs_prevweek",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "Текущая неделя vs прошлая (по вчера)",
+                    callback_data="mon_curweek_vs_lastweek",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "Кастомный период", callback_data="mon_custom_period"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "⚙️ Настройки мониторинга",
+                    callback_data="mon_settings",
+                )
+            ],
             [
                 InlineKeyboardButton(
                     "📈 План заявок (скоро)", callback_data="leads_plan_soon"
@@ -1077,12 +1105,6 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit_message(q, "📋 Биллинги (неактивные аккаунты):")
         await send_billing(context, chat_id)
         return
-    if data == "monitoring":
-        await safe_edit_message(
-            q,
-            "Мониторинг:",
-            reply_markup=monitoring_menu_kb(),
-        )
     if data == "billing_forecast":
         await safe_edit_message(q, "🔮 Считаю прогноз списаний…")
         await send_billing_forecast(context, chat_id)
@@ -1096,6 +1118,56 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Пока это информационная кнопка, функционал в разработке."
         )
         await safe_edit_message(q, text, reply_markup=monitoring_menu_kb())
+        return
+
+    # ====== Мониторинг: заглушки режимов сравнения и настроек ======
+
+    if data == "mon_yday_vs_byday":
+        await safe_edit_message(
+            q,
+            "Вчера vs позавчера — мониторинг пока в разработке.\n"
+            "В финальной версии здесь будет сравнение всех ключевых метрик за вчера "
+            "против позавчера по каждому включённому аккаунту.",
+            reply_markup=monitoring_menu_kb(),
+        )
+        return
+
+    if data == "mon_lastweek_vs_prevweek":
+        await safe_edit_message(
+            q,
+            "Прошлая неделя vs позапрошлая — мониторинг пока в разработке.\n"
+            "Позже здесь будет сравнение по неделям (пн–вс) с подсветкой изменений.",
+            reply_markup=monitoring_menu_kb(),
+        )
+        return
+
+    if data == "mon_curweek_vs_lastweek":
+        await safe_edit_message(
+            q,
+            "Текущая неделя vs прошлая (по вчера) — в разработке.\n"
+            "План: сравнение накопленных метрик с понедельника по вчерашний день "
+            "против такого же диапазона прошлой недели.",
+            reply_markup=monitoring_menu_kb(),
+        )
+        return
+
+    if data == "mon_custom_period":
+        await safe_edit_message(
+            q,
+            "Кастомный период мониторинга пока не реализован.\n"
+            "Дальше здесь появится выбор диапазона дат и сравнение с таким же по "
+            "длине предыдущим периодом.",
+            reply_markup=monitoring_menu_kb(),
+        )
+        return
+
+    if data == "mon_settings":
+        await safe_edit_message(
+            q,
+            "⚙️ Настройки мониторинга пока в разработке.\n"
+            "Планируется настройка курса USD→KZT и месячных бюджетов по аккаунтам.",
+            reply_markup=monitoring_menu_kb(),
+        )
         return
 
     if data == "sync_bm":
