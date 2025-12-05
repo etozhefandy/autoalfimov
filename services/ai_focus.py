@@ -80,7 +80,9 @@ def get_focus_comment(context: Dict[str, Any]) -> str:
         return msg.strip()
     except RuntimeError:
         return "Фокус-ИИ: нет доступа к ИИ-сервису (не найден API-ключ). Оцени ситуацию по цифрам выше."
-    except Exception:
+    except Exception as e:
+        # Логируем ошибку, чтобы видеть причину в Railway-логах.
+        print(f"[ai_focus] DeepSeek error: {e}")
         return (
             "Фокус-ИИ временно недоступен (ошибка ИИ-сервиса). "
             "Ориентируйся по изменениям CPA, заявок и спенда в сравнении периодов."
