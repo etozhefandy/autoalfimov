@@ -51,7 +51,8 @@ from .adsets import send_adset_report
 from .billing import send_billing, send_billing_forecast, billing_digest_job
 from .jobs import full_daily_scan_job, daily_report_job, schedule_cpa_alerts
 
-from services.analytics import analyze_campaigns, analyze_adsets
+from services.analytics import analyze_campaigns, analyze_adsets, analyze_account
+from services.ai_focus import get_focus_comment
 
 
 def _allowed(update: Update) -> bool:
@@ -804,18 +805,40 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        level_human = {
-            "account": "Аккаунт",
-            "campaign": "Кампании",
-            "adset": "Адсеты",
-            "ad": "Объявления",
-        }.get(level, level)
+        if level != "account":
+            level_human = {
+                "campaign": "Кампании",
+                "adset": "Адсеты",
+                "ad": "Объявления",
+            }.get(level, level)
+
+            await safe_edit_message(
+                q,
+                "📊 Разовый отчёт Фокус-ИИ\n\n"
+                f"Уровень '{level_human}' пока в разработке. Сейчас доступен только уровень 'Аккаунт'.",
+                reply_markup=focus_ai_main_kb(),
+            )
+            return
+
+        analysis = analyze_account(aid, days=7)
+        context_payload = {
+            "account_id": aid,
+            "account_name": get_account_name(aid),
+            "period": analysis.get("period"),
+            "metrics": analysis.get("metrics"),
+        }
+
+        comment = get_focus_comment(context_payload)
+
+        text = (
+            "📊 Разовый отчёт Фокус-ИИ\n\n"
+            f"Объект: {get_account_name(aid)} — уровень: Аккаунт.\n\n"
+            f"{comment}"
+        )
 
         await safe_edit_message(
             q,
-            f"📊 Разовый отчёт Фокус-ИИ\n\n"
-            f"Объект: {get_account_name(aid)} — уровень: {level_human}.\n\n"
-            "Здесь позже появится сравнение периодов, рекомендации и кнопки действий (+20% / -20% / ручной ввод).",
+            text,
             reply_markup=focus_ai_main_kb(),
         )
         return
