@@ -198,3 +198,62 @@ def is_active(aid: str) -> bool:
         return st == 1
     except Exception:
         return False
+
+
+# ========= Настройки Фокус-ИИ =========
+
+
+def get_focus_for_account(aid: str) -> dict:
+    """Возвращает словарь focus для аккаунта (по всем пользователям)."""
+    store = load_accounts()
+    row = store.get(aid) or {}
+    return row.get("focus") or {}
+
+
+def save_focus_for_account(aid: str, focus: dict) -> None:
+    """Сохраняет словарь focus для аккаунта в accounts.json."""
+    store = load_accounts()
+    row = store.get(aid) or {}
+    row["focus"] = focus
+    store[aid] = row
+    save_accounts(store)
+
+
+def user_has_focus_settings(user_id: str) -> bool:
+    """Проверяет, есть ли у пользователя включённые и активные таргеты Фокус-ИИ.
+
+    Проходит по всем аккаунтам в accounts.json и ищет focus[user_id]
+    с enabled=True и хотя бы одним target с active!=False.
+    """
+    uid = str(user_id)
+    store = load_accounts()
+    for row in store.values():
+        focus = row.get("focus") or {}
+        u = focus.get(uid)
+        if not u or not u.get("enabled", False):
+            continue
+        targets = u.get("targets") or []
+        for t in targets:
+            if t is None:
+                continue
+            if t.get("active", True):
+                return True
+    return False
+
+
+def disable_focus_target(aid: str, user_id: str, level: str, object_id: str) -> None:
+    """Помечает конкретный target Фокус-ИИ как неактивный (active=False)."""
+    uid = str(user_id)
+    focus = get_focus_for_account(aid)
+    u = focus.get(uid) or {}
+    targets = u.get("targets") or []
+    for t in targets:
+        if (
+            t.get("level") == level
+            and t.get("object_id") == object_id
+            and t.get("active", True)
+        ):
+            t["active"] = False
+    u["targets"] = targets
+    focus[uid] = u
+    save_focus_for_account(aid, focus)

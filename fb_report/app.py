@@ -51,18 +51,6 @@ from .adsets import send_adset_report
 from .billing import send_billing, send_billing_forecast, billing_digest_job
 from .jobs import full_daily_scan_job, daily_report_job, schedule_cpa_alerts
 
-from autopilat.engine import get_recommendations_ui
-from autopilat.ui import (
-    autopilot_main_menu,
-    autopilot_submode_menu,
-    confirm_action_buttons,
-)
-from autopilat.actions import (
-    apply_budget_change,
-    disable_entity,
-    parse_manual_input,
-    can_disable,
-)
 from services.analytics import analyze_campaigns, analyze_adsets
 
 
@@ -114,7 +102,6 @@ def main_menu() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("💳 Биллинг", callback_data="billing")],
             [InlineKeyboardButton("🔥 Тепловая карта", callback_data="hm_menu")],
             [InlineKeyboardButton("⚙️ Настройки", callback_data="choose_acc_settings")],
-            [InlineKeyboardButton("🤖 Автопилат", callback_data="ap_main")],
             [
                 InlineKeyboardButton(
                     f"🔁 Синк BM (посл. {last_sync})",
@@ -176,31 +163,85 @@ def monitoring_menu_kb() -> InlineKeyboardMarkup:
     )
 
 
-def focus_ai_level_kb() -> InlineKeyboardMarkup:
-    """Клавиатура выбора уровня для Фокус-ИИ."""
+def focus_ai_main_kb() -> InlineKeyboardMarkup:
+    """Промежуточное меню Фокус-ИИ."""
     return InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton(
-                    "Аккаунт", callback_data="focus_ai_level|account"
+                    "⚙️ Настройки", callback_data="focus_ai_settings"
                 )
             ],
             [
                 InlineKeyboardButton(
-                    "Кампания", callback_data="focus_ai_level|campaign"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "Адсет", callback_data="focus_ai_level|adset"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "Объявление", callback_data="focus_ai_level|ad"
+                    "📊 Запросить отчёт сейчас", callback_data="focus_ai_now"
                 )
             ],
             [InlineKeyboardButton("⬅️ Мониторинг", callback_data="monitoring_menu")],
+        ]
+    )
+
+
+def focus_ai_level_kb_settings() -> InlineKeyboardMarkup:
+    """Клавиатура выбора уровня для сценария настроек Фокус-ИИ.
+
+    Пока реально поддерживаем только уровень "Аккаунт".
+    """
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "Аккаунт", callback_data="focus_ai_set_level|account"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "Кампания", callback_data="focus_ai_set_level|campaign"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "Адсет", callback_data="focus_ai_set_level|adset"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "Объявление", callback_data="focus_ai_set_level|ad"
+                )
+            ],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="focus_ai_settings")],
+        ]
+    )
+
+
+def focus_ai_level_kb_now() -> InlineKeyboardMarkup:
+    """Клавиатура выбора уровня для разового отчёта Фокус-ИИ.
+
+    Пока вся логика отчёта остаётся заглушкой, но уровни уже отражены в UI.
+    """
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "Аккаунт", callback_data="focus_ai_now_level|account"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "Кампания", callback_data="focus_ai_now_level|campaign"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "Адсет", callback_data="focus_ai_now_level|adset"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "Объявление", callback_data="focus_ai_now_level|ad"
+                )
+            ],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="focus_ai_now")],
         ]
     )
 
@@ -438,6 +479,16 @@ def settings_kb(aid: str) -> InlineKeyboardMarkup:
     )
 
 
+def _user_has_focus_settings(user_id: str) -> bool:
+    """Проверка, есть ли у пользователя какие-либо сохранённые настройки Фокус-ИИ."""
+    st = load_accounts()
+    for row in st.values():
+        focus = row.get("focus") or {}
+        if user_id in focus:
+            return True
+    return False
+
+
 def period_kb_for(aid: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
@@ -607,159 +658,6 @@ async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ Ошибка синка: {e}")
 
 
-async def on_cb_autopilot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-
-    if not _allowed(update):
-        await safe_edit_message(q, "⛔️ Нет доступа.")
-        return
-
-    data = q.data or ""
-    chat_id = str(q.message.chat.id)
-
-    if data == "ap_main":
-        await safe_edit_message(
-            q,
-            "Выберите режим автопилата:",
-            reply_markup=autopilot_main_menu(),
-        )
-        return
-
-    if data.startswith("apmode|"):
-        mode = data.split("|", 1)[1]
-        context.user_data["autopilot_mode"] = mode
-
-        await safe_edit_message(
-            q,
-            f"Режим: <b>{mode}</b>\nВыберите подрежим:",
-            parse_mode="HTML",
-            reply_markup=autopilot_submode_menu(),
-        )
-        return
-
-    if data.startswith("apsub|"):
-        sub = data.split("|", 1)[1]
-        context.user_data["autopilot_submode"] = sub
-
-        await safe_edit_message(
-            q,
-            f"Режим: <b>{context.user_data.get('autopilot_mode')}</b>\n"
-            f"Подрежим: <b>{sub}</b>\n\n"
-            f"Теперь выберите аккаунт:",
-            parse_mode="HTML",
-            reply_markup=accounts_kb("ap_acc"),
-        )
-        return
-
-    if data.startswith("ap_acc|"):
-        aid = data.split("|", 1)[1]
-        context.user_data["ap_aid"] = aid
-
-        ui = get_recommendations_ui(aid)
-        text = f"🔍 <b>Рекомендации по {get_account_name(aid)}</b>\n\n{ui['text']}"
-        await q.edit_message_text(text, parse_mode="HTML")
-
-        from autopilat.ui import build_recommendations_ui
-
-        blocks = build_recommendations_ui(ui["items"])
-        for block in blocks:
-            await context.bot.send_message(
-                chat_id,
-                block["text"],
-                parse_mode="HTML",
-                reply_markup=block["reply_markup"]
-            )
-        return
-
-    if data.startswith("ap|"):
-        parts = data.split("|")
-        if len(parts) < 2:
-            await safe_edit_message(
-                q,
-                "⚠ Ошибка кнопки: некорректный формат callback_data.",
-                parse_mode="HTML",
-            )
-            return
-
-        _, action, *rest = parts
-        entity_id = rest[0] if rest else ""
-
-        if action == "back":
-            await safe_edit_message(
-                q,
-                "Выберите режим автопилата:",
-                reply_markup=autopilot_main_menu(),
-            )
-            return
-
-        if not entity_id:
-            await safe_edit_message(
-                q,
-                "⚠ Ошибка кнопки: не передан ID сущности.\n"
-                "Обнови рекомендации и попробуй ещё раз.",
-                parse_mode="HTML",
-            )
-            return
-
-        if action == "manual":
-            context.user_data["await_manual_input"] = entity_id
-            await safe_edit_message(
-                q,
-                f"✍️ Введите число (например 1.2, -20, 15):\n"
-                f"ID: <code>{entity_id}</code>",
-                parse_mode="HTML",
-            )
-            return
-
-        await safe_edit_message(
-            q,
-            f"Подтвердить действие <b>{action}</b> для <code>{entity_id}</code>?",
-            parse_mode="HTML",
-            reply_markup=confirm_action_buttons(action, entity_id),
-        )
-        return
-
-    if data.startswith("apconfirm|"):
-        _, yesno, action, entity_id = data.split("|", 3)
-
-        if yesno == "no":
-            await safe_edit_message(q, "Операция отменена.", parse_mode="HTML")
-            return
-
-        if action in ("up20", "down20"):
-            percent = 20 if action == "up20" else -20
-            res = apply_budget_change(entity_id, percent)
-            await safe_edit_message(q, res["message"], parse_mode="HTML")
-            return
-
-        if action == "off":
-            aid = context.user_data.get("ap_aid")
-            if aid and not can_disable(aid, entity_id):
-                await safe_edit_message(
-                    q,
-                    "❌ Нельзя отключить этот адсет — иначе весь аккаунт останется без трафика.",
-                    parse_mode="HTML",
-                )
-                return
-
-            res = disable_entity(entity_id)
-            await safe_edit_message(q, res["message"], parse_mode="HTML")
-            return
-
-        try:
-            percent = float(action.replace(",", "."))
-        except Exception:
-            await safe_edit_message(
-                q,
-                "⚠ Не получилось прочитать процент изменения.",
-                parse_mode="HTML",
-            )
-            return
-
-        res = apply_budget_change(entity_id, percent)
-        await safe_edit_message(q, res["message"], parse_mode="HTML")
-        return
 
 
 async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -793,8 +691,132 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit_message(
             q,
             "🎯 Фокус-ИИ\n\n"
-            "Выберите уровень, на котором хотите настраивать фокус-объекты:",
-            reply_markup=focus_ai_level_kb(),
+            "Выберите режим:",
+            reply_markup=focus_ai_main_kb(),
+        )
+        return
+
+    # ==== Фокус-ИИ: сценарий настроек ====
+
+    if data == "focus_ai_settings":
+        await safe_edit_message(
+            q,
+            "🎯 Фокус-ИИ — настройки\n\n"
+            "Сначала выбери рекламный аккаунт, для которого будем настраивать Фокус-ИИ:",
+            reply_markup=accounts_kb("focus_ai_acc"),
+        )
+        return
+
+    if data.startswith("focus_ai_acc|"):
+        aid = data.split("|", 1)[1]
+        context.user_data["focus_ai_settings_aid"] = aid
+        await safe_edit_message(
+            q,
+            f"🎯 Фокус-ИИ — настройки для {get_account_name(aid)}\n\n"
+            "Выбери уровень, на котором будет работать Фокус-ИИ:",
+            reply_markup=focus_ai_level_kb_settings(),
+        )
+        return
+
+    if data.startswith("focus_ai_set_level|"):
+        _prefix, level = data.split("|", 1)
+        aid = context.user_data.get("focus_ai_settings_aid")
+        if not aid:
+            await safe_edit_message(
+                q,
+                "Не удалось определить аккаунт для настроек Фокус-ИИ. Вернись назад и выбери аккаунт ещё раз.",
+                reply_markup=accounts_kb("focus_ai_acc"),
+            )
+            return
+
+        if level != "account":
+            level_human = {
+                "campaign": "Кампании",
+                "adset": "Адсеты",
+                "ad": "Объявления",
+            }.get(level, level)
+            await safe_edit_message(
+                q,
+                f"Уровень '{level_human}' пока в разработке.\n\n"
+                "Сейчас можно включить Фокус-ИИ только на уровне всего аккаунта.",
+                reply_markup=focus_ai_level_kb_settings(),
+            )
+            return
+
+        # Сохраняем простейшую настройку Фокус-ИИ: пользователь → уровень "account" по aid
+        st = load_accounts()
+        row = st.get(aid, {})
+        focus = row.get("focus") or {}
+        uid = str(update.effective_user.id)
+        focus[uid] = {"level": "account", "enabled": True}
+        row["focus"] = focus
+        st[aid] = row
+        save_accounts(st)
+
+        await safe_edit_message(
+            q,
+            f"🎯 Фокус-ИИ включён для аккаунта {get_account_name(aid)} на уровне всего аккаунта.\n\n"
+            "Дальше Фокус-ИИ будет использоваться при почасовом мониторинге и разовых отчётах.",
+            reply_markup=focus_ai_main_kb(),
+        )
+        return
+
+    # ==== Фокус-ИИ: разовый отчёт ====
+
+    if data == "focus_ai_now":
+        uid = str(update.effective_user.id)
+        if _user_has_focus_settings(uid):
+            await safe_edit_message(
+                q,
+                "📊 Разовый отчёт Фокус-ИИ по уже настроенным объектам пока в разработке.\n\n"
+                "План: бот возьмёт текущие цели Фокус-ИИ, сравнит несколько периодов и предложит действия.",
+                reply_markup=focus_ai_main_kb(),
+            )
+            return
+
+        await safe_edit_message(
+            q,
+            "📊 Разовый отчёт Фокус-ИИ\n\n"
+            "Сначала выбери аккаунт, по которому нужен отчёт:",
+            reply_markup=accounts_kb("focus_ai_now_acc"),
+        )
+        return
+
+    if data.startswith("focus_ai_now_acc|"):
+        aid = data.split("|", 1)[1]
+        context.user_data["focus_ai_now_aid"] = aid
+        await safe_edit_message(
+            q,
+            f"📊 Разовый отчёт Фокус-ИИ для {get_account_name(aid)}\n\n"
+            "Выбери уровень, по которому хотешь посмотреть отчёт:",
+            reply_markup=focus_ai_level_kb_now(),
+        )
+        return
+
+    if data.startswith("focus_ai_now_level|"):
+        _prefix, level = data.split("|", 1)
+        aid = context.user_data.get("focus_ai_now_aid")
+        if not aid:
+            await safe_edit_message(
+                q,
+                "Не удалось определить аккаунт для отчёта Фокус-ИИ. Вернись назад и выбери аккаунт ещё раз.",
+                reply_markup=accounts_kb("focus_ai_now_acc"),
+            )
+            return
+
+        level_human = {
+            "account": "Аккаунт",
+            "campaign": "Кампании",
+            "adset": "Адсеты",
+            "ad": "Объявления",
+        }.get(level, level)
+
+        await safe_edit_message(
+            q,
+            f"📊 Разовый отчёт Фокус-ИИ\n\n"
+            f"Объект: {get_account_name(aid)} — уровень: {level_human}.\n\n"
+            "Здесь позже появится сравнение периодов, рекомендации и кнопки действий (+20% / -20% / ручной ввод).",
+            reply_markup=focus_ai_main_kb(),
         )
         return
 
@@ -1211,24 +1233,6 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Планируется настройка курса USD→KZT и месячных бюджетов по аккаунтам.",
             reply_markup=monitoring_menu_kb(),
         )
-        return
-
-    if data.startswith("focus_ai_level|"):
-        _prefix, level = data.split("|", 1)
-        level_human = {
-            "account": "Аккаунт",
-            "campaign": "Кампания",
-            "adset": "Адсет",
-            "ad": "Объявление",
-        }.get(level, level)
-
-        text = (
-            f"🎯 Фокус-ИИ — уровень: {level_human}\n\n"
-            "Здесь позже появится список объектов на этом уровне с состоянием ON/OFF "
-            "и кнопками включения/выключения фокуса.\n\n"
-            "Пока раздел работает как заглушка."
-        )
-        await safe_edit_message(q, text, reply_markup=focus_ai_level_kb())
         return
 
     if data == "sync_bm":
@@ -1659,7 +1663,6 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("sync_accounts", cmd_sync))
     app.add_handler(CommandHandler("heatmap", cmd_heatmap))
 
-    app.add_handler(CallbackQueryHandler(on_cb_autopilot, pattern="^ap"))
     app.add_handler(CallbackQueryHandler(on_cb))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_any))
 

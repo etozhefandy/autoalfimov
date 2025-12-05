@@ -59,6 +59,13 @@ def apply_budget_change(adset_id: str, percent: float) -> Dict[str, Any]:
         "message": "...",
     }
     """
+    # Мягкое ограничение изменения за один шаг, чтобы не было резких скачков.
+    max_step = 30.0
+    if percent > max_step:
+        percent = max_step
+    elif percent < -max_step:
+        percent = -max_step
+
     adset = AdSet(adset_id)
 
     # Получаем текущий бюджет
