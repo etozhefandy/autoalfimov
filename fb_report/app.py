@@ -135,6 +135,11 @@ def monitoring_menu_kb() -> InlineKeyboardMarkup:
         [
             [
                 InlineKeyboardButton(
+                    "🎯 Фокус-ИИ", callback_data="focus_ai_menu"
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     "Вчера vs позавчера", callback_data="mon_yday_vs_byday"
                 )
             ],
@@ -167,6 +172,35 @@ def monitoring_menu_kb() -> InlineKeyboardMarkup:
                 )
             ],
             [InlineKeyboardButton("⬅️ В меню", callback_data="menu")],
+        ]
+    )
+
+
+def focus_ai_level_kb() -> InlineKeyboardMarkup:
+    """Клавиатура выбора уровня для Фокус-ИИ."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "Аккаунт", callback_data="focus_ai_level|account"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "Кампания", callback_data="focus_ai_level|campaign"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "Адсет", callback_data="focus_ai_level|adset"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "Объявление", callback_data="focus_ai_level|ad"
+                )
+            ],
+            [InlineKeyboardButton("⬅️ Мониторинг", callback_data="monitoring_menu")],
         ]
     )
 
@@ -755,6 +789,15 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if data == "focus_ai_menu":
+        await safe_edit_message(
+            q,
+            "🎯 Фокус-ИИ\n\n"
+            "Выберите уровень, на котором хотите настраивать фокус-объекты:",
+            reply_markup=focus_ai_level_kb(),
+        )
+        return
+
     if data == "reports_menu":
         await safe_edit_message(
             q,
@@ -1168,6 +1211,24 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Планируется настройка курса USD→KZT и месячных бюджетов по аккаунтам.",
             reply_markup=monitoring_menu_kb(),
         )
+        return
+
+    if data.startswith("focus_ai_level|"):
+        _prefix, level = data.split("|", 1)
+        level_human = {
+            "account": "Аккаунт",
+            "campaign": "Кампания",
+            "adset": "Адсет",
+            "ad": "Объявление",
+        }.get(level, level)
+
+        text = (
+            f"🎯 Фокус-ИИ — уровень: {level_human}\n\n"
+            "Здесь позже появится список объектов на этом уровне с состоянием ON/OFF "
+            "и кнопками включения/выключения фокуса.\n\n"
+            "Пока раздел работает как заглушка."
+        )
+        await safe_edit_message(q, text, reply_markup=focus_ai_level_kb())
         return
 
     if data == "sync_bm":
