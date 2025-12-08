@@ -3,7 +3,7 @@ from typing import Any, Dict, List
 
 from facebook_business.adobjects.adaccount import AdAccount
 
-from services.facebook_api import safe_api_call
+from services.facebook_api import safe_api_call, fetch_campaigns, fetch_adsets
 
 
 def _parse_fb_datetime(value: str) -> datetime:
@@ -25,14 +25,28 @@ def _parse_fb_datetime(value: str) -> datetime:
 
 
 def fetch_instagram_active_ads_links(account_id: str) -> List[Dict[str, Any]]:
-    """Возвращает плоский список активных инста-объявлений вида:
+    """Возвращает иерархию активной инста-рекламы вида:
 
     [
       {
-        "created_time": datetime,
-        "ad_id": "...",
-        "ad_name": "...",
-        "instagram_url": "...",
+        "campaign_id": "...",
+        "campaign_name": "...",
+        "adsets": [
+          {
+            "adset_id": "...",
+            "adset_name": "...",
+            "creatives": [
+              {
+                "launch_time": datetime,
+                "ad_id": "...",
+                "ad_name": "...",
+                "instagram_url": "...",
+              },
+              ...
+            ],
+          },
+          ...
+        ],
       },
       ...
     ]
@@ -40,6 +54,20 @@ def fetch_instagram_active_ads_links(account_id: str) -> List[Dict[str, Any]]:
     Берём только объявления с effective_status = ACTIVE и непустым
     creative.instagram_permalink_url.
     """
+
+    # Карты для имён кампаний и адсетов
+    campaigns = fetch_campaigns(account_id)
+    campaigns_map: Dict[str, str] = {
+        c.get("id"): c.get("name") or c.get("id") for c in campaigns
+    }
+
+    adsets = fetch_adsets(account_id)
+    adsets_map: Dict[str, Dict[str, Any]] = {}
+    for a in adsets:
+        adsets_map[a.get("id")] = {
+            "name": a.get("name") or a.get("id"),
+            "campaign_id": a.get("campaign_id"),
+        }
 
     acc = AdAccount(account_id)
 
@@ -50,6 +78,9 @@ def fetch_instagram_active_ads_links(account_id: str) -> List[Dict[str, Any]]:
             "name",
             "effective_status",
             "created_time",
+            "start_time",
+            "adset_id",
+            "campaign_id",
             "creative{instagram_permalink_url}",
         ],
         params={"effective_status": ["ACTIVE"]},
@@ -58,12 +89,26 @@ def fetch_instagram_active_ads_links(account_id: str) -> List[Dict[str, Any]]:
     if not ads:
         return []
 
-    result: List[Dict[str, Any]] = []
+    tree: Dict[str, Dict[str, Any]] = {}
 
     for row in ads:
         try:
             if row.get("effective_status") != "ACTIVE":
                 continue
+
+            adset_id = row.get("adset_id")
+            campaign_id = row.get("campaign_id")
+
+            if not campaign_id and adset_id in adsets_map:
+                campaign_id = adsets_map[adset_id].get("campaign_id")
+
+            if not campaign_id:
+                continue
+
+            campaign_name = campaigns_map.get(campaign_id, campaign_id)
+
+            adset_info = adsets_map.get(adset_id, {}) if adset_id else {}
+            adset_name = adset_info.get("name") or adset_id or "Без названия адсета"
 
             creative_info = row.get("creative") or {}
             if not isinstance(creative_info, dict) and hasattr(creative_info, "export_all_data"):
@@ -79,14 +124,36 @@ def fetch_instagram_active_ads_links(account_id: str) -> List[Dict[str, Any]]:
             if not url:
                 continue
 
-            created_time_raw = row.get("created_time") or ""
-            created_dt = _parse_fb_datetime(created_time_raw)
+            # Дата публикации: сначала start_time, если нет — created_time
+            start_time = row.get("start_time") or ""
+            created_time = row.get("created_time") or ""
+            launch_str = start_time or created_time
+            launch_time = _parse_fb_datetime(launch_str)
+
+            camp_entry = tree.setdefault(
+                campaign_id,
+                {
+                    "campaign_id": campaign_id,
+                    "campaign_name": campaign_name,
+                    "adsets": {},
+                },
+            )
+
+            adsets_dict: Dict[str, Any] = camp_entry["adsets"]
+            adset_entry = adsets_dict.setdefault(
+                adset_id or "unknown",
+                {
+                    "adset_id": adset_id,
+                    "adset_name": adset_name,
+                    "creatives": [],
+                },
+            )
 
             ad_name = row.get("name") or row.get("id") or "Без названия объявления"
 
-            result.append(
+            adset_entry["creatives"].append(
                 {
-                    "created_time": created_dt,
+                    "launch_time": launch_time,
                     "ad_id": row.get("id"),
                     "ad_name": ad_name,
                     "instagram_url": url,
@@ -95,64 +162,78 @@ def fetch_instagram_active_ads_links(account_id: str) -> List[Dict[str, Any]]:
         except Exception:
             continue
 
-    # Сортируем от новых к старым по created_time
-    result.sort(key=lambda x: x["created_time"], reverse=True)
+    if not tree:
+        return []
 
-    return result
+    campaigns_list: List[Dict[str, Any]] = []
+    for camp in tree.values():
+        adset_list: List[Dict[str, Any]] = []
+        for a in camp["adsets"].values():
+            # сортировка объявлений внутри адсета от новых к старым
+            a["creatives"].sort(key=lambda x: x["launch_time"], reverse=True)
+            adset_list.append(a)
+
+        # сортируем адсеты по дате самого нового объявления
+        adset_list.sort(
+            key=lambda ad: ad["creatives"][0]["launch_time"] if ad["creatives"] else datetime.min,
+            reverse=True,
+        )
+
+        camp["adsets"] = adset_list
+        campaigns_list.append(camp)
+
+    # Сортируем кампании по имени для стабильного вывода
+    campaigns_list.sort(key=lambda c: c.get("campaign_name") or "")
+
+    return campaigns_list
 
 
 def format_instagram_ads_links(items: List[Dict[str, Any]], *, max_chars: int = 3500) -> List[str]:
-    """Форматирует плоский список объявлений в один или несколько текстов для Telegram.
+    """Форматирует дерево кампаний/адсетов/объявлений в список сообщений Telegram.
 
-    Формат:
+    Каждая кампания — отдельное сообщение, в стиле, как на макете:
 
-    Активная реклама (Instagram, от новых к старым):
-
-    2025-12-03 | Телефон
-    https://www.instagram.com/p/...
-
-    2025-11-24 | 1 рус
-    https://www.instagram.com/p/...
+    🟩 Название кампании
+    ────────────
+    Адсет: Адсет 1
+    ────────────────
+      2025-12-03 — Телефон — 🔗 https://www.instagram.com/p/...
+      ...
     """
     if not items:
         return ["Активной рекламы в Instagram с прямыми ссылками сейчас нет."]
 
     messages: List[str] = []
-    current_lines: List[str] = [
-        "Активная реклама (Instagram, от новых к старым):",
-        "",
-    ]
 
-    def flush() -> None:
-        if current_lines:
-            messages.append("\n".join(current_lines))
-            current_lines.clear()
+    for camp in items:
+        camp_name = camp.get("campaign_name") or camp.get("campaign_id") or "Без названия кампании"
 
-    for ad in items:
-        created = ad.get("created_time")
-        if isinstance(created, datetime):
-            dt_str = created.date().isoformat()
-        else:
-            dt_str = "?"
+        lines: List[str] = [
+            f"🟩 {camp_name}",
+            "────────────",
+        ]
 
-        name = ad.get("ad_name") or "Без названия объявления" 
-        url = ad.get("instagram_url") or ""
+        for adset in camp.get("adsets", []):
+            adset_name = adset.get("adset_name") or "Без названия адсета"
 
-        line1 = f"{dt_str} | {name}"
-        line2 = url
-        block = [line1, line2, ""]
-
-        # Проверяем, поместится ли блок в текущее сообщение
-        if sum(len(l) + 1 for l in current_lines + block) > max_chars:
-            flush()
-            # после сброса начинаем новый блок с заголовком
-            current_lines.extend([
-                "Активная реклама (Instagram, от новых к старым):",
+            lines.extend([
                 "",
+                f"Адсет: {adset_name}",
+                "────────────────",
             ])
 
-        current_lines.extend(block)
+            for cr in adset.get("creatives", []):
+                lt = cr.get("launch_time")
+                if isinstance(lt, datetime):
+                    dt_str = lt.date().isoformat()
+                else:
+                    dt_str = "?"
 
-    flush()
+                ad_name = cr.get("ad_name") or "Без названия объявления"
+                url = cr.get("instagram_url") or ""
+
+                lines.append(f"  {dt_str} — {ad_name} — 🔗 {url}")
+
+        messages.append("\n".join(lines))
 
     return messages
