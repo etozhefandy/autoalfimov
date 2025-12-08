@@ -2,6 +2,7 @@ from datetime import datetime
 from typing import Any, Dict, List
 
 from facebook_business.adobjects.adaccount import AdAccount
+from facebook_business.adobjects.adcreative import AdCreative
 
 from services.facebook_api import safe_api_call, fetch_campaigns, fetch_adsets
 
@@ -71,6 +72,7 @@ def fetch_instagram_active_ads_links(account_id: str) -> List[Dict[str, Any]]:
 
     acc = AdAccount(account_id)
 
+    # Важно: используем только разрешённые поля для /ads
     ads = safe_api_call(
         acc.get_ads,
         fields=[
@@ -78,10 +80,9 @@ def fetch_instagram_active_ads_links(account_id: str) -> List[Dict[str, Any]]:
             "name",
             "effective_status",
             "created_time",
-            "start_time",
             "adset_id",
             "campaign_id",
-            "creative{instagram_permalink_url}",
+            "creative",
         ],
         params={"effective_status": ["ACTIVE"]},
     )
@@ -107,6 +108,7 @@ def fetch_instagram_active_ads_links(account_id: str) -> List[Dict[str, Any]]:
             adset_info = adsets_map.get(adset_id, {}) if adset_id else {}
             adset_name = adset_info.get("name") or adset_id or "Без названия адсета"
 
+            # Получаем id креатива из поля creative
             creative_info = row.get("creative") or {}
             if not isinstance(creative_info, dict) and hasattr(creative_info, "export_all_data"):
                 try:
@@ -117,9 +119,24 @@ def fetch_instagram_active_ads_links(account_id: str) -> List[Dict[str, Any]]:
                     except Exception:
                         creative_info = {}
 
-            url = None
+            creative_id = None
             if hasattr(creative_info, "get"):
-                url = creative_info.get("instagram_permalink_url")
+                creative_id = creative_info.get("id")
+            elif isinstance(creative_info, dict):
+                creative_id = creative_info.get("id")
+
+            if not creative_id:
+                continue
+
+            # Отдельным запросом тянем instagram_permalink_url креатива
+            creative = safe_api_call(
+                AdCreative(creative_id).api_get,
+                fields=["instagram_permalink_url"],
+            )
+
+            url = None
+            if creative and hasattr(creative, "get"):
+                url = creative.get("instagram_permalink_url")
 
             if not url:
                 continue
@@ -221,7 +238,7 @@ def format_instagram_ads_links(items: List[Dict[str, Any]], *, max_chars: int = 
             ])
 
             for cr in adset.get("creatives", []):
-                lt = cr.get("launch_time")
+                lt = cr.get("created_time")
                 if isinstance(lt, datetime):
                     dt_str = lt.date().isoformat()
                 else:
