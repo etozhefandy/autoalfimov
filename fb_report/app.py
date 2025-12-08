@@ -51,8 +51,9 @@ from .adsets import send_adset_report
 from .billing import send_billing, send_billing_forecast, billing_digest_job
 from .jobs import full_daily_scan_job, daily_report_job, schedule_cpa_alerts
 
-from services.analytics import analyze_campaigns, analyze_adsets, analyze_account
-from services.ai_focus import get_focus_comment
+from services.analytics import analyze_campaigns, analyze_adsets, analyze_account, analyze_ads
+from services.ai_focus import get_focus_comment, ask_deepseek
+import json
 
 
 def _allowed(update: Update) -> bool:
@@ -805,40 +806,117 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        if level != "account":
-            level_human = {
-                "campaign": "Кампании",
-                "adset": "Адсеты",
-                "ad": "Объявления",
-            }.get(level, level)
+        # Собираем данные по выбранному уровню для агрегированного анализа.
+        level_human = {
+            "account": "Аккаунт",
+            "campaign": "Кампании",
+            "adset": "Адсеты",
+            "ad": "Объявления",
+        }.get(level, level)
 
+        if level == "account":
+            base_analysis = analyze_account(aid, days=7)
+            heat = build_heatmap_for_account(aid, get_account_name, mode="7")
+
+            data_for_analysis = {
+                "scope": "account",
+                "account_id": aid,
+                "account_name": get_account_name(aid),
+                "period_7d": base_analysis.get("period"),
+                "metrics_7d": base_analysis.get("metrics"),
+                "heatmap_7d": heat,
+            }
+        elif level == "campaign":
+            camps = analyze_campaigns(aid, days=7) or []
+            data_for_analysis = {
+                "scope": "campaign",
+                "account_id": aid,
+                "account_name": get_account_name(aid),
+                "campaigns": camps,
+            }
+        elif level == "adset":
+            adsets = analyze_adsets(aid, days=7) or []
+            data_for_analysis = {
+                "scope": "adset",
+                "account_id": aid,
+                "account_name": get_account_name(aid),
+                "adsets": adsets,
+            }
+        elif level == "ad":
+            ads = analyze_ads(aid, days=7) or []
+            data_for_analysis = {
+                "scope": "ad",
+                "account_id": aid,
+                "account_name": get_account_name(aid),
+                "ads": ads,
+            }
+        else:
             await safe_edit_message(
                 q,
-                "📊 Разовый отчёт Фокус-ИИ\n\n"
-                f"Уровень '{level_human}' пока в разработке. Сейчас доступен только уровень 'Аккаунт'.",
+                "Неизвестный уровень для Фокус-ИИ.",
                 reply_markup=focus_ai_main_kb(),
             )
             return
 
-        analysis = analyze_account(aid, days=7)
-        context_payload = {
-            "account_id": aid,
-            "account_name": get_account_name(aid),
-            "period": analysis.get("period"),
-            "metrics": analysis.get("metrics"),
-        }
-
-        comment = get_focus_comment(context_payload)
-
-        text = (
-            "📊 Разовый отчёт Фокус-ИИ\n\n"
-            f"Объект: {get_account_name(aid)} — уровень: Аккаунт.\n\n"
-            f"{comment}"
+        system_msg = (
+            "Ты — продвинутый аналитик для Facebook Ads (Focus-ИИ). "
+            "Тебе переданы данные по аккаунту и объектам рекламной структуры (аккаунт/кампании/адсеты/объявления). "
+            "Нужно выявить тренды, аномалии и дать рекомендацию по бюджету и действиям. "
+            "Если передан список кампаний/адсетов/объявлений, опиши коротко каждый объект отдельно внутри поля 'analysis' (структурированный текст с разбивкой по объектам), "
+            "но верни один общий JSON-объект. "
+            "Всегда отвечай СТРОГО одним JSON-объектом со структурой: "
+            "{""status"":""ok""|""error"", ""analysis"":""..."", ""reason"":""..."", ""recommendation"":""increase_budget""|""decrease_budget""|""keep""|""check_creatives"", ""confidence"":0-100, ""suggested_change_percent"":число}. "
+            "Не добавляй никакого текста вне JSON."
         )
+
+        user_msg = json.dumps(data_for_analysis, ensure_ascii=False)
+
+        try:
+            ds_resp = await ask_deepseek(
+                [
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": user_msg},
+                ],
+                json_mode=True,
+            )
+
+            choice = (ds_resp.get("choices") or [{}])[0]
+            content = (choice.get("message") or {}).get("content") or ""
+            parsed = json.loads(content)
+        except Exception as e:
+            parsed = {
+                "status": "error",
+                "analysis": "Фокус-ИИ временно недоступен. Используй стандартные отчёты по аккаунту.",
+                "reason": f"DeepSeek error: {e}",
+                "recommendation": "keep",
+                "confidence": 0,
+                "suggested_change_percent": 0,
+            }
+
+        status = parsed.get("status", "ok")
+        analysis_text = parsed.get("analysis") or "Без текста анализа."
+        reason_text = parsed.get("reason") or "Причина не указана."
+        rec = parsed.get("recommendation") or "keep"
+        conf = parsed.get("confidence") or 0
+        delta = parsed.get("suggested_change_percent") or 0
+
+        text_lines = [
+            "📊 Разовый отчёт Фокус-ИИ",
+            "",
+            f"Объект: {get_account_name(aid)} — уровень: {level_human}.",
+            "",
+            f"Анализ: {analysis_text}",
+            f"Причина: {reason_text}",
+            f"Рекомендация: {rec} ({delta:+}%)",
+            f"Уверенность: {conf}%",
+        ]
+
+        if status != "ok":
+            text_lines.append("\n⚠️ При обработке запроса возникла ошибка, проверь данные вручную.")
 
         await safe_edit_message(
             q,
-            text,
+            "\n".join(text_lines),
             reply_markup=focus_ai_main_kb(),
         )
         return

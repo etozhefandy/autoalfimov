@@ -1,4 +1,5 @@
 import os
+import asyncio
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -87,3 +88,44 @@ def get_focus_comment(context: Dict[str, Any]) -> str:
             "Фокус-ИИ временно недоступен (ошибка ИИ-сервиса). "
             "Ориентируйся по изменениям CPA, заявок и спенда в сравнении периодов."
         )
+
+
+async def ask_deepseek(messages: List[Dict[str, str]], json_mode: bool = False) -> Dict[str, Any]:
+    """Асинхронная обёртка вокруг DeepSeek Chat Completions (thinking-mode).
+
+    Принимает список messages в формате OpenAI (role/content) и, опционально,
+    включает JSON-режим ответа через response_format.
+    """
+
+    api_key = os.getenv("DS-focus")
+    if not api_key:
+        raise RuntimeError("DeepSeek API key is missing (DS-focus)")
+
+    url = f"{DEEPSEEK_BASE_URL.rstrip('/')}{DEEPSEEK_ENDPOINT}"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    payload: Dict[str, Any] = {
+        "model": DEEPSEEK_MODEL,
+        "messages": messages,
+    }
+
+    if json_mode:
+        payload["response_format"] = {"type": "json_object"}
+
+    def _do_request() -> Dict[str, Any]:
+        resp = requests.post(url, headers=headers, json=payload, timeout=60)
+        resp.raise_for_status()
+        return resp.json()
+
+    return await asyncio.to_thread(_do_request)
+
+
+# ======== Продвинутые настройки DeepSeek для Focus-ИИ (WS) ========
+
+DEEPSEEK_API_KEY = os.getenv("DS-focus")
+DEEPSEEK_MODEL = "deepseek-reasoner"
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+DEEPSEEK_CHAT_COMPLETIONS = "/v1/chat/completions"
