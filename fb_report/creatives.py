@@ -93,9 +93,6 @@ def fetch_instagram_active_ads_links(account_id: str) -> List[Dict[str, Any]]:
 
     for row in ads:
         try:
-            if row.get("effective_status") != "ACTIVE":
-                continue
-
             adset_id = row.get("adset_id")
             campaign_id = row.get("campaign_id")
 
