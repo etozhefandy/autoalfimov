@@ -62,7 +62,8 @@ def build_heatmap_for_account(aid, get_account_name, mode: str = "7"):
             "since": since.strftime("%Y-%m-%d"),
             "until": until.strftime("%Y-%m-%d")
         },
-        "fields": "spend,actions,name"
+        # Добавляем показы и частоту, чтобы Фокус-ИИ видел, где аудитория выгорает.
+        "fields": "spend,actions,name,impressions,frequency"
     }
 
     try:
@@ -85,17 +86,18 @@ def build_heatmap_for_account(aid, get_account_name, mode: str = "7"):
         )
 
         cpa = _calculate_cpa(spend, msgs, leads)
+        freq = float(row.get("frequency", 0) or 0)
 
         if cpa is None:
-            COLD.append(f"❄️ {name} — 0 заявок, {spend:.2f}$ трат")
+            COLD.append(f"❄️ {name} — 0 заявок, {spend:.2f}$ трат, частота {freq:.1f}")
             continue
 
         if cpa < 3:
-            HOT.append(f"🔥 {name} — CPA {cpa:.2f}$")
+            HOT.append(f"🔥 {name} — CPA {cpa:.2f}$, частота {freq:.1f}")
         elif 3 <= cpa <= 7:
-            MEDIUM.append(f"🟡 {name} — CPA {cpa:.2f}$")
+            MEDIUM.append(f"🟡 {name} — CPA {cpa:.2f}$, частота {freq:.1f}")
         else:
-            COLD.append(f"❄️ {name} — CPA {cpa:.2f}$")
+            COLD.append(f"❄️ {name} — CPA {cpa:.2f}$, частота {freq:.1f}")
 
     # Название режима для текста
     mode_text = {

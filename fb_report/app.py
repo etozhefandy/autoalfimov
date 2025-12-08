@@ -17,6 +17,7 @@ from telegram.ext import (
 )
 
 from billing_watch import init_billing_watch
+from autopilat.actions import apply_budget_change
 
 from .constants import (
     ALMATY_TZ,
@@ -47,6 +48,7 @@ from .reporting import (
     parse_two_ranges,
 )
 from .insights import build_heatmap_for_account
+from .creatives import fetch_instagram_active_ads_links, format_instagram_ads_links
 from .adsets import send_adset_report
 from .billing import send_billing, send_billing_forecast, billing_digest_job
 from .jobs import full_daily_scan_job, daily_report_job, schedule_cpa_alerts
@@ -103,6 +105,7 @@ def main_menu() -> InlineKeyboardMarkup:
             ],
             [InlineKeyboardButton("💳 Биллинг", callback_data="billing")],
             [InlineKeyboardButton("🔥 Тепловая карта", callback_data="hm_menu")],
+            [InlineKeyboardButton("🔗 Ссылки на рекламу", callback_data="insta_links_menu")],
             [InlineKeyboardButton("⚙️ Настройки", callback_data="choose_acc_settings")],
             [
                 InlineKeyboardButton(
@@ -115,7 +118,33 @@ def main_menu() -> InlineKeyboardMarkup:
     )
 
 
-def focus_ai_recommendation_kb(level: str, recommendation: str, delta: float) -> InlineKeyboardMarkup:
+def focus_ai_period_kb(level: str) -> InlineKeyboardMarkup:
+    """Клавиатура выбора периода для разового отчёта Фокус-ИИ."""
+    base = f"focus_ai_now_period|{level}"
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Сегодня", callback_data=f"{base}|today"),
+                InlineKeyboardButton("Вчера", callback_data=f"{base}|yday"),
+            ],
+            [
+                InlineKeyboardButton("7 дней", callback_data=f"{base}|7d"),
+                InlineKeyboardButton("30 дней", callback_data=f"{base}|30d"),
+            ],
+            [
+                InlineKeyboardButton("🗓 Свой период", callback_data=f"{base}|custom"),
+            ],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="focus_ai_now")],
+        ]
+    )
+
+
+def focus_ai_recommendation_kb(
+    level: str,
+    recommendation: str,
+    delta: float,
+    objects: list | None = None,
+) -> InlineKeyboardMarkup:
     """Клавиатура под отчётом Фокус-ИИ с кнопкой действия и ручным вводом.
 
     Пока действия не применяют реальные изменения бюджета, а служат как подсказка.
@@ -157,6 +186,40 @@ def focus_ai_recommendation_kb(level: str, recommendation: str, delta: float) ->
             )
         ]
     )
+
+    # Пер-объектные рекомендации (минимум по адсетам).
+    objs = objects or []
+    for obj in objs:
+        obj_level = obj.get("level") or ""
+        obj_id = str(obj.get("id") or "")
+        obj_name = str(obj.get("name") or obj_id)
+        obj_rec = obj.get("recommendation") or "keep"
+        obj_delta = float(obj.get("suggested_change_percent") or 0)
+
+        # Бюджетные действия только для adset-уровня.
+        if obj_level != "adset":
+            continue
+
+        if obj_rec == "increase_budget" and obj_delta > 0:
+            action = "inc"
+            sign = "⬆️"
+            label = f"{sign} {obj_name}: +{obj_delta:.0f}%"
+        elif obj_rec == "decrease_budget" and obj_delta < 0:
+            action = "dec"
+            sign = "⬇️"
+            label = f"{sign} {obj_name}: {obj_delta:.0f}%"
+        else:
+            continue
+
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    label,
+                    callback_data=f"focus_ai_obj|adset|{obj_id}|{action}|{int(obj_delta)}",
+                )
+            ]
+        )
+
     rows.append([InlineKeyboardButton("⬅️ Мониторинг", callback_data="monitoring_menu")])
 
     return InlineKeyboardMarkup(rows)
@@ -642,7 +705,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/heatmap <act_id> — тепловая карта адсетов за 7 дней\n"
         "/version — показать текущую версию бота и краткое описание\n"
         "\n"
-        "🚀 Функции автопилата:\n"
+        "🚀 Функции автопилота:\n"
         "• Автоматические рекомендации по аккаунту\n"
         "• Изменение бюджета (-20%, +20%, ручной ввод)\n"
         "• Безопасное отключение дорогих адсетов\n"
@@ -707,8 +770,6 @@ async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ Ошибка синка: {e}")
 
 
-
-
 async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -728,6 +789,15 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit_message(q, "🤖 Выберите действие:", reply_markup=main_menu())
         return
 
+    if data == "insta_links_menu":
+        # Сценарий получения ссылок на активную инста-рекламу.
+        await safe_edit_message(
+            q,
+            "Выберите рекламный аккаунт для получения ссылок на активную рекламу в Instagram:",
+            reply_markup=accounts_kb("insta_links_acc"),
+        )
+        return
+
     if data == "monitoring_menu":
         await safe_edit_message(
             q,
@@ -743,6 +813,22 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Выберите режим:",
             reply_markup=focus_ai_main_kb(),
         )
+        return
+
+    if data.startswith("insta_links_acc|"):
+        aid = data.split("|", 1)[1]
+        account_name = get_account_name(aid)
+
+        await safe_edit_message(
+            q,
+            f"🔗 Ссылки на рекламу — {account_name}\n\n"
+            "Собираю активные инста-объявления...",
+        )
+
+        items = fetch_instagram_active_ads_links(aid, limit=20)
+        text = format_instagram_ads_links(items)
+
+        await context.bot.send_message(chat_id, text)
         return
 
     # ==== Фокус-ИИ: сценарий настроек ====
@@ -853,7 +939,8 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # Собираем данные по выбранному уровню для агрегированного анализа.
+        # Сохраняем уровень и предлагаем выбрать период.
+        context.user_data["focus_ai_now_level"] = level
         level_human = {
             "account": "Аккаунт",
             "campaign": "Кампании",
@@ -861,46 +948,116 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "ad": "Объявления",
         }.get(level, level)
 
-        # Сразу показываем пользователю, что Фокус-ИИ начал работу.
         await safe_edit_message(
             q,
-            "🧠 Фокус-ИИ думает...\nАнализирую данные по аккаунту и выбранному уровню...",
+            "📊 Разовый отчёт Фокус-ИИ\n\n"
+            f"Объект: {get_account_name(aid)} — уровень: {level_human}.\n\n"
+            "Выбери период для анализа:",
+            reply_markup=focus_ai_period_kb(level),
+        )
+        return
+
+    if data.startswith("focus_ai_now_period|"):
+        # Формат: focus_ai_now_period|{level}|{mode}
+        _, level, mode = data.split("|", 2)
+        aid = context.user_data.get("focus_ai_now_aid")
+        if not aid:
+            await safe_edit_message(
+                q,
+                "Не удалось определить аккаунт для отчёта Фокус-ИИ. Вернись назад и выбери аккаунт ещё раз.",
+                reply_markup=accounts_kb("focus_ai_now_acc"),
+            )
+            return
+
+        level_human = {
+            "account": "Аккаунт",
+            "campaign": "Кампании",
+            "adset": "Адсеты",
+            "ad": "Объявления",
+        }.get(level, level)
+
+        period_human = {
+            "today": "Сегодня",
+            "yday": "Вчера",
+            "7d": "Последние 7 дней",
+            "30d": "Последние 30 дней",
+            "custom": "Свой период",
+        }.get(mode, "Последние 7 дней")
+
+        # Для custom сначала просим ввести диапазон дат в свободном вводе.
+        if mode == "custom":
+            context.user_data["focus_ai_now_custom_ctx"] = {
+                "aid": aid,
+                "level": level,
+            }
+            await safe_edit_message(
+                q,
+                "🗓 Фокус-ИИ — свой период\n\n"
+                f"Объект: {get_account_name(aid)} — уровень: {level_human}.\n\n"
+                "Введи даты форматом: 01.06.2025-07.06.2025",
+                reply_markup=focus_ai_period_kb(level),
+            )
+            return
+
+        # Показываем пользователю понятный индикатор, что Фокус-ИИ работает.
+        await safe_edit_message(
+            q,
+            "🧠 Фокус-ИИ думает...\n"
+            f"Анализирую данные по аккаунту и уровню '{level_human}' за период: {period_human}...",
         )
 
+        # Собираем данные по выбранному уровню и периоду.
+        from services.analytics import _make_period_for_mode  # локальный импорт, чтобы избежать циклов
+
+        # Для custom пока используем fallback 7 дней, но передаём маркер в контекст.
+        mode_for_period = mode if mode in {"today", "yday", "7d", "30d"} else "7d"
+        period_dict = _make_period_for_mode(mode_for_period)
+
         if level == "account":
-            base_analysis = analyze_account(aid, days=7)
+            base_analysis = analyze_account(aid, period=period_dict)
             heat = build_heatmap_for_account(aid, get_account_name, mode="7")
 
             data_for_analysis = {
                 "scope": "account",
                 "account_id": aid,
                 "account_name": get_account_name(aid),
-                "period_7d": base_analysis.get("period"),
-                "metrics_7d": base_analysis.get("metrics"),
+                "period_mode": mode,
+                "period_label": period_human,
+                "period": period_dict,
+                "metrics": base_analysis.get("metrics"),
                 "heatmap_7d": heat,
             }
         elif level == "campaign":
-            camps = analyze_campaigns(aid, days=7) or []
+            camps = analyze_campaigns(aid, period=period_dict) or []
             data_for_analysis = {
                 "scope": "campaign",
                 "account_id": aid,
                 "account_name": get_account_name(aid),
+                "period_mode": mode,
+                "period_label": period_human,
+                "period": period_dict,
                 "campaigns": camps,
             }
         elif level == "adset":
-            adsets = analyze_adsets(aid, days=7) or []
+            adsets = analyze_adsets(aid, period=period_dict) or []
             data_for_analysis = {
                 "scope": "adset",
                 "account_id": aid,
                 "account_name": get_account_name(aid),
+                "period_mode": mode,
+                "period_label": period_human,
+                "period": period_dict,
                 "adsets": adsets,
             }
         elif level == "ad":
-            ads = analyze_ads(aid, days=7) or []
+            ads = analyze_ads(aid, period=period_dict) or []
             data_for_analysis = {
                 "scope": "ad",
                 "account_id": aid,
                 "account_name": get_account_name(aid),
+                "period_mode": mode,
+                "period_label": period_human,
+                "period": period_dict,
                 "ads": ads,
             }
         else:
@@ -913,13 +1070,16 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         system_msg = (
             "Ты — продвинутый аналитик для Facebook Ads (Focus-ИИ). "
-            "Отвечай ТОЛЬКО на русском языке, понятным маркетологу, без английских терминов там, где можно использовать русские. "
-            "Тебе переданы данные по аккаунту и объектам рекламной структуры (аккаунт/кампании/адсеты/объявления). "
+            "Отвечай ТОЛЬКО на русском языке, понятным маркетологу. "
+            "Используй русские названия метрик: показы, клики, расходы, сообщения/заявки, стоимость заявки (CPA), CTR, частота показов. "
+            "Тебе переданы данные по аккаунту и объектам рекламной структуры (аккаунт/кампании/адсеты/объявления) за указанный период. "
             "Нужно выявить тренды, аномалии и дать рекомендацию по бюджету и действиям. "
-            "Если передан список кампаний/адсетов/объявлений, опиши коротко каждый объект отдельно внутри поля 'analysis' (структурированный текст с разбивкой по объектам), "
-            "но верни один общий JSON-объект. "
+            "Если передан список кампаний/адсетов/объявлений, опиши коротко каждый объект отдельным абзацем внутри поля 'analysis' (по одному абзацу на объект), "
+            "а затем добавь общий вывод. "
+            "Если по объектам есть отдельные рекомендации, добавь поле 'objects' — массив объектов вида: "
+            "[{""id"":""..."", ""name"":""..."", ""level"":""campaign""|""adset""|""ad"", ""recommendation"":""increase_budget""|""decrease_budget""|""keep""|""check_creatives"", ""suggested_change_percent"":число, ""confidence"":0-100}]. "
             "Всегда отвечай СТРОГО одним JSON-объектом со структурой: "
-            "{""status"":""ok""|""error"", ""analysis"":""..."", ""reason"":""..."", ""recommendation"":""increase_budget""|""decrease_budget""|""keep""|""check_creatives"", ""confidence"":0-100, ""suggested_change_percent"":число}. "
+            "{""status"":""ok""|""error"", ""analysis"":""..."", ""reason"":""..."", ""recommendation"":""increase_budget""|""decrease_budget""|""keep""|""check_creatives"", ""confidence"":0-100, ""suggested_change_percent"":число, ""objects"":[...]}. "
             "Не добавляй никакого текста вне JSON."
         )
 
@@ -953,11 +1113,18 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rec = parsed.get("recommendation") or "keep"
         conf = parsed.get("confidence") or 0
         delta = parsed.get("suggested_change_percent") or 0
+        objects = parsed.get("objects") or []
+
+        # Пытаемся вывести человекочитаемый текст периода, если он есть в данных.
+        period_label = data_for_analysis.get("period_label") or period_human
 
         text_lines = [
             "📊 Разовый отчёт Фокус-ИИ",
             "",
             f"Объект: {get_account_name(aid)} — уровень: {level_human}.",
+            f"Период: {period_human}",
+            "",
+            f"Период: {period_label}",
             "",
             f"Анализ: {analysis_text}",
             f"Причина: {reason_text}",
@@ -968,10 +1135,9 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if status != "ok":
             text_lines.append("\n⚠️ При обработке запроса возникла ошибка, проверь данные вручную.")
 
-        await safe_edit_message(
-            q,
+        await update.message.reply_text(
             "\n".join(text_lines),
-            reply_markup=focus_ai_recommendation_kb(level, rec, float(delta)),
+            reply_markup=focus_ai_recommendation_kb(level, rec, float(delta), objects),
         )
         return
 
@@ -998,6 +1164,86 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Реальные изменения бюджета будут добавлены на следующем этапе.",
             reply_markup=focus_ai_main_kb(),
         )
+        return
+
+    if data.startswith("focus_ai_obj|"):
+        # Формат: focus_ai_obj|adset|{adset_id}|inc|20
+        _prefix, obj_level, obj_id, action, delta_str = data.split("|", 4)
+        try:
+            delta_val = int(delta_str)
+        except Exception:
+            delta_val = 0
+
+        if obj_level != "adset":
+            await q.answer("Пока можно применять бюджеты только на уровне адсета.", show_alert=True)
+            return
+
+        # Подтверждение перед реальным изменением бюджета.
+        text = (
+            "Подтверждение действия Фокус-ИИ:\n\n"
+            f"Объект: adset {obj_id}\n"
+            f"Действие: {'увеличить' if action == 'inc' else 'уменьшить'} бюджет на {delta_val:+d}%\n\n"
+            "Применить изменение бюджета?"
+        )
+        kb = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "✅ Да",
+                        callback_data=f"focus_ai_obj_confirm|adset|{obj_id}|{action}|{delta_val}",
+                    ),
+                    InlineKeyboardButton(
+                        "❌ Отмена",
+                        callback_data="focus_ai_obj_cancel",
+                    ),
+                ]
+            ]
+        )
+
+        await safe_edit_message(q, text, reply_markup=kb)
+        return
+
+    if data.startswith("focus_ai_obj_confirm|"):
+        # Формат: focus_ai_obj_confirm|adset|{adset_id}|inc|20
+        _p, obj_level, obj_id, action, delta_str = data.split("|", 4)
+        try:
+            delta_val = float(delta_str)
+        except Exception:
+            delta_val = 0.0
+
+        if obj_level != "adset":
+            await safe_edit_message(
+                q,
+                "Можно подтверждать только изменения бюджета на уровне адсета.",
+            )
+            return
+
+        # Если рекомендация была на снижение (dec), передаём отрицательный процент.
+        if action == "dec" and delta_val > 0:
+            delta_val = -delta_val
+
+        res = apply_budget_change(obj_id, delta_val)
+        status = res.get("status")
+        msg = res.get("message") or "Бюджет обновлён."
+
+        if status != "ok":
+            text = f"⚠️ Не удалось применить изменение бюджета: {msg}"
+        else:
+            old_b = res.get("old_budget")
+            new_b = res.get("new_budget")
+            text = (
+                "✅ Изменение бюджета применено.\n\n"
+                f"Adset: {obj_id}\n"
+                f"Старый бюджет: {old_b:.2f} $\n"
+                f"Новый бюджет: {new_b:.2f} $\n"
+                f"Δ: {delta_val:+.0f}%"
+            )
+
+        await safe_edit_message(q, text)
+        return
+
+    if data == "focus_ai_obj_cancel":
+        await safe_edit_message(q, "Действие Фокус-ИИ отменено.")
         return
 
     if data == "reports_menu":

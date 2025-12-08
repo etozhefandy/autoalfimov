@@ -53,6 +53,7 @@ def parse_insight(ins: Dict[str, Any]) -> Dict[str, Any]:
             "cpm": 0.0,
             "cpc": 0.0,
             "ctr": 0.0,
+            "freq": 0.0,
         }
 
     impr = int(ins.get("impressions", 0) or 0)
@@ -80,6 +81,7 @@ def parse_insight(ins: Dict[str, Any]) -> Dict[str, Any]:
     cpm = safe_div(spend * 1000, impr)
     cpc = safe_div(spend, clicks)
     ctr = safe_div(clicks, impr) * 100
+    freq = to_float(ins.get("frequency", 0.0) or 0.0)
 
     return {
         "impr": impr,
@@ -92,6 +94,7 @@ def parse_insight(ins: Dict[str, Any]) -> Dict[str, Any]:
         "cpm": cpm,
         "cpc": cpc,
         "ctr": ctr,
+        "freq": freq,
     }
 
 
@@ -99,17 +102,51 @@ def parse_insight(ins: Dict[str, Any]) -> Dict[str, Any]:
 # 🔥 АНАЛИТИКА АККАУНТА / ADSETS / ADS
 # ============================================================
 
-def analyze_account(aid: str, days: int = 7) -> Dict[str, Any]:
-    """
-    Анализ аккаунта за последние X дней.
-    """
-    until = (datetime.now(ALMATY_TZ) - timedelta(days=1)).date()
-    since = until - timedelta(days=days - 1)
+def _make_period_for_mode(mode: str) -> Dict[str, str]:
+    """Утилита для построения периода по режиму.
 
-    period = {
+    Используется в Фокус-ИИ и других отчётах.
+    """
+    today = datetime.now(ALMATY_TZ).date()
+
+    if mode == "today":
+        since = until = today
+    elif mode == "yday":
+        until = today - timedelta(days=1)
+        since = until
+    elif mode == "7d":
+        until = today - timedelta(days=1)
+        since = until - timedelta(days=6)
+    elif mode == "30d":
+        until = today - timedelta(days=1)
+        since = until - timedelta(days=29)
+    else:
+        # fallback = последние 7 дней до вчера
+        until = today - timedelta(days=1)
+        since = until - timedelta(days=6)
+
+    return {
         "since": since.strftime("%Y-%m-%d"),
         "until": until.strftime("%Y-%m-%d"),
     }
+
+
+def analyze_account(
+    aid: str,
+    days: int = 7,
+    period: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    """
+    Анализ аккаунта за последние X дней.
+    """
+    if period is None:
+        until = (datetime.now(ALMATY_TZ) - timedelta(days=1)).date()
+        since = until - timedelta(days=days - 1)
+
+        period = {
+            "since": since.strftime("%Y-%m-%d"),
+            "until": until.strftime("%Y-%m-%d"),
+        }
 
     ins = fetch_insights(aid, period)
     if not ins:
@@ -123,7 +160,11 @@ def analyze_account(aid: str, days: int = 7) -> Dict[str, Any]:
     }
 
 
-def analyze_adsets(aid: str, days: int = 7) -> List[Dict[str, Any]]:
+def analyze_adsets(
+    aid: str,
+    days: int = 7,
+    period: Optional[Dict[str, str]] = None,
+) -> List[Dict[str, Any]]:
     """
     Аналитика адсетов:
     - собирает адсеты
@@ -133,16 +174,16 @@ def analyze_adsets(aid: str, days: int = 7) -> List[Dict[str, Any]]:
     adsets = fetch_adsets(aid)
     results = []
 
-    for adset in adsets:
-        adset_id = adset["id"]
-
-        # строим период
+    if period is None:
         until = (datetime.now(ALMATY_TZ) - timedelta(days=1)).date()
         since = until - timedelta(days=days - 1)
         period = {
             "since": since.strftime("%Y-%m-%d"),
             "until": until.strftime("%Y-%m-%d"),
         }
+
+    for adset in adsets:
+        adset_id = adset["id"]
 
         # инсайты по адсету
         # NB: insights по adset делаются через account.get_insights(level='adset')
@@ -167,7 +208,11 @@ def analyze_adsets(aid: str, days: int = 7) -> List[Dict[str, Any]]:
     return results
 
 
-def analyze_campaigns(aid: str, days: int = 7) -> List[Dict[str, Any]]:
+def analyze_campaigns(
+    aid: str,
+    days: int = 7,
+    period: Optional[Dict[str, str]] = None,
+) -> List[Dict[str, Any]]:
     """Аналитика кампаний за последние days дней.
 
     Для каждой кампании считаем стандартные метрики через parse_insight и
@@ -176,12 +221,13 @@ def analyze_campaigns(aid: str, days: int = 7) -> List[Dict[str, Any]]:
     camps = fetch_campaigns(aid)
     results: List[Dict[str, Any]] = []
 
-    until = (datetime.now(ALMATY_TZ) - timedelta(days=1)).date()
-    since = until - timedelta(days=days - 1)
-    period = {
-        "since": since.strftime("%Y-%m-%d"),
-        "until": until.strftime("%Y-%m-%d"),
-    }
+    if period is None:
+        until = (datetime.now(ALMATY_TZ) - timedelta(days=1)).date()
+        since = until - timedelta(days=days - 1)
+        period = {
+            "since": since.strftime("%Y-%m-%d"),
+            "until": until.strftime("%Y-%m-%d"),
+        }
 
     for camp in camps:
         cid = camp.get("id")
@@ -205,7 +251,11 @@ def analyze_campaigns(aid: str, days: int = 7) -> List[Dict[str, Any]]:
     return results
 
 
-def analyze_ads(aid: str, days: int = 7) -> List[Dict[str, Any]]:
+def analyze_ads(
+    aid: str,
+    days: int = 7,
+    period: Optional[Dict[str, str]] = None,
+) -> List[Dict[str, Any]]:
     """
     Аналитика объявлений:
     - CTR
@@ -215,15 +265,16 @@ def analyze_ads(aid: str, days: int = 7) -> List[Dict[str, Any]]:
     ads = fetch_ads(aid)
     results = []
 
-    for ad in ads:
-        ad_id = ad["id"]
-
+    if period is None:
         until = (datetime.now(ALMATY_TZ) - timedelta(days=1)).date()
         since = until - timedelta(days=days - 1)
         period = {
             "since": since.strftime("%Y-%m-%d"),
             "until": until.strftime("%Y-%m-%d"),
         }
+
+    for ad in ads:
+        ad_id = ad["id"]
 
         ins = fetch_insights_by_level(aid, ad_id, period, level="ad")
 
@@ -265,7 +316,7 @@ def fetch_insights_by_level(aid: str, entity_id: str, period: Dict[str, str], le
         ],
     }
 
-    fields = ["impressions", "clicks", "spend", "actions", "cpm", "cpc"]
+    fields = ["impressions", "clicks", "spend", "actions", "cpm", "cpc", "frequency"]
 
     acc = AdAccount(aid)
 
