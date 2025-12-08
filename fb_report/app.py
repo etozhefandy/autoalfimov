@@ -55,6 +55,7 @@ from .jobs import full_daily_scan_job, daily_report_job, schedule_cpa_alerts
 
 from services.analytics import analyze_campaigns, analyze_adsets, analyze_account, analyze_ads
 from services.ai_focus import get_focus_comment, ask_deepseek
+from monitor_anomalies import build_anomaly_messages_for_account
 import json
 import asyncio
 
@@ -264,6 +265,12 @@ def monitoring_menu_kb() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     "⚙️ Настройки мониторинга",
                     callback_data="mon_settings",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "⚠️ Аномалии",
+                    callback_data="anomalies_menu",
                 )
             ],
             [
@@ -822,6 +829,15 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if data == "anomalies_menu":
+        # Выбор аккаунта для проверки аномалий по адсетам.
+        await safe_edit_message(
+            q,
+            "Выберите аккаунт для анализа аномалий по адсетам:",
+            reply_markup=accounts_kb("anomalies_acc"),
+        )
+        return
+
     if data.startswith("insta_links_acc|"):
         aid = data.split("|", 1)[1]
         account_name = get_account_name(aid)
@@ -838,6 +854,29 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for msg in messages:
             await context.bot.send_message(chat_id, msg)
             # Небольшая пауза, чтобы не заддосить Telegram при большом количестве ссылок
+            await asyncio.sleep(0.3)
+        return
+
+    if data.startswith("anomalies_acc|"):
+        aid = data.split("|", 1)[1]
+        account_name = get_account_name(aid)
+
+        await safe_edit_message(
+            q,
+            f"⚠️ Анализ аномалий по адсетам для {account_name}…",
+        )
+
+        messages = build_anomaly_messages_for_account(aid)
+
+        if not messages:
+            await context.bot.send_message(
+                chat_id,
+                f"⚠️ Для аккаунта {account_name} аномалий по адсетам не обнаружено.",
+            )
+            return
+
+        for msg in messages:
+            await context.bot.send_message(chat_id, msg)
             await asyncio.sleep(0.3)
         return
 
