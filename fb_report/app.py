@@ -56,6 +56,7 @@ from .jobs import full_daily_scan_job, daily_report_job, schedule_cpa_alerts
 from services.analytics import analyze_campaigns, analyze_adsets, analyze_account, analyze_ads
 from services.ai_focus import get_focus_comment, ask_deepseek
 import json
+import asyncio
 
 
 def _allowed(update: Update) -> bool:
@@ -825,10 +826,13 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Собираю активные инста-объявления...",
         )
 
-        items = fetch_instagram_active_ads_links(aid, limit=20)
-        text = format_instagram_ads_links(items)
+        items = fetch_instagram_active_ads_links(aid)
+        messages = format_instagram_ads_links(items)
 
-        await context.bot.send_message(chat_id, text)
+        for msg in messages:
+            await context.bot.send_message(chat_id, msg)
+            # Небольшая пауза, чтобы не заддосить Telegram при большом количестве ссылок
+            await asyncio.sleep(0.3)
         return
 
     # ==== Фокус-ИИ: сценарий настроек ====
