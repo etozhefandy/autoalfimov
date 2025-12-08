@@ -127,11 +127,9 @@ def fetch_instagram_active_ads_links(account_id: str) -> List[Dict[str, Any]]:
             if not url:
                 continue
 
-            # Дата публикации: сначала start_time, если нет — created_time
-            start_time = row.get("start_time") or ""
-            created_time = row.get("created_time") or ""
-            launch_str = start_time or created_time
-            launch_time = _parse_fb_datetime(launch_str)
+            # Дата публикации: используем created_time как основу сортировки/отображения.
+            created_time_raw = row.get("created_time") or ""
+            created_dt = _parse_fb_datetime(created_time_raw)
 
             camp_entry = tree.setdefault(
                 campaign_id,
@@ -156,7 +154,7 @@ def fetch_instagram_active_ads_links(account_id: str) -> List[Dict[str, Any]]:
 
             adset_entry["creatives"].append(
                 {
-                    "launch_time": launch_time,
+                    "created_time": created_dt,
                     "ad_id": row.get("id"),
                     "ad_name": ad_name,
                     "instagram_url": url,
@@ -172,13 +170,13 @@ def fetch_instagram_active_ads_links(account_id: str) -> List[Dict[str, Any]]:
     for camp in tree.values():
         adset_list: List[Dict[str, Any]] = []
         for a in camp["adsets"].values():
-            # сортировка объявлений внутри адсета от новых к старым
-            a["creatives"].sort(key=lambda x: x["launch_time"], reverse=True)
+            # сортировка объявлений внутри адсета от новых к старым по created_time
+            a["creatives"].sort(key=lambda x: x["created_time"], reverse=True)
             adset_list.append(a)
 
         # сортируем адсеты по дате самого нового объявления
         adset_list.sort(
-            key=lambda ad: ad["creatives"][0]["launch_time"] if ad["creatives"] else datetime.min,
+            key=lambda ad: ad["creatives"][0]["created_time"] if ad["creatives"] else datetime.min,
             reverse=True,
         )
 
