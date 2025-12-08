@@ -1,56 +1,32 @@
-# config.py
-import os
-from pytz import timezone
+import json
+from facebook_business.api import FacebookAdsApi
+from facebook_business.adobjects.adaccount import AdAccount
 
-# ==== TIMEZONE ====
-ALMATY_TZ = timezone("Asia/Almaty")
+FB_ACCESS_TOKEN = "EAASZCrBwhoH0BO6hvTPZBtAX3OFPcJjZARZBZCIllnjc4GkxagyhvvrylPKWdU9jMijZA051BJRRvVuV1nab4k5jtVO5q0TsDIKbXzphumaFIbqKDcJ3JMvQTmORdrNezQPZBP14pq4NKB56wpIiNJSLFa5yXFsDttiZBgUHAmVAJknN7Ig1ZBVU2q0vRyQKJtyuXXwZDZD"
+AD_ACCOUNT_ID = "act_1437151187825723"  # дримкэмп
 
-# ==== ENV ====
-def _get_env(*names, default=""):
-    """Возвращает первое найденное значение переменной среды."""
-    for n in names:
-        v = os.getenv(n, "")
-        if v:
-            return v
-    return default
 
-# Facebook API
-FB_ACCESS_TOKEN = _get_env("FB_ACCESS_TOKEN")
-FB_APP_ID = _get_env("FB_APP_ID")
-FB_APP_SECRET = _get_env("FB_APP_SECRET")
+def main():
+    # Отключаем строгую проверку appsecret_proof
+    FacebookAdsApi.set_appsecret_proof_enabled(False)
 
-# Telegram
-TELEGRAM_TOKEN = _get_env("TG_BOT_TOKEN", "TELEGRAM_BOT_TOKEN", "TELEGRAM_TOKEN")
-DEFAULT_REPORT_CHAT = _get_env("TG_CHAT_ID", default="-1002679045097")
+    FacebookAdsApi.init(access_token=FB_ACCESS_TOKEN)
 
-# Доступ
-ALLOWED_USER_IDS = {
-    253181449,  # Андрей
-}
-ALLOWED_CHAT_IDS = {
-    str(DEFAULT_REPORT_CHAT),
-}
+    acc = AdAccount(AD_ACCOUNT_ID)
 
-# === Currency ===
-FX_RATE_OVERRIDE = float(os.getenv("FX_RATE_OVERRIDE", "0") or 0.0)
+    fields = [
+        "id",
+        "name",
+        "effective_status",
+        "created_time",
+        "creative{instagram_permalink_url,effective_object_story_id,effective_instagram_media_id,object_story_spec,object_story_id}",
+    ]
 
-def usd_to_kzt() -> float:
-    """Фиксированный курс USD→KZT."""
-    if FX_RATE_OVERRIDE > 0:
-        return FX_RATE_OVERRIDE
-    return 540.0  # дефолт
+    ads = acc.get_ads(fields=fields)
 
-# --- DIRECTORIES ---
-DATA_DIR = os.getenv("DATA_DIR", "/data")
-INSIGHTS_DIR = os.path.join(DATA_DIR, "insights_cache")
+    out = [ad.export_all_data() for ad in ads]
+    print(json.dumps(out, ensure_ascii=False, indent=2))
 
-# Ensure dirs exist
-os.makedirs(DATA_DIR, exist_ok=True)
-os.makedirs(INSIGHTS_DIR, exist_ok=True)
 
-# Files
-ACCOUNTS_JSON = os.path.join(DATA_DIR, "accounts.json")
-REPORT_CACHE_FILE = os.path.join(DATA_DIR, "report_cache.json")
-SYNC_META_FILE = os.path.join(DATA_DIR, "sync_meta.json")
-
-REPORT_CACHE_TTL = int(os.getenv("REPORT_CACHE_TTL", "3600"))  # seconds
+if __name__ == "__main__":
+    main()
