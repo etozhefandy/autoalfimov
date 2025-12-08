@@ -381,6 +381,12 @@ def account_reports_level_kb(aid: str) -> InlineKeyboardMarkup:
                     callback_data=f"rep_acc_mode|{aid}|adsets",
                 )
             ],
+            [
+                InlineKeyboardButton(
+                    "По объявлениям",
+                    callback_data=f"rep_acc_mode|{aid}|ads",
+                )
+            ],
             [InlineKeyboardButton("⬅️ К аккаунтам", callback_data="report_one")],
         ]
     )
@@ -1375,7 +1381,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
 
-        # Кампании / адсеты: используем analyze_campaigns/analyze_adsets
+        # Кампании / адсеты / объявления: используем analyze_*/fetch_instagram_active_ads_links
         # и выбранный пресет периода.
         from .storage import metrics_flags
 
