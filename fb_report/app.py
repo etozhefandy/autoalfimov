@@ -115,6 +115,53 @@ def main_menu() -> InlineKeyboardMarkup:
     )
 
 
+def focus_ai_recommendation_kb(level: str, recommendation: str, delta: float) -> InlineKeyboardMarkup:
+    """Клавиатура под отчётом Фокус-ИИ с кнопкой действия и ручным вводом.
+
+    Пока действия не применяют реальные изменения бюджета, а служат как подсказка.
+    """
+
+    buttons = []
+
+    if recommendation == "increase_budget" and delta > 0:
+        buttons.append(
+            InlineKeyboardButton(
+                f"⬆️ Увеличить бюджет на {delta:.0f}%",
+                callback_data=f"focus_ai_action|{level}|inc|{int(delta)}",
+            )
+        )
+    elif recommendation == "decrease_budget" and delta < 0:
+        buttons.append(
+            InlineKeyboardButton(
+                f"⬇️ Понизить бюджет на {abs(delta):.0f}%",
+                callback_data=f"focus_ai_action|{level}|dec|{int(abs(delta))}",
+            )
+        )
+    elif recommendation == "keep":
+        buttons.append(
+            InlineKeyboardButton(
+                "✅ Оставить как есть",
+                callback_data=f"focus_ai_action|{level}|keep|0",
+            )
+        )
+
+    rows = []
+    if buttons:
+        rows.append(buttons)
+
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "✏️ Ручной ввод",
+                callback_data=f"focus_ai_action|{level}|manual|0",
+            )
+        ]
+    )
+    rows.append([InlineKeyboardButton("⬅️ Мониторинг", callback_data="monitoring_menu")])
+
+    return InlineKeyboardMarkup(rows)
+
+
 def monitoring_menu_kb() -> InlineKeyboardMarkup:
     """Подменю раздела мониторинга.
 
@@ -814,6 +861,12 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "ad": "Объявления",
         }.get(level, level)
 
+        # Сразу показываем пользователю, что Фокус-ИИ начал работу.
+        await safe_edit_message(
+            q,
+            "🧠 Фокус-ИИ думает...\nАнализирую данные по аккаунту и выбранному уровню...",
+        )
+
         if level == "account":
             base_analysis = analyze_account(aid, days=7)
             heat = build_heatmap_for_account(aid, get_account_name, mode="7")
@@ -918,6 +971,31 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit_message(
             q,
             "\n".join(text_lines),
+            reply_markup=focus_ai_recommendation_kb(level, rec, float(delta)),
+        )
+        return
+
+    if data.startswith("focus_ai_action|"):
+        # Пока только подтверждаем получение действия от пользователя.
+        # В следующих итерациях сюда будет добавлена реальная логика изменения бюджетов.
+        _prefix, lvl, action, delta_str = data.split("|", 3)
+        delta_val = 0
+        try:
+            delta_val = int(delta_str)
+        except Exception:
+            delta_val = 0
+
+        human_action = {
+            "inc": "увеличение бюджета",
+            "dec": "снижение бюджета",
+            "keep": "оставить как есть",
+            "manual": "ручной ввод",
+        }.get(action, action)
+
+        await safe_edit_message(
+            q,
+            f"Фокус-ИИ: получено действие '{human_action}' для уровня '{lvl}' (Δ={delta_val}%).\n"
+            "Реальные изменения бюджета будут добавлены на следующем этапе.",
             reply_markup=focus_ai_main_kb(),
         )
         return

@@ -1,8 +1,9 @@
 # fb_report/jobs.py
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 import asyncio
 import re
+import json
 
 from telegram.ext import ContextTypes, Application
 
@@ -25,11 +26,15 @@ except Exception:  # noqa: BLE001 - нам важен ЛЮБОЙ ImportError/Run
 try:  # pragma: no cover
     from services.facebook_api import fetch_insights
     from services.analytics import parse_insight
+    from services.ai_focus import ask_deepseek
 except Exception:  # noqa: BLE001
     fetch_insights = None  # type: ignore[assignment]
 
     def parse_insight(_ins: dict) -> dict:  # type: ignore[override]
         return {"msgs": 0, "leads": 0, "total": 0, "spend": 0.0}
+
+    async def ask_deepseek(_messages, json_mode: bool = False):  # type: ignore[override]
+        raise RuntimeError("DeepSeek is not available in this environment")
 
 
 def _yesterday_period():
@@ -138,12 +143,7 @@ def _parse_totals_from_report_text(txt: str):
 
 
 async def _cpa_alerts_job(context: ContextTypes.DEFAULT_TYPE):
-    # Ограничиваем отправку алёртов часовым окном, как в старом боте:
-    # каждый час с 10:00 до 22:00 по Алмате.
     now = datetime.now(ALMATY_TZ)
-    if not (10 <= now.hour <= 22):
-        return
-
     accounts = load_accounts() or {}
     # Алёрты шлём напрямую владельцу в личку (первый ID из ALLOWED_USER_IDS).
     # Если по какой-то причине список пуст, используем дефолтный чат как фолбэк.
@@ -197,6 +197,45 @@ async def _cpa_alerts_job(context: ContextTypes.DEFAULT_TYPE):
         body = "\n".join(body_lines)
 
         text = f"{header}\n{body}"
+
+        # Пытаемся добавить короткий комментарий Фокус-ИИ (DeepSeek).
+        focus_comment = None
+        try:
+            data_for_analysis = {
+                "account_id": aid,
+                "account_name": acc_name,
+                "date": label,
+                "spend": spend,
+                "total_conversions": total_convs,
+                "cpa": cpa,
+                "target_cpa": target_cpl,
+            }
+
+            system_msg = (
+                "Ты — продвинутый аналитик (Focus-ИИ) для CPA-алёртов. "
+                "Отвечай ТОЛЬКО на русском языке. "
+                "Тебе даны затраты, количество заявок и фактический CPA относительно таргет CPA. "
+                "Кратко оцени ситуацию и предложи одно-два действия: оставить бюджет, мягко повысить/понизить бюджет (10–30%), либо проверить креативы/аудитории. "
+                "Отвечай очень кратко (1–2 предложения) в виде обычного текста, без JSON."
+            )
+
+            user_msg = json.dumps(data_for_analysis, ensure_ascii=False)
+
+            ds_resp = await ask_deepseek(
+                [
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": user_msg},
+                ],
+                json_mode=False,
+            )
+
+            choice = (ds_resp.get("choices") or [{}])[0]
+            focus_comment = (choice.get("message") or {}).get("content")
+        except Exception:
+            focus_comment = None
+
+        if focus_comment:
+            text = f"{text}\n\n🤖 Комментарий Фокус-ИИ:\n{focus_comment.strip()}"
 
         try:
             await context.bot.send_message(chat_id, text)
@@ -282,17 +321,12 @@ async def _hourly_snapshot_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 def schedule_cpa_alerts(app: Application):
-    # Часовые CPA-алёрты (по вчерашнему периоду через текстовые отчёты).
-    # Выравниваем запуск по началу часа, чтобы алёрты приходили в 10:00, 11:00, ...
-    # (сам _cpa_alerts_job дополнительно фильтрует часы 10–22 по ALMATY_TZ).
-    now = datetime.now(ALMATY_TZ)
-    first_run = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
-
-    app.job_queue.run_repeating(
-        _cpa_alerts_job,
-        interval=timedelta(hours=1),
-        first=first_run,
-    )
+    # CPA-алёрты с комментариями Фокус-ИИ три раза в день: 10:00, 13:00, 18:00.
+    for hh in (10, 13, 18):
+        app.job_queue.run_daily(
+            _cpa_alerts_job,
+            time=time(hour=hh, minute=0, tzinfo=ALMATY_TZ),
+        )
 
     # Часовой снимок инсайтов за today для часового кэша
     app.job_queue.run_repeating(
