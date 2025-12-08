@@ -1696,7 +1696,7 @@ def build_app() -> Application:
 
     app.job_queue.run_daily(
         billing_digest_job,
-        time=time(hour=9, minute=0, tzinfo=ALMATY_TZ),
+        time=time(hour=9, minute=45, tzinfo=ALMATY_TZ),
     )
 
     schedule_cpa_alerts(app)

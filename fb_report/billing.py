@@ -160,7 +160,11 @@ async def billing_digest_job(ctx: ContextTypes.DEFAULT_TYPE):
     items.sort(key=lambda x: x["days_left"])
 
     today = datetime.now(ALMATY_TZ).date()
-    lines = ["☀️ <b>Предстоящие списания (≤ 5 дней)</b>"]
+    lines = [
+        "@Zz11mmaa отправь им запрос пополнения карт",
+        "",
+        "☀️ <b>Текущие биллинги (кабинеты с ближайшими списаниями ≤ 5 дней)</b>",
+    ]
 
     for fc in items:
         days_left = fc["days_left"]
