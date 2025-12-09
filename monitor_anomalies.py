@@ -432,24 +432,6 @@ def build_anomaly_messages_for_account(aid: str) -> List[str]:
         messages.append(format_anomaly_message(a))
 
     return messages
-        if abs(d_cpm) > 20.0 and base_cpm not in (None, 0):
-            issues.append({"metric": "CPM", "delta_pct": d_cpm})
-
-        base_cpc = base.get("cpc")
-        cur_cpc = cur.get("cpc")
-        d_cpc = _delta_percent(base_cpc, cur_cpc)
-        # CPC напрямую в ТЗ не фигурирует по порогу, но можно подсвечивать
-        if abs(d_cpc) > 20.0 and base_cpc not in (None, 0):
-            issues.append({"metric": "CPC", "delta_pct": d_cpc})
-
-        # Частота — только по текущему периоду
-        freq = float(cur.get("freq") or 0.0)
-        if freq > 4.0:
-            issues.append({"metric": "Frequency", "value": freq})
-
-        base_cvr = _compute_cvr(base)
-        cur_cvr = _compute_cvr(cur)
-        d_cvr = _delta_percent(base_cvr, cur_cvr)
         if d_cvr < -20.0 and base_cvr > 0:
             issues.append({"metric": "CVR", "delta_pct": d_cvr})
 
