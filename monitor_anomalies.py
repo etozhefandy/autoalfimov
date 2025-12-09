@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from config import ALMATY_TZ
 from services.analytics import analyze_adsets, safe_div
-from datetime import datetime, timedelta
 
 
 """Модуль анализа аномалий по адсетам.
