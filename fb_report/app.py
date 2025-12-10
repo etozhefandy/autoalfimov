@@ -51,7 +51,7 @@ from .insights import build_heatmap_for_account
 from .creatives import fetch_instagram_active_ads_links, format_instagram_ads_links
 from .adsets import send_adset_report
 from .billing import send_billing, send_billing_forecast, billing_digest_job
-from .jobs import full_daily_scan_job, daily_report_job, schedule_cpa_alerts
+from .jobs import full_daily_scan_job, daily_report_job, schedule_cpa_alerts, _resolve_account_cpa
 
 from services.analytics import analyze_campaigns, analyze_adsets, analyze_account, analyze_ads
 from services.facebook_api import pause_ad
@@ -543,7 +543,17 @@ def cpa_settings_kb(aid: str):
         [InlineKeyboardButton("Каждый день", callback_data=f"cpa_days_all|{aid}")],
         [
             InlineKeyboardButton(
+                "📁 CPA по кампаниям", callback_data=f"cpa_campaigns|{aid}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
                 "📂 CPA по адсетам", callback_data=f"cpa_adsets|{aid}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "📁 CPA по объявлениям", callback_data=f"cpa_ads|{aid}"
             )
         ],
         [
@@ -2143,6 +2153,195 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit_message(q, text, reply_markup=kb)
         return
 
+    if data.startswith("cpa_campaigns|"):
+        aid = data.split("|", 1)[1]
+
+        st = load_accounts()
+        row = st.get(aid, {"alerts": {}})
+        alerts = row.get("alerts", {}) or {}
+        campaign_alerts = alerts.get("campaign_alerts", {}) or {}
+
+        try:
+            camps = analyze_campaigns(aid, days=7) or []
+        except Exception:
+            camps = []
+
+        kb_rows = []
+        for camp in camps:
+            cid = camp.get("campaign_id")
+            if not cid:
+                continue
+            name = camp.get("name") or cid
+            cfg_c = (campaign_alerts.get(cid) or {}) if cid in campaign_alerts else {}
+            target = float(cfg_c.get("target_cpa") or 0.0)
+            label_suffix = (
+                f"[CPA {target:.2f}$]" if target > 0 else "[CPA аккаунта]"
+            )
+            text_btn = f"{name} {label_suffix}".strip()
+
+            kb_rows.append(
+                [
+                    InlineKeyboardButton(
+                        text_btn,
+                        callback_data=f"cpa_campaign|{aid}|{cid}",
+                    )
+                ]
+            )
+
+        kb_rows.append(
+            [
+                InlineKeyboardButton(
+                    "⬅️ Назад", callback_data=f"cpa_settings|{aid}"
+                )
+            ]
+        )
+
+        text = "Выбери кампанию для настройки CPA-алёртов."
+        await safe_edit_message(q, text, reply_markup=InlineKeyboardMarkup(kb_rows))
+        return
+
+    if data.startswith("cpa_campaign|"):
+        _, aid, campaign_id = data.split("|", 2)
+
+        st = load_accounts()
+        row = st.get(aid, {"alerts": {}})
+        alerts = row.get("alerts", {}) or {}
+        campaign_alerts = alerts.setdefault("campaign_alerts", {})
+        cfg = campaign_alerts.get(campaign_id) or {}
+
+        try:
+            camps = analyze_campaigns(aid, days=7) or []
+        except Exception:
+            camps = []
+
+        camp_name = campaign_id
+        for camp in camps:
+            if camp.get("campaign_id") == campaign_id:
+                camp_name = camp.get("name") or campaign_id
+                break
+
+        account_cpa = _resolve_account_cpa(alerts)
+        target_cpa = float(cfg.get("target_cpa") or 0.0)
+        effective_target = target_cpa if target_cpa > 0 else account_cpa
+        enabled = bool(cfg.get("enabled", True))
+
+        mode_str = "свой таргет" if target_cpa > 0 else "наследует CPA аккаунта"
+        status_str = "ВКЛ" if enabled else "ВЫКЛ"
+
+        text = (
+            "CPA-алёрты для кампании:\n\n"
+            f"{camp_name}\n\n"
+            f"Эффективный target CPA: {effective_target:.2f} $ ({mode_str})\n"
+            f"Статус CPA-алёртов кампании: {status_str}"
+        )
+
+        toggle_text = (
+            "⚠️ CPA-алёрты кампании: ON" if enabled else "⚠️ CPA-алёрты кампании: OFF"
+        )
+
+        kb = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        toggle_text,
+                        callback_data=f"cpa_campaign_toggle|{aid}|{campaign_id}",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "✏️ Задать CPA для кампании",
+                        callback_data=f"cpa_campaign_set|{aid}|{campaign_id}",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "↩️ Наследовать CPA аккаунта",
+                        callback_data=f"cpa_campaign_inherit|{aid}|{campaign_id}",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "⬅️ Назад к списку кампаний",
+                        callback_data=f"cpa_campaigns|{aid}",
+                    )
+                ],
+            ]
+        )
+
+        await safe_edit_message(q, text, reply_markup=kb)
+        return
+
+    if data.startswith("cpa_campaign_toggle|"):
+        _, aid, campaign_id = data.split("|", 2)
+
+        st = load_accounts()
+        row = st.get(aid, {"alerts": {}})
+        alerts = row.get("alerts", {}) or {}
+        campaign_alerts = alerts.setdefault("campaign_alerts", {})
+        cfg = campaign_alerts.get(campaign_id) or {}
+
+        cfg["enabled"] = not bool(cfg.get("enabled", True))
+        campaign_alerts[campaign_id] = cfg
+        alerts["campaign_alerts"] = campaign_alerts
+        row["alerts"] = alerts
+        st[aid] = row
+        save_accounts(st)
+
+        data = f"cpa_campaign|{aid}|{campaign_id}"
+        update.callback_query.data = data
+        await on_cb(update, context)
+        return
+
+    if data.startswith("cpa_campaign_set|"):
+        _, aid, campaign_id = data.split("|", 2)
+
+        st = load_accounts()
+        row = st.get(aid, {"alerts": {}})
+        alerts = row.get("alerts", {}) or {}
+        campaign_alerts = alerts.setdefault("campaign_alerts", {})
+        cfg = campaign_alerts.get(campaign_id) or {}
+
+        current = float(cfg.get("target_cpa") or 0.0)
+
+        row["alerts"] = alerts
+        st[aid] = row
+        save_accounts(st)
+
+        await safe_edit_message(
+            q,
+            (
+                f"⚠️ Текущий CPA для кампании: {current:.2f} $.\n"
+                "Напиши в чат число в долларах (например 1.2). 0 — будет наследовать CPA аккаунта."
+            ),
+        )
+
+        context.user_data["await_cpa_campaign_for"] = {
+            "aid": aid,
+            "campaign_id": campaign_id,
+        }
+        return
+
+    if data.startswith("cpa_campaign_inherit|"):
+        _, aid, campaign_id = data.split("|", 2)
+
+        st = load_accounts()
+        row = st.get(aid, {"alerts": {}})
+        alerts = row.get("alerts", {}) or {}
+        campaign_alerts = alerts.setdefault("campaign_alerts", {})
+        cfg = campaign_alerts.get(campaign_id) or {}
+
+        cfg["target_cpa"] = 0.0
+        campaign_alerts[campaign_id] = cfg
+        alerts["campaign_alerts"] = campaign_alerts
+        row["alerts"] = alerts
+        st[aid] = row
+        save_accounts(st)
+
+        data = f"cpa_campaign|{aid}|{campaign_id}"
+        update.callback_query.data = data
+        await on_cb(update, context)
+        return
+
     if data.startswith("cpa_ai|"):
         aid = data.split("|", 1)[1]
         st = load_accounts()
@@ -2335,6 +2534,212 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Перерисовываем экран настроек адсета
         data = f"cpa_adset|{aid}|{adset_id}"
+        update.callback_query.data = data
+        await on_cb(update, context)
+        return
+
+    if data.startswith("cpa_ads|"):
+        aid = data.split("|", 1)[1]
+
+        st = load_accounts()
+        row = st.get(aid, {"alerts": {}})
+        alerts = row.get("alerts", {}) or {}
+        ad_alerts = alerts.get("ad_alerts", {}) or {}
+
+        try:
+            ads = analyze_ads(aid, days=7) or []
+        except Exception:
+            ads = []
+
+        kb_rows = []
+        for ad in ads:
+            ad_id = ad.get("ad_id") or ad.get("id")
+            if not ad_id:
+                continue
+
+            spend = float(ad.get("spend", 0.0) or 0.0)
+            if ad_id not in ad_alerts and spend <= 0:
+                continue
+
+            name = ad.get("name") or ad_id
+            cfg = ad_alerts.get(ad_id) or {}
+            target = float(cfg.get("target_cpa") or 0.0)
+            label_suffix = (
+                f"[CPA {target:.2f}$]" if target > 0 else "[CPA вышестоящего уровня]"
+            )
+            text_btn = f"{name} {label_suffix}".strip()
+
+            kb_rows.append(
+                [
+                    InlineKeyboardButton(
+                        text_btn,
+                        callback_data=f"cpa_ad_cfg|{aid}|{ad_id}",
+                    )
+                ]
+            )
+
+        kb_rows.append(
+            [
+                InlineKeyboardButton(
+                    "⬅️ Назад", callback_data=f"cpa_settings|{aid}"
+                )
+            ]
+        )
+
+        text = "Выбери объявление для настройки CPA-алёртов."
+        await safe_edit_message(q, text, reply_markup=InlineKeyboardMarkup(kb_rows))
+        return
+
+    if data.startswith("cpa_ad_cfg|"):
+        _, aid, ad_id = data.split("|", 2)
+
+        st = load_accounts()
+        row = st.get(aid, {"alerts": {}})
+        alerts = row.get("alerts", {}) or {}
+        ad_alerts = alerts.setdefault("ad_alerts", {})
+        cfg = ad_alerts.get(ad_id) or {}
+
+        try:
+            ads = analyze_ads(aid, days=7) or []
+        except Exception:
+            ads = []
+
+        ad_name = ad_id
+        for ad in ads:
+            if (ad.get("ad_id") or ad.get("id")) == ad_id:
+                ad_name = ad.get("name") or ad_id
+                break
+
+        enabled = bool(cfg.get("enabled", True))
+        target_cpa = float(cfg.get("target_cpa") or 0.0)
+        silent = bool(cfg.get("silent", False))
+
+        mode_str = (
+            "свой таргет" if target_cpa > 0 else "наследует CPA вышестоящего уровня"
+        )
+        effective_str = f"{target_cpa:.2f} $" if target_cpa > 0 else "—"
+        status_str = "ВКЛ" if enabled else "ВЫКЛ"
+        silent_str = "ВКЛ" if silent else "ВЫКЛ"
+
+        text = (
+            "CPA-алёрты для объявления:\n\n"
+            f"{ad_name}\n\n"
+            f"Эффективный target CPA: {effective_str} ({mode_str})\n"
+            f"Статус CPA-алёртов: {status_str}\n"
+            f"Тихий режим: {silent_str}"
+        )
+
+        toggle_text = (
+            "⚠️ CPA-алёрты объявления: ON"
+            if enabled
+            else "⚠️ CPA-алёрты объявления: OFF"
+        )
+        silent_btn_text = (
+            "🔕 Тихий режим: OFF" if silent else "🔕 Тихий режим: ON"
+        )
+
+        kb = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        toggle_text,
+                        callback_data=f"cpa_ad_cfg_toggle|{aid}|{ad_id}",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "✏️ Задать CPA объявления",
+                        callback_data=f"cpa_ad_cfg_set|{aid}|{ad_id}",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "↩️ Наследовать CPA вышестоящего уровня",
+                        callback_data=f"cpa_ad_cfg_inherit|{aid}|{ad_id}",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        silent_btn_text,
+                        callback_data=f"cpa_ad_silent|{aid}|{ad_id}",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "⬅️ Назад к списку объявлений",
+                        callback_data=f"cpa_ads|{aid}",
+                    )
+                ],
+            ]
+        )
+
+        await safe_edit_message(q, text, reply_markup=kb)
+        return
+
+    if data.startswith("cpa_ad_cfg_toggle|"):
+        _, aid, ad_id = data.split("|", 2)
+
+        st = load_accounts()
+        row = st.get(aid, {"alerts": {}})
+        alerts = row.get("alerts", {}) or {}
+        ad_alerts = alerts.setdefault("ad_alerts", {})
+        cfg = ad_alerts.get(ad_id) or {}
+
+        cfg["enabled"] = not bool(cfg.get("enabled", True))
+        ad_alerts[ad_id] = cfg
+        alerts["ad_alerts"] = ad_alerts
+        row["alerts"] = alerts
+        st[aid] = row
+        save_accounts(st)
+
+        data = f"cpa_ad_cfg|{aid}|{ad_id}"
+        update.callback_query.data = data
+        await on_cb(update, context)
+        return
+
+    if data.startswith("cpa_ad_cfg_set|"):
+        _, aid, ad_id = data.split("|", 2)
+
+        st = load_accounts()
+        row = st.get(aid, {"alerts": {}})
+        alerts = row.get("alerts", {}) or {}
+        ad_alerts = alerts.setdefault("ad_alerts", {})
+        cfg = ad_alerts.get(ad_id) or {}
+
+        current = float(cfg.get("target_cpa") or 0.0)
+
+        row["alerts"] = alerts
+        st[aid] = row
+        save_accounts(st)
+
+        await safe_edit_message(
+            q,
+            (
+                f"⚠️ Текущий CPA для объявления: {current:.2f} $.\n"
+                "Напиши в чат число в долларах (например 1.2). 0 — будет наследовать CPA вышестоящего уровня."
+            ),
+        )
+
+        context.user_data["await_cpa_ad_for"] = {"aid": aid, "ad_id": ad_id}
+        return
+
+    if data.startswith("cpa_ad_cfg_inherit|"):
+        _, aid, ad_id = data.split("|", 2)
+
+        st = load_accounts()
+        row = st.get(aid, {"alerts": {}})
+        alerts = row.get("alerts", {}) or {}
+        ad_alerts = alerts.setdefault("ad_alerts", {})
+        cfg = ad_alerts.get(ad_id) or {}
+
+        cfg["target_cpa"] = 0.0
+        ad_alerts[ad_id] = cfg
+        alerts["ad_alerts"] = ad_alerts
+        row["alerts"] = alerts
+        st[aid] = row
+        save_accounts(st)
+
+        data = f"cpa_ad_cfg|{aid}|{ad_id}"
         update.callback_query.data = data
         await on_cb(update, context)
         return
@@ -2593,6 +2998,58 @@ async def on_text_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
+    if "await_cpa_campaign_for" in context.user_data:
+        payload = context.user_data.pop("await_cpa_campaign_for")
+        aid = payload.get("aid")
+        campaign_id = payload.get("campaign_id")
+
+        try:
+            val = float(text.replace(",", "."))
+        except Exception:
+            await update.message.reply_text(
+                "Введите число, например: 1.2 (или 0 чтобы наследовать CPA аккаунта)"
+            )
+            context.user_data["await_cpa_campaign_for"] = payload
+            return
+
+        st = load_accounts()
+        row = st.get(aid, {"alerts": {}})
+        alerts = row.get("alerts", {}) or {}
+        campaign_alerts = alerts.setdefault("campaign_alerts", {})
+        cfg = campaign_alerts.get(campaign_id) or {}
+
+        new_cpa = float(val)
+        cfg["target_cpa"] = new_cpa
+        if new_cpa > 0:
+            cfg["enabled"] = True
+
+        campaign_alerts[campaign_id] = cfg
+        alerts["campaign_alerts"] = campaign_alerts
+        row["alerts"] = alerts
+        st[aid] = row
+        save_accounts(st)
+
+        try:
+            camps = analyze_campaigns(aid, days=7) or []
+        except Exception:
+            camps = []
+
+        name = campaign_id
+        for camp in camps:
+            if camp.get("campaign_id") == campaign_id:
+                name = camp.get("name") or campaign_id
+                break
+
+        if new_cpa > 0:
+            await update.message.reply_text(
+                f"✅ CPA для кампании '{name}' обновлён: {new_cpa:.2f} $ (алерты ВКЛ)"
+            )
+        else:
+            await update.message.reply_text(
+                f"✅ CPA для кампании '{name}' установлен 0 — будет наследовать CPA аккаунта"
+            )
+        return
+
     if "await_cpa_adset_for" in context.user_data:
         payload = context.user_data.pop("await_cpa_adset_for")
         aid = payload.get("aid")
@@ -2636,6 +3093,58 @@ async def on_text_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text(
                 f"✅ CPA для адсета '{name}' установлен 0 — будет наследовать CPA аккаунта"
+            )
+        return
+
+    if "await_cpa_ad_for" in context.user_data:
+        payload = context.user_data.pop("await_cpa_ad_for")
+        aid = payload.get("aid")
+        ad_id = payload.get("ad_id")
+
+        try:
+            val = float(text.replace(",", "."))
+        except Exception:
+            await update.message.reply_text(
+                "Введите число, например: 1.2 (или 0 чтобы наследовать CPA вышестоящего уровня)"
+            )
+            context.user_data["await_cpa_ad_for"] = payload
+            return
+
+        st = load_accounts()
+        row = st.get(aid, {"alerts": {}})
+        alerts = row.get("alerts", {}) or {}
+        ad_alerts = alerts.setdefault("ad_alerts", {})
+        cfg = ad_alerts.get(ad_id) or {}
+
+        new_cpa = float(val)
+        cfg["target_cpa"] = new_cpa
+        if new_cpa > 0:
+            cfg["enabled"] = True
+
+        ad_alerts[ad_id] = cfg
+        alerts["ad_alerts"] = ad_alerts
+        row["alerts"] = alerts
+        st[aid] = row
+        save_accounts(st)
+
+        try:
+            ads = analyze_ads(aid, days=7) or []
+        except Exception:
+            ads = []
+
+        name = ad_id
+        for ad in ads:
+            if (ad.get("ad_id") or ad.get("id")) == ad_id:
+                name = ad.get("name") or ad_id
+                break
+
+        if new_cpa > 0:
+            await update.message.reply_text(
+                f"✅ CPA для объявления '{name}' обновлён: {new_cpa:.2f} $ (алерты ВКЛ)"
+            )
+        else:
+            await update.message.reply_text(
+                f"✅ CPA для объявления '{name}' установлен 0 — будет наследовать CPA вышестоящего уровня"
             )
         return
 
