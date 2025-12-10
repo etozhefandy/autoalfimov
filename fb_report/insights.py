@@ -1,12 +1,13 @@
 # fb_report/insights.py
 
 from datetime import datetime, timedelta
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Any
 
 from services.facebook_api import fetch_insights
 from services.storage import (
     load_local_insights as _load_local_insights,
     save_local_insights as _save_local_insights,
+    load_hourly_stats,
 )
 
 from .constants import ALMATY_TZ
@@ -144,6 +145,14 @@ def _load_daily_totals_for_account(
     result: List[Dict[str, Optional[float]]] = []
 
     for day in days:
+        # 1) Пытаемся взять агрегаты из почасового кэша
+        daily_from_hourly = _get_daily_stats_from_hourly(aid, day)
+
+        if daily_from_hourly is not None:
+            result.append(daily_from_hourly)
+            continue
+
+        # 2) Фолбэк в старое поведение через fetch_insights
         ins = _fetch_daily_insight(aid, day)
 
         if not ins:
@@ -170,6 +179,198 @@ def _load_daily_totals_for_account(
         )
 
     return result
+
+
+def _get_daily_stats_from_hourly(aid: str, day: datetime) -> Optional[Dict[str, Any]]:
+    """Возвращает агрегацию за день из hourly_stats, если день полный (00–23).
+
+    Формат возвращаемого словаря совместим с _load_daily_totals_for_account:
+    {
+        "date": datetime,
+        "messages": int,
+        "leads": int,
+        "total_conversions": int,
+        "spend": float,
+    }
+    """
+
+    stats = load_hourly_stats() or {}
+    acc_stats = stats.get(aid) or {}
+    if not isinstance(acc_stats, dict):
+        return None
+
+    day_key = day.strftime("%Y-%m-%d")
+    day_stats = acc_stats.get(day_key)
+    if not isinstance(day_stats, dict):
+        return None
+
+    # Требование «все часы 00–23 хотя бы с нулевыми значениями» интерпретируем как
+    # наличие явных бакетов для каждого часа суток.
+    hours = [f"{h:02d}" for h in range(24)]
+    if not all(h in day_stats for h in hours):
+        return None
+
+    msgs = 0
+    leads = 0
+    total = 0
+    spend = 0.0
+
+    for h in hours:
+        bucket = day_stats.get(h) or {}
+        msgs += int(bucket.get("messages", 0) or 0)
+        leads += int(bucket.get("leads", 0) or 0)
+        total += int(bucket.get("total", 0) or 0)
+        spend += float(bucket.get("spend", 0.0) or 0.0)
+
+    return {
+        "date": day,
+        "messages": msgs,
+        "leads": leads,
+        "total_conversions": total,
+        "spend": spend,
+    }
+
+
+def _iter_days_for_hourly_mode(mode: str) -> List[datetime]:
+    """Возвращает список дат для почасовой тепловой карты.
+
+    mode: "today" | "yday" | "7d" (по умолчанию 7 дней).
+    """
+
+    now = datetime.now(ALMATY_TZ)
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    if mode == "today":
+        return [today]
+    if mode == "yday":
+        return [today - timedelta(days=1)]
+
+    # Последние 7 дней, включая сегодня
+    days = 7
+    return [today - timedelta(days=i) for i in range(days)][::-1]
+
+
+def _hourly_mode_label(mode: str) -> str:
+    if mode == "today":
+        return "сегодня"
+    if mode == "yday":
+        return "вчера"
+    return "последние 7 дней"
+
+
+def build_hourly_heatmap_for_account(
+    aid: str,
+    get_account_name_fn=get_account_name,
+    mode: str = "7d",
+) -> Tuple[str, Dict[str, Any]]:
+    """Строит почасовую тепловую карту для аккаунта на базе hourly_stats.
+
+    Возвращает:
+      - готовый текст для Telegram
+      - summary-словарь для ИИ-анализа (матрица день×час и агрегаты).
+    """
+
+    acc_name = get_account_name_fn(aid)
+    mode_label = _hourly_mode_label(mode)
+
+    stats = load_hourly_stats() or {}
+    acc_stats = stats.get(aid) or {}
+    if not isinstance(acc_stats, dict):
+        acc_stats = {}
+
+    days = _iter_days_for_hourly_mode(mode)
+    hours = [f"{h:02d}" for h in range(24)]
+
+    matrix: List[Dict[str, Any]] = []
+    max_convs = 0
+    total_convs_all = 0
+    total_spend_all = 0.0
+
+    for day in days:
+        day_key = day.strftime("%Y-%m-%d")
+        day_stats = acc_stats.get(day_key) or {}
+        if not isinstance(day_stats, dict):
+            day_stats = {}
+
+        row_totals: List[int] = []
+        day_total = 0
+        day_spend = 0.0
+
+        for h in hours:
+            bucket = day_stats.get(h) or {}
+            val = int(bucket.get("total", 0) or 0)
+            sp = float(bucket.get("spend", 0.0) or 0.0)
+            row_totals.append(val)
+            day_total += val
+            day_spend += sp
+            if val > max_convs:
+                max_convs = val
+
+        total_convs_all += day_total
+        total_spend_all += day_spend
+
+        matrix.append(
+            {
+                "date": day,
+                "date_key": day_key,
+                "totals_per_hour": row_totals,
+                "total_conversions": day_total,
+                "spend": day_spend,
+            }
+        )
+
+    # Текстовая визуализация
+    lines: List[str] = []
+    lines.append(f"🔥 Тепловая карта по часам (заявки 💬+📩) — {acc_name}")
+    lines.append(f"Период: {mode_label}")
+    lines.append("")
+
+    if not matrix or total_convs_all == 0:
+        lines.append("За выбранный период нет заявок (💬+📩) по часам.")
+    else:
+        lines.append(
+            f"Итого за период: {total_convs_all} заявок, затраты: {total_spend_all:.2f} $"
+        )
+        lines.append("")
+        lines.append("Строки — дни, символы — часы 00–23:")
+        lines.append("")
+
+        for row in matrix:
+            day_dt: datetime = row["date"]
+            date_str = day_dt.strftime("%d.%m")
+            vals: List[int] = row["totals_per_hour"]
+            symbols = "".join(_heat_symbol(v, max_convs) for v in vals)
+            lines.append(f"{date_str}: {symbols}")
+
+        lines.append("")
+        lines.append("Легенда интенсивности:")
+        lines.append("⬜ — нет заявок")
+        lines.append("▢ — низкая активность")
+        lines.append("▤ — средняя активность")
+        lines.append("▦ — высокая активность")
+        lines.append("▩ — пиковая активность")
+
+    text = "\n".join(lines)
+
+    summary: Dict[str, Any] = {
+        "account_id": aid,
+        "account_name": acc_name,
+        "mode": mode,
+        "mode_label": mode_label,
+        "days": [
+            {
+                "date": row["date_key"],
+                "totals_per_hour": row["totals_per_hour"],
+                "total_conversions": row["total_conversions"],
+                "spend": row["spend"],
+            }
+            for row in matrix
+        ],
+        "total_conversions_all": total_convs_all,
+        "total_spend_all": total_spend_all,
+    }
+
+    return text, summary
 
 
 # ================== ВИЗУАЛ ТЕПЛОВОЙ КАРТЫ ==================

@@ -6,6 +6,7 @@ from telegram import (
     InlineKeyboardButton,
     ReplyKeyboardRemove,
 )
+from telegram.constants import ChatAction
 from telegram.error import BadRequest
 from telegram.ext import (
     Application,
@@ -47,7 +48,7 @@ from .reporting import (
     parse_range,
     parse_two_ranges,
 )
-from .insights import build_heatmap_for_account
+from .insights import build_heatmap_for_account, build_hourly_heatmap_for_account
 from .creatives import fetch_instagram_active_ads_links, format_instagram_ads_links
 from .adsets import send_adset_report
 from .billing import send_billing, send_billing_forecast, billing_digest_job
@@ -78,6 +79,25 @@ async def safe_edit_message(q, text: str, **kwargs):
         if "Message is not modified" in str(e):
             return
         raise
+
+
+async def _typing_loop(bot, chat_id: str, stop_event: "asyncio.Event") -> None:
+    """Показывает анимацию "бот печатает" пока не будет установлен stop_event.
+
+    Ограничение по времени ~30 секунд, чтобы не спамить action'ами.
+    """
+
+    start = datetime.now(ALMATY_TZ)
+    while not stop_event.is_set():
+        try:
+            await bot.send_chat_action(chat_id, ChatAction.TYPING)
+        except Exception:
+            break
+
+        await asyncio.sleep(2.0)
+
+        if (datetime.now(ALMATY_TZ) - start).total_seconds() > 30:
+            break
 
 
 def _build_version_text() -> str:
@@ -276,10 +296,68 @@ def monitoring_menu_kb() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
+                    "🔥 Тепловая карта по часам",
+                    callback_data="hm_hourly_menu",
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     "📈 План заявок (скоро)", callback_data="leads_plan_soon"
                 )
             ],
             [InlineKeyboardButton("⬅️ В меню", callback_data="menu")],
+        ]
+    )
+
+
+def heatmap_hourly_accounts_kb() -> InlineKeyboardMarkup:
+    """Выбор аккаунта для почасовой тепловой карты (из меню мониторинга)."""
+
+    store = load_accounts()
+    if store:
+        enabled_ids = [aid for aid, row in store.items() if row.get("enabled", True)]
+        disabled_ids = [
+            aid for aid, row in store.items() if not row.get("enabled", True)
+        ]
+        ids = enabled_ids + disabled_ids
+    else:
+        from .constants import AD_ACCOUNTS_FALLBACK
+
+        ids = AD_ACCOUNTS_FALLBACK
+
+    rows = []
+    for aid in ids:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"{_flag_line(aid)}  {get_account_name(aid)}",
+                    callback_data=f"hmh_acc|{aid}",
+                )
+            ]
+        )
+    rows.append([InlineKeyboardButton("⬅️ Мониторинг", callback_data="monitoring_menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+def heatmap_hourly_periods_kb(aid: str) -> InlineKeyboardMarkup:
+    base = f"hmh_p|{aid}"
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Сегодня", callback_data=f"{base}|today"),
+                InlineKeyboardButton("Вчера", callback_data=f"{base}|yday"),
+            ],
+            [
+                InlineKeyboardButton(
+                    "Последние 7 дней", callback_data=f"{base}|7d"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "⬅️ К аккаунтам",
+                    callback_data="hm_hourly_menu",
+                )
+            ],
         ]
     )
 
@@ -806,6 +884,76 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "в ALLOWED_USER_IDS."
             ),
         )
+        return
+
+    if data == "hm_hourly_menu":
+        await safe_edit_message(
+            q,
+            "Выберите аккаунт для почасовой тепловой карты:",
+            reply_markup=heatmap_hourly_accounts_kb(),
+        )
+        return
+
+    if data.startswith("hmh_acc|"):
+        aid = data.split("|", 1)[1]
+        await safe_edit_message(
+            q,
+            f"Выберите период для почасовой тепловой карты по {get_account_name(aid)}:",
+            reply_markup=heatmap_hourly_periods_kb(aid),
+        )
+        return
+
+    if data.startswith("hmh_p|"):
+        _, aid, mode = data.split("|", 2)
+
+        text_hm, summary = build_hourly_heatmap_for_account(aid, get_account_name, mode)
+
+        await safe_edit_message(q, text_hm)
+
+        # ИИ-анализ почасовой карты с анимацией "бот печатает"
+        chat_id = str(q.message.chat.id)
+        stop_event = asyncio.Event()
+        typing_task = asyncio.create_task(
+            _typing_loop(context.bot, chat_id, stop_event)
+        )
+
+        focus_comment = None
+        try:
+            system_msg = (
+                "Ты — продвинутый аналитик по почасовой активности рекламы. "
+                "Отвечай ТОЛЬКО на русском языке. "
+                "Тебе дана матрица заявок по дням и часам, а также суммарные заявки и затраты. "
+                "Определи лучшие часы по заявкам, 'мёртвые' часы, различия между буднями и выходными (если есть) "
+                "и предложи 2–3 практических рекомендации по бюджетам/ставкам. "
+                "Отвечай кратко (до 5–7 строк обычного текста), без JSON."
+            )
+
+            user_msg = json.dumps(summary, ensure_ascii=False)
+
+            ds_resp = await ask_deepseek(
+                [
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": user_msg},
+                ],
+                json_mode=False,
+            )
+
+            choice = (ds_resp.get("choices") or [{}])[0]
+            focus_comment = (choice.get("message") or {}).get("content")
+        except Exception:
+            focus_comment = None
+        finally:
+            stop_event.set()
+            try:
+                await typing_task
+            except Exception:
+                pass
+
+        if focus_comment:
+            await context.bot.send_message(
+                chat_id,
+                f"🤖 Анализ почасовой тепловой карты:\n{focus_comment.strip()}",
+            )
         return
     await context.bot.send_message(
         chat_id=update.effective_chat.id,

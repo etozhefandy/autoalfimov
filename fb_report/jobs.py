@@ -237,10 +237,10 @@ async def _cpa_alerts_job(context: ContextTypes.DEFAULT_TYPE):
         freq = alerts.get("freq", "3x")
 
         if freq == "3x":
-            # Срабатываем только в определённые времена
-            if now.replace(second=0, microsecond=0).timetz() not in [
-                t.timetz() for t in CPA_ALERT_TIMES
-            ]:
+            # Срабатываем только в определённые времена.
+            # Округляем текущее время до минуты и сравниваем с допустимыми слотами.
+            current_time = now.replace(second=0, microsecond=0).time()
+            if current_time not in CPA_ALERT_TIMES:
                 continue
         elif freq == "hourly":
             # Каждый час в окне 10–22
