@@ -139,7 +139,7 @@ async def send_billing_forecast(ctx: ContextTypes.DEFAULT_TYPE, chat_id: str):
 async def billing_digest_job(ctx: ContextTypes.DEFAULT_TYPE):
     """
     Ежедневный дайджест утром:
-    список аккаунтов, у которых days_left ≤ 5, отсортированный от самых “горящих”.
+    список неактивных аккаунтов (как в send_billing), чтобы напомнить о пополнении.
     """
     from .constants import DEFAULT_REPORT_CHAT
 
@@ -147,42 +147,12 @@ async def billing_digest_job(ctx: ContextTypes.DEFAULT_TYPE):
     if not chat_id:
         return
 
-    rate = usd_to_kzt()
-    items = []
-    for aid in iter_enabled_accounts_only():
-        fc = _compute_billing_forecast_for_account(aid, rate_kzt=rate)
-        if fc and fc["days_left"] <= 5.0:
-            items.append(fc)
+    # Заголовок утреннего сообщения
+    await ctx.bot.send_message(
+        chat_id=chat_id,
+        text="📋 Биллинги (неактивные аккаунты):",
+    )
 
-    if not items:
-        return
-
-    items.sort(key=lambda x: x["days_left"])
-
-    today = datetime.now(ALMATY_TZ).date()
-    lines = [
-        "@Zz11mmaa отправь им запрос пополнения карт",
-        "",
-        "☀️ <b>Текущие биллинги (кабинеты с ближайшими списаниями ≤ 5 дней)</b>",
-    ]
-
-    for fc in items:
-        days_left = fc["days_left"]
-        if days_left < 1:
-            approx_days = 0
-        else:
-            approx_days = max(int(math.floor(days_left)) - 1, 0)
-        date = today + timedelta(days=approx_days)
-        if approx_days <= 0:
-            when_str = "сегодня (ориентир)"
-        else:
-            when_str = f"через {approx_days} дн. (ориентир {date.strftime('%d.%m')})"
-
-        lines.append(
-            f"\n💳 <b>{fc['name']}</b>\n"
-            f"   Баланс: {fc['balance_usd']:.2f} $  |  🇰🇿 {fmt_int(fc['balance_kzt'])} ₸\n"
-            f"   Средний расход: {fc['avg_daily_spend']:.2f} $/день\n"
-            f"   ⏳ {when_str}"
-        )
-
-    await ctx.bot.send_message(chat_id=chat_id, text="\n".join(lines), parse_mode="HTML")
+    # Далее используем существующую логику send_billing, которая выводит
+    # сами неактивные аккаунты.
+    await send_billing(ctx, chat_id)
