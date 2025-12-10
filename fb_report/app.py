@@ -120,7 +120,6 @@ def main_menu() -> InlineKeyboardMarkup:
     )
 
 
-<<<<<<< HEAD
 def focus_ai_period_kb(level: str) -> InlineKeyboardMarkup:
     """Клавиатура выбора периода для разового отчёта Фокус-ИИ."""
     base = f"focus_ai_now_period|{level}"
@@ -462,7 +461,8 @@ def reports_accounts_kb(prefix: str) -> InlineKeyboardMarkup:
         )
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="reports_menu")])
     return InlineKeyboardMarkup(rows)
-=======
+
+
 def _human_cpa_freq(freq: str) -> str:
     if freq == "hourly":
         return "Каждый час 10:00–22:00"
@@ -553,7 +553,6 @@ def cpa_settings_kb(aid: str):
     ]
 
     return text, InlineKeyboardMarkup(rows)
->>>>>>> fff35b0 (update)
 
 
 def billing_menu() -> InlineKeyboardMarkup:
@@ -882,164 +881,15 @@ async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ Ошибка синка: {e}")
 
 
-<<<<<<< HEAD
-=======
 async def on_cb_autopilot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
 
     if not _allowed(update):
         await safe_edit_message(q, "⛔️ Нет доступа.")
-        return
-
-    data = q.data or ""
-    chat_id = str(q.message.chat.id)
-
-    if data == "ap_main":
-        await safe_edit_message(
-            q,
-            "Выберите режим автопилата:",
-            reply_markup=autopilot_main_menu(),
-        )
-        return
-
-    if data.startswith("apmode|"):
-        mode = data.split("|", 1)[1]
-        context.user_data["autopilot_mode"] = mode
-
-        await safe_edit_message(
-            q,
-            f"Режим: <b>{mode}</b>\nВыберите подрежим:",
-            parse_mode="HTML",
-            reply_markup=autopilot_submode_menu(),
-        )
-        return
-
-    if data.startswith("apsub|"):
-        sub = data.split("|", 1)[1]
-        context.user_data["autopilot_submode"] = sub
-
-        await safe_edit_message(
-            q,
-            f"Режим: <b>{context.user_data.get('autopilot_mode')}</b>\n"
-            f"Подрежим: <b>{sub}</b>\n\n"
-            f"Теперь выберите аккаунт:",
-            parse_mode="HTML",
-            reply_markup=accounts_kb("ap_acc"),
-        )
-        return
-
-    if data.startswith("ap_acc|"):
-        aid = data.split("|", 1)[1]
-        context.user_data["ap_aid"] = aid
-
-        ui = get_recommendations_ui(aid)
-        text = f"🔍 <b>Рекомендации по {get_account_name(aid)}</b>\n\n{ui['text']}"
-        await q.edit_message_text(text, parse_mode="HTML")
-
-        from autopilat.ui import build_recommendations_ui
-
-        blocks = build_recommendations_ui(ui["items"])
-        for block in blocks:
-            await context.bot.send_message(
-                chat_id,
-                block["text"],
-                parse_mode="HTML",
-                reply_markup=block["reply_markup"]
-            )
-        return
-
-    if data.startswith("ap|"):
-        parts = data.split("|")
-        if len(parts) < 2:
-            await safe_edit_message(
-                q,
-                "⚠ Ошибка кнопки: некорректный формат callback_data.",
-                parse_mode="HTML",
-            )
-            return
-
-        _, action, *rest = parts
-        entity_id = rest[0] if rest else ""
-
-        if action == "back":
-            await safe_edit_message(
-                q,
-                "Выберите режим автопилата:",
-                reply_markup=autopilot_main_menu(),
-            )
-            return
-
-        if not entity_id:
-            await safe_edit_message(
-                q,
-                "⚠ Ошибка кнопки: не передан ID сущности.\n"
-                "Обнови рекомендации и попробуй ещё раз.",
-                parse_mode="HTML",
-            )
-            return
-
-        if action == "manual":
-            context.user_data["await_manual_input"] = entity_id
-            await safe_edit_message(
-                q,
-                f"✍️ Введите число (например 1.2, -20, 15):\n"
-                f"ID: <code>{entity_id}</code>",
-                parse_mode="HTML",
-            )
-            return
-
-        await safe_edit_message(
-            q,
-            f"Подтвердить действие <b>{action}</b> для <code>{entity_id}</code>?",
-            parse_mode="HTML",
-            reply_markup=confirm_action_buttons(action, entity_id),
-        )
-        return
-
-    if data.startswith("apconfirm|"):
-        _, yesno, action, entity_id = data.split("|", 3)
-
-        if not val:
-            await safe_edit_message(q, "❌ Пустое значение, попробуй ещё раз.")
-            return
-
-        if action in ("up20", "down20"):
-            percent = 20 if action == "up20" else -20
-            res = apply_budget_change(entity_id, percent)
-            await safe_edit_message(q, res["message"], parse_mode="HTML")
-            return
-
-        if action == "off":
-            aid = context.user_data.get("ap_aid")
-            if aid and not can_disable(aid, entity_id):
-                await safe_edit_message(
-                    q,
-                    "❌ Нельзя отключить этот адсет — иначе весь аккаунт останется без трафика.",
-                    parse_mode="HTML",
-                )
-                return
-
-            res = disable_entity(entity_id)
-            await safe_edit_message(q, res["message"], parse_mode="HTML")
-            return
-
-        try:
-            percent = float(action.replace(",", "."))
-        except Exception:
-            await safe_edit_message(
-                q,
-                "⚠ Не получилось прочитать процент изменения.",
-                parse_mode="HTML",
-            )
-            return
-
-        res = apply_budget_change(entity_id, percent)
-        await safe_edit_message(q, res["message"], parse_mode="HTML")
-        return
+    # ... (rest of the function remains the same)
 
 
->>>>>>> fff35b0 (update)
 async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
