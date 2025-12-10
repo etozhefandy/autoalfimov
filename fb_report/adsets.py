@@ -92,6 +92,8 @@ def fetch_adset_insights_7d(aid: str):
                 "leads": leads,
                 "total": total,
                 "cpa": blended,
+                "campaign_id": cid,
+                "campaign_name": cname,
             }
         )
 

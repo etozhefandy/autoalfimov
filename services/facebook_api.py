@@ -6,6 +6,7 @@ import json
 
 from facebook_business.api import FacebookAdsApi
 from facebook_business.adobjects.adaccount import AdAccount
+from facebook_business.adobjects.ad import Ad
 from facebook_business.adobjects.adsinsights import AdsInsights
 
 from config import FB_ACCESS_TOKEN, FB_APP_ID, FB_APP_SECRET
@@ -150,6 +151,70 @@ def fetch_campaigns(aid: str) -> List[Dict[str, Any]]:
             continue
 
     return out
+
+
+# ========= AD MANAGEMENT =========
+
+def pause_ad(ad_id: str) -> Dict[str, Any]:
+    """Ставит объявление в статус PAUSED через Facebook Marketing API.
+
+    Возвращает dict с ключами:
+      - status: "ok" или "error"
+      - message: человекочитаемое описание
+      - api_response: сырой ответ SDK (для отладки), если есть
+      - exception: текст исключения при ошибке, если было
+    """
+
+    if not ad_id:
+        return {
+            "status": "error",
+            "message": "Пустой ad_id",
+            "api_response": None,
+            "exception": None,
+        }
+
+    # Гарантируем инициализацию SDK перед вызовом.
+    try:
+        api = FacebookAdsApi.get_default_api()
+    except Exception:
+        api = None
+
+    if api is None and FB_ACCESS_TOKEN:
+        try:
+            FacebookAdsApi.init(FB_APP_ID, FB_APP_SECRET, FB_ACCESS_TOKEN)
+        except Exception as e:  # pragma: no cover
+            return {
+                "status": "error",
+                "message": "Не удалось инициализировать Facebook API",
+                "api_response": None,
+                "exception": str(e),
+            }
+
+    try:
+        ad = Ad(ad_id)
+        # Обновляем статус объявления на PAUSED.
+        res = safe_api_call(ad.api_update, params={"status": "PAUSED"})
+        if res is None:
+            return {
+                "status": "error",
+                "message": "API вернуло пустой ответ",
+                "api_response": None,
+                "exception": None,
+            }
+    except Exception as e:  # pragma: no cover - обёртка ошибок SDK
+        return {
+            "status": "error",
+            "message": "Исключение при вызове API",
+            "api_response": None,
+            "exception": str(e),
+        }
+
+    return {
+        "status": "ok",
+        "message": "Объявление поставлено на паузу через Facebook API.",
+        "api_response": res,
+        "exception": None,
+    }
 
 
 # ========= ADSETS =========

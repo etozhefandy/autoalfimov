@@ -281,6 +281,11 @@ def analyze_ads(
         parsed = parse_insight(ins or {})
         parsed["ad_id"] = ad_id
         parsed["name"] = ad["name"]
+        # Дополнительно пробуем сохранить связи с адсетом и кампанией, если есть
+        parsed["adset_id"] = ad.get("adset_id")
+        parsed["campaign_id"] = ad.get("campaign_id")
+        parsed["adset_name"] = ad.get("adset", {}).get("name") if isinstance(ad.get("adset"), dict) else None
+        parsed["campaign_name"] = ad.get("campaign", {}).get("name") if isinstance(ad.get("campaign"), dict) else None
 
         results.append(parsed)
 

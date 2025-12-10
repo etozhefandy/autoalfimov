@@ -54,6 +54,7 @@ from .billing import send_billing, send_billing_forecast, billing_digest_job
 from .jobs import full_daily_scan_job, daily_report_job, schedule_cpa_alerts
 
 from services.analytics import analyze_campaigns, analyze_adsets, analyze_account, analyze_ads
+from services.facebook_api import pause_ad
 from services.ai_focus import get_focus_comment, ask_deepseek
 from monitor_anomalies import build_anomaly_messages_for_account
 import json
@@ -907,6 +908,121 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "menu":
         await safe_edit_message(q, "🤖 Выберите действие:", reply_markup=main_menu())
+        return
+
+    # ==== CPA-алёрты по объявлениям: тихий режим и выключение ====
+
+    if data.startswith("cpa_ad_silent|"):
+        # Формат: cpa_ad_silent|{aid}|{ad_id}
+        try:
+            _p, aid, ad_id = data.split("|", 2)
+        except ValueError:
+            await q.answer("Некорректные данные для тихого режима.", show_alert=True)
+            return
+
+        st = load_accounts()
+        row = st.get(aid) or {}
+        alerts = row.get("alerts") or {}
+        ad_alerts = alerts.get("ad_alerts") or {}
+        cfg = ad_alerts.get(ad_id) or {}
+
+        current = bool(cfg.get("silent", False))
+        cfg["silent"] = not current
+        ad_alerts[ad_id] = cfg
+        alerts["ad_alerts"] = ad_alerts
+        row["alerts"] = alerts
+        st[aid] = row
+        save_accounts(st)
+
+        if cfg["silent"]:
+            await q.answer("Тихий режим включён для объявления.", show_alert=False)
+        else:
+            await q.answer("Тихий режим выключен для объявления.", show_alert=False)
+        return
+
+    if data.startswith("cpa_ad_off|"):
+        # Формат: cpa_ad_off|{aid}|{ad_id}
+        try:
+            _p, aid, ad_id = data.split("|", 2)
+        except ValueError:
+            await q.answer("Некорректные данные для выключения объявления.", show_alert=True)
+            return
+
+        res = pause_ad(ad_id)
+        status = res.get("status")
+        msg = res.get("message") or ""
+
+        if status != "ok":
+            # При ошибке API просто сообщаем пользователю и, если есть альтернативы,
+            # даём кнопку для ручного открытия объявления в Ads Manager.
+            await q.answer(f"Ошибка при выключении: {msg}", show_alert=True)
+
+            try:
+                # Проверяем наличие альтернатив за последние 7 дней.
+                now = datetime.now(ALMATY_TZ)
+                period_7d = {
+                    "since": (now - timedelta(days=7)).strftime("%Y-%m-%d"),
+                    "until": now.strftime("%Y-%m-%d"),
+                }
+                ads_7d = analyze_ads(aid, period=period_7d) or []
+
+                # Находим adset для этого объявления и проверяем, есть ли другие объявления с spend>0.
+                adset_id = None
+                for ad in ads_7d:
+                    if ad.get("ad_id") == ad_id:
+                        adset_id = ad.get("adset_id")
+                        break
+
+                has_alternative = False
+                if adset_id:
+                    for ad in ads_7d:
+                        if ad.get("ad_id") == ad_id:
+                            continue
+                        if ad.get("adset_id") != adset_id:
+                            continue
+                        if float(ad.get("spend", 0.0) or 0.0) > 0:
+                            has_alternative = True
+                            break
+
+                if has_alternative:
+                    open_url = f"https://www.facebook.com/adsmanager/manage/ad/?ad={ad_id}"
+                    text = (
+                        "Не удалось автоматически выключить объявление через API. "
+                        "Открой его вручную в Ads Manager и отключи там:"
+                    )
+                    kb = InlineKeyboardMarkup(
+                        [
+                            [
+                                InlineKeyboardButton(
+                                    "Открыть объявление",
+                                    url=open_url,
+                                )
+                            ]
+                        ]
+                    )
+                    await context.bot.send_message(chat_id, text, reply_markup=kb)
+            except Exception:
+                # Вспомогательный блок не должен ломать основной обработчик.
+                pass
+
+            return
+
+        st = load_accounts()
+        row = st.get(aid) or {}
+        alerts = row.get("alerts") or {}
+        ad_alerts = alerts.get("ad_alerts") or {}
+        cfg = ad_alerts.get(ad_id) or {}
+        cfg["enabled"] = False
+        ad_alerts[ad_id] = cfg
+        alerts["ad_alerts"] = ad_alerts
+        row["alerts"] = alerts
+        st[aid] = row
+        save_accounts(st)
+
+        await q.answer(
+            "Объявление выключено, алёрты по нему больше не будут приходить.",
+            show_alert=False,
+        )
         return
 
     if data == "insta_links_menu":

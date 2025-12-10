@@ -83,8 +83,21 @@ def _migrate_alerts_schema(store: dict) -> dict:
         alerts.setdefault("ai_enabled", True)
 
         # Adset-уровень CPA-алёртов: по умолчанию пустой словарь.
-        # Если поле отсутствует, добавляем его как {} для обратной совместимости.
         alerts.setdefault("adset_alerts", {})
+        # Campaign-уровень CPA-алёртов: по умолчанию пустой словарь.
+        alerts.setdefault("campaign_alerts", {})
+        # Ad-уровень CPA-алёртов: по умолчанию пустой словарь.
+        alerts.setdefault("ad_alerts", {})
+
+        # Новое поле silent для ad_alerts: по умолчанию False, если не задано.
+        try:
+            ad_alerts = alerts.get("ad_alerts") or {}
+            if isinstance(ad_alerts, dict):
+                for _ad_id, cfg in ad_alerts.items():
+                    if isinstance(cfg, dict) and "silent" not in cfg:
+                        cfg["silent"] = False
+        except Exception:
+            pass
 
         row["alerts"] = alerts
         store[aid] = row
@@ -225,6 +238,10 @@ def upsert_from_bm() -> dict:
                     "ai_enabled": True,
                     # Adset-уровень CPA-алёртов: по умолчанию пусто.
                     "adset_alerts": {},
+                    # Campaign-уровень CPA-алёртов: по умолчанию пусто.
+                    "campaign_alerts": {},
+                    # Ad-уровень CPA-алёртов: по умолчанию пусто.
+                    "ad_alerts": {},
                 },
             }
             added += 1
