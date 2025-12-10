@@ -2173,11 +2173,13 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 continue
             name = camp.get("name") or cid
             cfg_c = (campaign_alerts.get(cid) or {}) if cid in campaign_alerts else {}
+            enabled_c = bool(cfg_c.get("enabled", False))
             target = float(cfg_c.get("target_cpa") or 0.0)
             label_suffix = (
                 f"[CPA {target:.2f}$]" if target > 0 else "[CPA аккаунта]"
             )
-            text_btn = f"{name} {label_suffix}".strip()
+            indicator = "🟢" if enabled_c else "⚪️"
+            text_btn = f"{indicator} {name} {label_suffix}".strip()
 
             kb_rows.append(
                 [
@@ -2287,7 +2289,8 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         st[aid] = row
         save_accounts(st)
 
-        data = f"cpa_campaign|{aid}|{campaign_id}"
+        # После переключения статуса возвращаемся к списку кампаний
+        data = f"cpa_campaigns|{aid}"
         update.callback_query.data = data
         await on_cb(update, context)
         return
@@ -2563,11 +2566,13 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             name = ad.get("name") or ad_id
             cfg = ad_alerts.get(ad_id) or {}
+            enabled_ad = bool(cfg.get("enabled", False))
             target = float(cfg.get("target_cpa") or 0.0)
             label_suffix = (
                 f"[CPA {target:.2f}$]" if target > 0 else "[CPA вышестоящего уровня]"
             )
-            text_btn = f"{name} {label_suffix}".strip()
+            indicator = "🟢" if enabled_ad else "⚪️"
+            text_btn = f"{indicator} {name} {label_suffix}".strip()
 
             kb_rows.append(
                 [
@@ -2692,7 +2697,8 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         st[aid] = row
         save_accounts(st)
 
-        data = f"cpa_ad_cfg|{aid}|{ad_id}"
+        # После переключения статуса возвращаемся к списку объявлений
+        data = f"cpa_ads|{aid}"
         update.callback_query.data = data
         await on_cb(update, context)
         return
@@ -3029,25 +3035,49 @@ async def on_text_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
         st[aid] = row
         save_accounts(st)
 
+        # После ввода CPA возвращаем пользователя к списку кампаний
         try:
             camps = analyze_campaigns(aid, days=7) or []
         except Exception:
             camps = []
 
-        name = campaign_id
+        campaign_alerts_view = alerts.get("campaign_alerts", {}) or {}
+        kb_rows = []
         for camp in camps:
-            if camp.get("campaign_id") == campaign_id:
-                name = camp.get("name") or campaign_id
-                break
+            cid = camp.get("campaign_id")
+            if not cid:
+                continue
+            name = camp.get("name") or cid
+            cfg_c = (campaign_alerts_view.get(cid) or {}) if cid in campaign_alerts_view else {}
+            enabled_c = bool(cfg_c.get("enabled", False))
+            target = float(cfg_c.get("target_cpa") or 0.0)
+            label_suffix = (
+                f"[CPA {target:.2f}$]" if target > 0 else "[CPA аккаунта]"
+            )
+            indicator = "🟢" if enabled_c else "⚪️"
+            text_btn = f"{indicator} {name} {label_suffix}".strip()
 
-        if new_cpa > 0:
-            await update.message.reply_text(
-                f"✅ CPA для кампании '{name}' обновлён: {new_cpa:.2f} $ (алерты ВКЛ)"
+            kb_rows.append(
+                [
+                    InlineKeyboardButton(
+                        text_btn,
+                        callback_data=f"cpa_campaign|{aid}|{cid}",
+                    )
+                ]
             )
-        else:
-            await update.message.reply_text(
-                f"✅ CPA для кампании '{name}' установлен 0 — будет наследовать CPA аккаунта"
-            )
+
+        kb_rows.append(
+            [
+                InlineKeyboardButton(
+                    "⬅️ Назад", callback_data=f"cpa_settings|{aid}"
+                )
+            ]
+        )
+
+        text_list = "Выбери кампанию для настройки CPA-алёртов."
+        await update.message.reply_text(
+            text_list, reply_markup=InlineKeyboardMarkup(kb_rows)
+        )
         return
 
     if "await_cpa_adset_for" in context.user_data:
@@ -3127,25 +3157,54 @@ async def on_text_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
         st[aid] = row
         save_accounts(st)
 
+        # После ввода CPA возвращаем пользователя к списку объявлений
         try:
             ads = analyze_ads(aid, days=7) or []
         except Exception:
             ads = []
 
-        name = ad_id
+        ad_alerts_view = alerts.get("ad_alerts", {}) or {}
+        kb_rows = []
         for ad in ads:
-            if (ad.get("ad_id") or ad.get("id")) == ad_id:
-                name = ad.get("name") or ad_id
-                break
+            ad_row_id = ad.get("ad_id") or ad.get("id")
+            if not ad_row_id:
+                continue
 
-        if new_cpa > 0:
-            await update.message.reply_text(
-                f"✅ CPA для объявления '{name}' обновлён: {new_cpa:.2f} $ (алерты ВКЛ)"
+            spend = float(ad.get("spend", 0.0) or 0.0)
+            if ad_row_id not in ad_alerts_view and spend <= 0:
+                continue
+
+            name = ad.get("name") or ad_row_id
+            cfg_row = ad_alerts_view.get(ad_row_id) or {}
+            enabled_row = bool(cfg_row.get("enabled", False))
+            target_row = float(cfg_row.get("target_cpa") or 0.0)
+            label_suffix = (
+                f"[CPA {target_row:.2f}$]" if target_row > 0 else "[CPA вышестоящего уровня]"
             )
-        else:
-            await update.message.reply_text(
-                f"✅ CPA для объявления '{name}' установлен 0 — будет наследовать CPA вышестоящего уровня"
+            indicator = "🟢" if enabled_row else "⚪️"
+            text_btn = f"{indicator} {name} {label_suffix}".strip()
+
+            kb_rows.append(
+                [
+                    InlineKeyboardButton(
+                        text_btn,
+                        callback_data=f"cpa_ad_cfg|{aid}|{ad_row_id}",
+                    )
+                ]
             )
+
+        kb_rows.append(
+            [
+                InlineKeyboardButton(
+                    "⬅️ Назад", callback_data=f"cpa_settings|{aid}"
+                )
+            ]
+        )
+
+        text_list = "Выбери объявление для настройки CPA-алёртов."
+        await update.message.reply_text(
+            text_list, reply_markup=InlineKeyboardMarkup(kb_rows)
+        )
         return
 
     if "await_manual_input" in context.user_data:
