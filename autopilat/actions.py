@@ -6,12 +6,13 @@ from facebook_business.adobjects.adaccount import AdAccount
 from facebook_business.api import FacebookAdsApi
 
 from services.facebook_api import safe_api_call
-from config import FB_ACCESS_TOKEN, FB_APP_ID, FB_APP_SECRET
+from config import FB_ACCESS_TOKEN
 
 
 # Инициализация API (на случай прямого вызова)
 if FB_ACCESS_TOKEN:
-    FacebookAdsApi.init(FB_APP_ID, FB_APP_SECRET, FB_ACCESS_TOKEN)
+    # Используем только access_token, как в services/facebook_api.
+    FacebookAdsApi.init(access_token=FB_ACCESS_TOKEN)
 
 
 # ============================================================
