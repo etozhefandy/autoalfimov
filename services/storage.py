@@ -6,15 +6,19 @@ import shutil
 from datetime import datetime
 from typing import Any, Dict
 
-from config import (
+from fb_report.constants import (
     DATA_DIR,
-    INSIGHTS_DIR,
     ACCOUNTS_JSON,
     REPORT_CACHE_FILE,
     SYNC_META_FILE,
     REPORT_CACHE_TTL,
     ALMATY_TZ,
 )
+
+# В старой версии INSIGHTS_DIR задавался через config.
+# Здесь восстанавливаем тот же путь на основе DATA_DIR.
+INSIGHTS_DIR = os.path.join(DATA_DIR, "insights_cache")
+os.makedirs(INSIGHTS_DIR, exist_ok=True)
 
 # ========= БАЗОВЫЙ JSON I/O =========
 
