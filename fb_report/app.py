@@ -886,75 +886,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if data == "hm_hourly_menu":
-        await safe_edit_message(
-            q,
-            "Выберите аккаунт для почасовой тепловой карты:",
-            reply_markup=heatmap_hourly_accounts_kb(),
-        )
-        return
-
-    if data.startswith("hmh_acc|"):
-        aid = data.split("|", 1)[1]
-        await safe_edit_message(
-            q,
-            f"Выберите период для почасовой тепловой карты по {get_account_name(aid)}:",
-            reply_markup=heatmap_hourly_periods_kb(aid),
-        )
-        return
-
-    if data.startswith("hmh_p|"):
-        _, aid, mode = data.split("|", 2)
-
-        text_hm, summary = build_hourly_heatmap_for_account(aid, get_account_name, mode)
-
-        await safe_edit_message(q, text_hm)
-
-        # ИИ-анализ почасовой карты с анимацией "бот печатает"
-        chat_id = str(q.message.chat.id)
-        stop_event = asyncio.Event()
-        typing_task = asyncio.create_task(
-            _typing_loop(context.bot, chat_id, stop_event)
-        )
-
-        focus_comment = None
-        try:
-            system_msg = (
-                "Ты — продвинутый аналитик по почасовой активности рекламы. "
-                "Отвечай ТОЛЬКО на русском языке. "
-                "Тебе дана матрица заявок по дням и часам, а также суммарные заявки и затраты. "
-                "Определи лучшие часы по заявкам, 'мёртвые' часы, различия между буднями и выходными (если есть) "
-                "и предложи 2–3 практических рекомендации по бюджетам/ставкам. "
-                "Отвечай кратко (до 5–7 строк обычного текста), без JSON."
-            )
-
-            user_msg = json.dumps(summary, ensure_ascii=False)
-
-            ds_resp = await ask_deepseek(
-                [
-                    {"role": "system", "content": system_msg},
-                    {"role": "user", "content": user_msg},
-                ],
-                json_mode=False,
-            )
-
-            choice = (ds_resp.get("choices") or [{}])[0]
-            focus_comment = (choice.get("message") or {}).get("content")
-        except Exception:
-            focus_comment = None
-        finally:
-            stop_event.set()
-            try:
-                await typing_task
-            except Exception:
-                pass
-
-        if focus_comment:
-            await context.bot.send_message(
-                chat_id,
-                f"🤖 Анализ почасовой тепловой карты:\n{focus_comment.strip()}",
-            )
-        return
     await context.bot.send_message(
         chat_id=update.effective_chat.id,
         text="🤖 Выберите действие:",
@@ -2263,6 +2194,76 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Введи даты для тепловой карты форматом: 01.06.2025-07.06.2025",
             reply_markup=heatmap_menu(aid),
         )
+        return
+
+    if data == "hm_hourly_menu":
+        await safe_edit_message(
+            q,
+            "Выберите аккаунт для почасовой тепловой карты:",
+            reply_markup=heatmap_hourly_accounts_kb(),
+        )
+        return
+
+    if data.startswith("hmh_acc|"):
+        aid = data.split("|", 1)[1]
+        await safe_edit_message(
+            q,
+            f"Выберите период для почасовой тепловой карты по {get_account_name(aid)}:",
+            reply_markup=heatmap_hourly_periods_kb(aid),
+        )
+        return
+
+    if data.startswith("hmh_p|"):
+        _, aid, mode = data.split("|", 2)
+
+        text_hm, summary = build_hourly_heatmap_for_account(aid, get_account_name, mode)
+
+        await safe_edit_message(q, text_hm)
+
+        # ИИ-анализ почасовой карты с анимацией "бот печатает"
+        chat_id = str(q.message.chat.id)
+        stop_event = asyncio.Event()
+        typing_task = asyncio.create_task(
+            _typing_loop(context.bot, chat_id, stop_event)
+        )
+
+        focus_comment = None
+        try:
+            system_msg = (
+                "Ты — продвинутый аналитик по почасовой активности рекламы. "
+                "Отвечай ТОЛЬКО на русском языке. "
+                "Тебе дана матрица заявок по дням и часам, а также суммарные заявки и затраты. "
+                "Определи лучшие часы по заявкам, 'мёртвые' часы, различия между буднями и выходными (если есть) "
+                "и предложи 2–3 практических рекомендации по бюджетам/ставкам. "
+                "Отвечай кратко (до 5–7 строк обычного текста), без JSON."
+            )
+
+            user_msg = json.dumps(summary, ensure_ascii=False)
+
+            ds_resp = await ask_deepseek(
+                [
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": user_msg},
+                ],
+                json_mode=False,
+            )
+
+            choice = (ds_resp.get("choices") or [{}])[0]
+            focus_comment = (choice.get("message") or {}).get("content")
+        except Exception:
+            focus_comment = None
+        finally:
+            stop_event.set()
+            try:
+                await typing_task
+            except Exception:
+                pass
+
+        if focus_comment:
+            await context.bot.send_message(
+                chat_id,
+                f"🤖 Анализ почасовой тепловой карты:\n{focus_comment.strip()}",
+            )
         return
 
     if data == "choose_acc_settings":
