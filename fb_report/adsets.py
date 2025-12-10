@@ -104,6 +104,40 @@ def fetch_adset_insights_7d(aid: str):
     return list(campaigns.values()), since, until
 
 
+def list_adsets_for_account(aid: str) -> list[dict]:
+    """Возвращает плоский список адсетов аккаунта (id, name).
+
+    Используется в UI настроек CPA-алёртов по адсетам.
+    Берём последние 7 дней и собираем уникальные пары (id, name).
+    """
+
+    campaigns, _since, _until = fetch_adset_insights_7d(aid)
+    seen: dict[str, str] = {}
+    for camp in campaigns:
+        for ad in camp.get("adsets", []) or []:
+            adset_id = ad.get("id")
+            if not adset_id:
+                continue
+            name = ad.get("name") or adset_id
+            if adset_id not in seen:
+                seen[adset_id] = name
+    return [{"id": i, "name": n} for i, n in seen.items()]
+
+
+def get_adset_name(aid: str, adset_id: str) -> str:
+    """Возвращает имя адсета по ID для данного аккаунта.
+
+    Используется в экране настроек CPA-алёртов для конкретного адсета.
+    """
+
+    if not adset_id:
+        return "(adset)"
+    for it in list_adsets_for_account(aid):
+        if it.get("id") == adset_id:
+            return it.get("name", adset_id)
+    return adset_id
+
+
 async def send_adset_report(ctx: ContextTypes.DEFAULT_TYPE, chat_id: str, aid: str):
     campaigns, since, until = fetch_adset_insights_7d(aid)
     if not campaigns:

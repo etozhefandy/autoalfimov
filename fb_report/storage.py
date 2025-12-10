@@ -53,12 +53,54 @@ _ensure_accounts_file()
 # ========= STORES / META ==========
 
 
+def _migrate_alerts_schema(store: dict) -> dict:
+    """Мягкая миграция структуры alerts к новой схеме.
+
+    - Переносит старый target_cpl в account_cpa, если account_cpa ещё не задан.
+    - Устанавливает дефолты для days/freq/ai_enabled, если их нет.
+    """
+
+    for aid, row in (store or {}).items():
+        if not isinstance(row, dict):
+            continue
+        alerts = row.get("alerts") or {}
+        if not isinstance(alerts, dict):
+            alerts = {}
+
+        # Если новая схема ещё не применялась
+        if "account_cpa" not in alerts:
+            old = float(alerts.get("target_cpl", 0.0) or 0.0)
+            if old > 0:
+                alerts["account_cpa"] = old
+        # Дни недели: по умолчанию все включены, чтобы не ломать старое поведение
+        alerts.setdefault(
+            "days",
+            ["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
+        )
+        # Частота по умолчанию — 3 раза в день
+        alerts.setdefault("freq", "3x")
+        # По умолчанию ИИ-анализ включён (как в старой системе с комментариями)
+        alerts.setdefault("ai_enabled", True)
+
+        # Adset-уровень CPA-алёртов: по умолчанию пустой словарь.
+        # Если поле отсутствует, добавляем его как {} для обратной совместимости.
+        alerts.setdefault("adset_alerts", {})
+
+        row["alerts"] = alerts
+        store[aid] = row
+
+    return store
+
+
 def load_accounts() -> dict:
     try:
         with open(ACCOUNTS_JSON, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
     except Exception:
         return {}
+
+    # Мягко мигрируем alerts к новой схеме при каждом чтении
+    return _migrate_alerts_schema(data)
 
 
 def save_accounts(d: dict):
@@ -164,7 +206,26 @@ def upsert_from_bm() -> dict:
                 "name": name,
                 "enabled": True,
                 "metrics": {"messaging": True, "leads": False},
-                "alerts": {"enabled": False, "target_cpl": 0.0},
+                # Новая расширенная схема alerts. Старые поля (target_cpl, enabled)
+                # остаются для обратной совместимости.
+                "alerts": {
+                    "enabled": False,
+                    "target_cpl": 0.0,
+                    "account_cpa": 0.0,
+                    "days": [
+                        "mon",
+                        "tue",
+                        "wed",
+                        "thu",
+                        "fri",
+                        "sat",
+                        "sun",
+                    ],
+                    "freq": "3x",
+                    "ai_enabled": True,
+                    # Adset-уровень CPA-алёртов: по умолчанию пусто.
+                    "adset_alerts": {},
+                },
             }
             added += 1
     save_accounts(store)
