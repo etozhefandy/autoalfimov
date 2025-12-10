@@ -16,7 +16,6 @@ from services.storage import load_local_insights, save_local_insights, period_ke
 # ИНИЦИАЛИЗАЦИЯ FACEBOOK API (один раз для всего проекта)
 if FB_ACCESS_TOKEN:
     # Используем токен без app_id/app_secret, как в config.py.
-    FacebookAdsApi.set_appsecret_proof_enabled(False)
     FacebookAdsApi.init(access_token=FB_ACCESS_TOKEN)
 
 
@@ -182,7 +181,6 @@ def pause_ad(ad_id: str) -> Dict[str, Any]:
 
     if api is None and FB_ACCESS_TOKEN:
         try:
-            FacebookAdsApi.set_appsecret_proof_enabled(False)
             FacebookAdsApi.init(access_token=FB_ACCESS_TOKEN)
         except Exception as e:  # pragma: no cover
             return {
