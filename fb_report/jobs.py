@@ -198,44 +198,46 @@ async def _cpa_alerts_job(context: ContextTypes.DEFAULT_TYPE):
 
         text = f"{header}\n{body}"
 
-        # Пытаемся добавить короткий комментарий Фокус-ИИ (DeepSeek).
-        focus_comment = None
-        try:
-            data_for_analysis = {
-                "account_id": aid,
-                "account_name": acc_name,
-                "date": label,
-                "spend": spend,
-                "total_conversions": total_convs,
-                "cpa": cpa,
-                "target_cpa": target_cpl,
-            }
-
-            system_msg = (
-                "Ты — продвинутый аналитик (Focus-ИИ) для CPA-алёртов. "
-                "Отвечай ТОЛЬКО на русском языке. "
-                "Тебе даны затраты, количество заявок и фактический CPA относительно таргет CPA. "
-                "Кратко оцени ситуацию и предложи одно-два действия: оставить бюджет, мягко повысить/понизить бюджет (10–30%), либо проверить креативы/аудитории. "
-                "Отвечай очень кратко (1–2 предложения) в виде обычного текста, без JSON."
-            )
-
-            user_msg = json.dumps(data_for_analysis, ensure_ascii=False)
-
-            ds_resp = await ask_deepseek(
-                [
-                    {"role": "system", "content": system_msg},
-                    {"role": "user", "content": user_msg},
-                ],
-                json_mode=False,
-            )
-
-            choice = (ds_resp.get("choices") or [{}])[0]
-            focus_comment = (choice.get("message") or {}).get("content")
-        except Exception:
+        # Пытаемся добавить короткий комментарий Фокус-ИИ (DeepSeek),
+        # если включён ai_enabled для аккаунта.
+        if alerts.get("ai_enabled", True):
             focus_comment = None
+            try:
+                data_for_analysis = {
+                    "account_id": aid,
+                    "account_name": acc_name,
+                    "date": label,
+                    "spend": spend,
+                    "total_conversions": total_convs,
+                    "cpa": cpa,
+                    "target_cpa": target_cpl,
+                }
 
-        if focus_comment:
-            text = f"{text}\n\n🤖 Комментарий Фокус-ИИ:\n{focus_comment.strip()}"
+                system_msg = (
+                    "Ты — продвинутый аналитик (Focus-ИИ) для CPA-алёртов. "
+                    "Отвечай ТОЛЬКО на русском языке. "
+                    "Тебе даны затраты, количество заявок и фактический CPA относительно таргет CPA. "
+                    "Кратко оцени ситуацию и предложи одно-два действия: оставить бюджет, мягко повысить/понизить бюджет (10–30%), либо проверить креативы/аудитории. "
+                    "Отвечай очень кратко (1–2 предложения) в виде обычного текста, без JSON."
+                )
+
+                user_msg = json.dumps(data_for_analysis, ensure_ascii=False)
+
+                ds_resp = await ask_deepseek(
+                    [
+                        {"role": "system", "content": system_msg},
+                        {"role": "user", "content": user_msg},
+                    ],
+                    json_mode=False,
+                )
+
+                choice = (ds_resp.get("choices") or [{}])[0]
+                focus_comment = (choice.get("message") or {}).get("content")
+            except Exception:
+                focus_comment = None
+
+            if focus_comment:
+                text = f"{text}\n\n🤖 Комментарий Фокус-ИИ:\n{focus_comment.strip()}"
 
         try:
             await context.bot.send_message(chat_id, text)
