@@ -10,7 +10,7 @@ from services.facebook_api import (
     fetch_campaigns,
 )
 from services.storage import load_accounts
-from config import ALMATY_TZ
+from fb_report.constants import ALMATY_TZ
 
 
 # ============================================================
