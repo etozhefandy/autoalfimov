@@ -644,6 +644,195 @@ def cpa_settings_kb(aid: str):
     return text, InlineKeyboardMarkup(rows)
 
 
+def cpa_campaigns_kb(aid: str) -> InlineKeyboardMarkup:
+    """Список кампаний для настроек CPA-алёртов."""
+
+    st = load_accounts()
+    row = st.get(aid, {"alerts": {}})
+    alerts = row.get("alerts", {}) or {}
+    campaign_alerts = alerts.get("campaign_alerts", {}) or {}
+
+    try:
+        camps = analyze_campaigns(aid, days=7) or []
+    except Exception:
+        camps = []
+
+    kb_rows = []
+    for camp in camps:
+        cid = camp.get("campaign_id")
+        if not cid:
+            continue
+        name = camp.get("name") or cid
+        cfg_c = (campaign_alerts.get(cid) or {}) if cid in campaign_alerts else {}
+        target = float(cfg_c.get("target_cpa") or 0.0)
+        label_suffix = (
+            f"[CPA {target:.2f}$]" if target > 0 else "[CPA аккаунта]"
+        )
+        enabled_c = bool(cfg_c.get("enabled", False))
+        indicator = "⚠️ " if enabled_c else ""
+        text_btn = f"{indicator}{name} {label_suffix}".strip()
+
+        kb_rows.append(
+            [
+                InlineKeyboardButton(
+                    text_btn,
+                    callback_data=f"cpa_campaign|{aid}|{cid}",
+                )
+            ]
+        )
+
+    kb_rows.append(
+        [
+            InlineKeyboardButton(
+                "⬅️ Назад", callback_data=f"cpa_settings|{aid}"
+            )
+        ]
+    )
+
+    return InlineKeyboardMarkup(kb_rows)
+
+
+def cpa_adsets_kb(aid: str) -> InlineKeyboardMarkup:
+    """Список адсетов для настроек CPA-алёртов."""
+
+    st = load_accounts()
+    row = st.get(aid, {"alerts": {}})
+    alerts = row.get("alerts", {}) or {}
+    adset_alerts = alerts.get("adset_alerts", {}) or {}
+
+    from .adsets import list_adsets_for_account
+
+    adsets = list_adsets_for_account(aid)
+
+    try:
+        fb_adsets = fetch_adsets(aid) or []
+    except Exception:
+        fb_adsets = []
+
+    active_adset_ids = {
+        str(r.get("id"))
+        for r in fb_adsets
+        if (r or {}).get("status") == "ACTIVE" and r.get("id")
+    }
+
+    kb_rows = []
+    for it in adsets:
+        adset_id = it.get("id")
+        name = it.get("name", adset_id)
+        cfg = (adset_alerts.get(adset_id) or {}) if adset_id else {}
+
+        target = float(cfg.get("target_cpa") or 0.0)
+        label_suffix = (
+            f"[CPA {target:.2f}$]" if target > 0 else "[CPA аккаунта]"
+        )
+        enabled_a = bool(cfg.get("enabled", False))
+        is_active = adset_id in active_adset_ids
+        indicator = "⚠️ " if (enabled_a and is_active) else ""
+        text_btn = f"{indicator}{name} {label_suffix}".strip()
+
+        kb_rows.append(
+            [
+                InlineKeyboardButton(
+                    text_btn, callback_data=f"cpa_adset|{aid}|{adset_id}"
+                )
+            ]
+        )
+
+    kb_rows.append(
+        [
+            InlineKeyboardButton(
+                "⬅️ Назад", callback_data=f"cpa_settings|{aid}"
+            )
+        ]
+    )
+
+    return InlineKeyboardMarkup(kb_rows)
+
+
+def cpa_ads_kb(aid: str) -> InlineKeyboardMarkup:
+    """Список объявлений для настроек CPA-алёртов."""
+
+    st = load_accounts()
+    row = st.get(aid, {"alerts": {}})
+    alerts = row.get("alerts", {}) or {}
+    ad_alerts = alerts.get("ad_alerts", {}) or {}
+
+    try:
+        ads = analyze_ads(aid, days=7) or []
+    except Exception:
+        ads = []
+
+    try:
+        fb_ads = fetch_ads(aid) or []
+    except Exception:
+        fb_ads = []
+
+    ad_status: dict[str, str] = {}
+    ad_to_adset: dict[str, str] = {}
+    for r in fb_ads:
+        ad_id_raw = str(r.get("id") or "")
+        if not ad_id_raw:
+            continue
+        ad_status[ad_id_raw] = r.get("status") or ""
+        ad_to_adset[ad_id_raw] = str(r.get("adset_id") or "")
+
+    try:
+        fb_adsets = fetch_adsets(aid) or []
+    except Exception:
+        fb_adsets = []
+
+    active_adset_ids = {
+        str(r.get("id"))
+        for r in fb_adsets
+        if (r or {}).get("status") == "ACTIVE" and r.get("id")
+    }
+
+    kb_rows = []
+    for ad in ads:
+        ad_id = ad.get("ad_id") or ad.get("id")
+        if not ad_id:
+            continue
+
+        spend = float(ad.get("spend", 0.0) or 0.0)
+        if ad_id not in ad_alerts and spend <= 0:
+            continue
+
+        status = ad_status.get(str(ad_id), "")
+        adset_id = str(ad.get("adset_id") or ad_to_adset.get(str(ad_id)) or "")
+        adset_active = adset_id in active_adset_ids
+        if status != "ACTIVE" or not adset_active:
+            continue
+
+        name = ad.get("name") or ad_id
+        cfg = ad_alerts.get(ad_id) or {}
+        enabled_ad = bool(cfg.get("enabled", False))
+        target = float(cfg.get("target_cpa") or 0.0)
+        label_suffix = (
+            f"[CPA {target:.2f}$]" if target > 0 else "[CPA вышестоящего уровня]"
+        )
+        indicator = "⚠️ " if enabled_ad else ""
+        text_btn = f"{indicator}{name} {label_suffix}".strip()
+
+        kb_rows.append(
+            [
+                InlineKeyboardButton(
+                    text_btn,
+                    callback_data=f"cpa_ad_cfg|{aid}|{ad_id}",
+                )
+            ]
+        )
+
+    kb_rows.append(
+        [
+            InlineKeyboardButton(
+                "⬅️ Назад", callback_data=f"cpa_settings|{aid}"
+            )
+        ]
+    )
+
+    return InlineKeyboardMarkup(kb_rows)
+
+
 def billing_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
@@ -3250,48 +3439,9 @@ async def on_text_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
         st[aid] = row
         save_accounts(st)
 
-        # После ввода CPA возвращаем пользователя к списку кампаний
-        try:
-            camps = analyze_campaigns(aid, days=7) or []
-        except Exception:
-            camps = []
-
-        campaign_alerts_view = alerts.get("campaign_alerts", {}) or {}
-        kb_rows = []
-        for camp in camps:
-            cid = camp.get("campaign_id")
-            if not cid:
-                continue
-            name = camp.get("name") or cid
-            cfg_c = (campaign_alerts_view.get(cid) or {}) if cid in campaign_alerts_view else {}
-            enabled_c = bool(cfg_c.get("enabled", False))
-            target = float(cfg_c.get("target_cpa") or 0.0)
-            label_suffix = (
-                f"[CPA {target:.2f}$]" if target > 0 else "[CPA аккаунта]"
-            )
-            indicator = "🟢" if enabled_c else "⚪️"
-            text_btn = f"{indicator} {name} {label_suffix}".strip()
-
-            kb_rows.append(
-                [
-                    InlineKeyboardButton(
-                        text_btn,
-                        callback_data=f"cpa_campaign|{aid}|{cid}",
-                    )
-                ]
-            )
-
-        kb_rows.append(
-            [
-                InlineKeyboardButton(
-                    "⬅️ Назад", callback_data=f"cpa_settings|{aid}"
-                )
-            ]
-        )
-
-        text_list = "Выбери кампанию для настройки CPA-алёртов."
+        # После ввода CPA сразу возвращаемся к списку кампаний.
         await update.message.reply_text(
-            text_list, reply_markup=InlineKeyboardMarkup(kb_rows)
+            "✅ CPA для кампании обновлён.", reply_markup=cpa_campaigns_kb(aid)
         )
         return
 
@@ -3327,18 +3477,10 @@ async def on_text_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
         st[aid] = row
         save_accounts(st)
 
-        from .adsets import get_adset_name
-
-        name = get_adset_name(aid, adset_id)
-
-        if new_cpa > 0:
-            await update.message.reply_text(
-                f"✅ CPA для адсета '{name}' обновлён: {new_cpa:.2f} $ (алерты ВКЛ)"
-            )
-        else:
-            await update.message.reply_text(
-                f"✅ CPA для адсета '{name}' установлен 0 — будет наследовать CPA аккаунта"
-            )
+        # После ввода CPA сразу возвращаемся к списку адсетов.
+        await update.message.reply_text(
+            "✅ CPA для адсета обновлён.", reply_markup=cpa_adsets_kb(aid)
+        )
         return
 
     if "await_cpa_ad_for" in context.user_data:
@@ -3372,53 +3514,9 @@ async def on_text_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
         st[aid] = row
         save_accounts(st)
 
-        # После ввода CPA возвращаем пользователя к списку объявлений
-        try:
-            ads = analyze_ads(aid, days=7) or []
-        except Exception:
-            ads = []
-
-        ad_alerts_view = alerts.get("ad_alerts", {}) or {}
-        kb_rows = []
-        for ad in ads:
-            ad_row_id = ad.get("ad_id") or ad.get("id")
-            if not ad_row_id:
-                continue
-
-            spend = float(ad.get("spend", 0.0) or 0.0)
-            if ad_row_id not in ad_alerts_view and spend <= 0:
-                continue
-
-            name = ad.get("name") or ad_row_id
-            cfg_row = ad_alerts_view.get(ad_row_id) or {}
-            enabled_row = bool(cfg_row.get("enabled", False))
-            target_row = float(cfg_row.get("target_cpa") or 0.0)
-            label_suffix = (
-                f"[CPA {target_row:.2f}$]" if target_row > 0 else "[CPA вышестоящего уровня]"
-            )
-            indicator = "🟢" if enabled_row else "⚪️"
-            text_btn = f"{indicator} {name} {label_suffix}".strip()
-
-            kb_rows.append(
-                [
-                    InlineKeyboardButton(
-                        text_btn,
-                        callback_data=f"cpa_ad_cfg|{aid}|{ad_row_id}",
-                    )
-                ]
-            )
-
-        kb_rows.append(
-            [
-                InlineKeyboardButton(
-                    "⬅️ Назад", callback_data=f"cpa_settings|{aid}"
-                )
-            ]
-        )
-
-        text_list = "Выбери объявление для настройки CPA-алёртов."
+        # После ввода CPA сразу возвращаемся к списку объявлений.
         await update.message.reply_text(
-            text_list, reply_markup=InlineKeyboardMarkup(kb_rows)
+            "✅ CPA для объявления обновлён.", reply_markup=cpa_ads_kb(aid)
         )
         return
 
