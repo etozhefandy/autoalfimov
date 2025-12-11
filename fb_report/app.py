@@ -55,7 +55,7 @@ from .billing import send_billing, send_billing_forecast, billing_digest_job
 from .jobs import full_daily_scan_job, daily_report_job, schedule_cpa_alerts, _resolve_account_cpa
 
 from services.analytics import analyze_campaigns, analyze_adsets, analyze_account, analyze_ads
-from services.facebook_api import pause_ad
+from services.facebook_api import pause_ad, fetch_adsets, fetch_ads
 from services.ai_focus import get_focus_comment, ask_deepseek
 from monitor_anomalies import build_anomaly_messages_for_account
 import json
@@ -713,7 +713,19 @@ def _flag_line(aid: str) -> str:
     on = "🟢" if enabled else "🔴"
     mm = "💬" if m.get("messaging") else ""
     ll = "♿️" if m.get("leads") else ""
-    aa = "⚠️" if a.get("enabled") and (a.get("target_cpl", 0) or 0) > 0 else ""
+    # CPA-индикатор: включён ли CPA-алёрт на любом уровне (аккаунт/кампания/адсет/объявление).
+    account_cpa_val = float(a.get("account_cpa", a.get("target_cpl", 0.0)) or 0.0)
+    base_enabled = bool(a.get("enabled", False)) and account_cpa_val > 0
+
+    camp_alerts = a.get("campaign_alerts", {}) or {}
+    adset_alerts = a.get("adset_alerts", {}) or {}
+    ad_alerts = a.get("ad_alerts", {}) or {}
+
+    camp_on = any(bool((cfg or {}).get("enabled", False)) for cfg in camp_alerts.values())
+    adset_on = any(bool((cfg or {}).get("enabled", False)) for cfg in adset_alerts.values())
+    ad_on = any(bool((cfg or {}).get("enabled", False)) for cfg in ad_alerts.values())
+
+    aa = "⚠️" if (base_enabled or camp_on or adset_on or ad_on) else ""
     return f"{on} {mm}{ll}{aa}".strip()
 
 
@@ -2322,13 +2334,14 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 continue
             name = camp.get("name") or cid
             cfg_c = (campaign_alerts.get(cid) or {}) if cid in campaign_alerts else {}
-            enabled_c = bool(cfg_c.get("enabled", False))
             target = float(cfg_c.get("target_cpa") or 0.0)
             label_suffix = (
                 f"[CPA {target:.2f}$]" if target > 0 else "[CPA аккаунта]"
             )
-            indicator = "🟢" if enabled_c else "⚪️"
-            text_btn = f"{indicator} {name} {label_suffix}".strip()
+            enabled_c = bool(cfg_c.get("enabled", False))
+            # В списке кампаний: один индикатор ⚠️, если CPA-алёрт для кампании включён.
+            indicator = "⚠️ " if enabled_c else ""
+            text_btn = f"{indicator}{name} {label_suffix}".strip()
 
             kb_rows.append(
                 [
@@ -2569,6 +2582,18 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         adsets = list_adsets_for_account(aid)
 
+        # Берём статусы адсетов из Facebook API, чтобы понимать активность.
+        try:
+            fb_adsets = fetch_adsets(aid) or []
+        except Exception:
+            fb_adsets = []
+
+        active_adset_ids = {
+            str(row.get("id"))
+            for row in fb_adsets
+            if (row or {}).get("status") == "ACTIVE" and row.get("id")
+        }
+
         kb_rows = []
         for it in adsets:
             adset_id = it.get("id")
@@ -2579,7 +2604,11 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             label_suffix = (
                 f"[CPA {target:.2f}$]" if target > 0 else "[CPA аккаунта]"
             )
-            text_btn = f"{name} {label_suffix}".strip()
+            enabled_a = bool(cfg.get("enabled", False))
+            is_active = adset_id in active_adset_ids
+            # В списке адсетов показываем ⚠️ только если адсет активен и его CPA-алёрт включён.
+            indicator = "⚠️ " if (enabled_a and is_active) else ""
+            text_btn = f"{indicator}{name} {label_suffix}".strip()
 
             kb_rows.append(
                 [
@@ -2698,10 +2727,38 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         alerts = row.get("alerts", {}) or {}
         ad_alerts = alerts.get("ad_alerts", {}) or {}
 
+        # Метрики по объявлениям для CPA и названий
         try:
             ads = analyze_ads(aid, days=7) or []
         except Exception:
             ads = []
+
+        # Метаданные объявлений и адсетов для статуса активности
+        try:
+            fb_ads = fetch_ads(aid) or []
+        except Exception:
+            fb_ads = []
+
+        ad_status: dict[str, str] = {}
+        ad_to_adset: dict[str, str] = {}
+        for row in fb_ads:
+            ad_id_raw = str(row.get("id") or "")
+            if not ad_id_raw:
+                continue
+            ad_status[ad_id_raw] = row.get("status") or ""
+            ad_to_adset[ad_id_raw] = str(row.get("adset_id") or "")
+
+        # Статусы адсетов
+        try:
+            fb_adsets = fetch_adsets(aid) or []
+        except Exception:
+            fb_adsets = []
+
+        active_adset_ids = {
+            str(row.get("id"))
+            for row in fb_adsets
+            if (row or {}).get("status") == "ACTIVE" and row.get("id")
+        }
 
         kb_rows = []
         for ad in ads:
@@ -2713,6 +2770,14 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if ad_id not in ad_alerts and spend <= 0:
                 continue
 
+            status = ad_status.get(str(ad_id), "")
+            adset_id = str(ad.get("adset_id") or ad_to_adset.get(str(ad_id)) or "")
+            adset_active = adset_id in active_adset_ids
+
+            # В списке объявлений показываем только активные креативы с активным адсетом.
+            if status != "ACTIVE" or not adset_active:
+                continue
+
             name = ad.get("name") or ad_id
             cfg = ad_alerts.get(ad_id) or {}
             enabled_ad = bool(cfg.get("enabled", False))
@@ -2720,8 +2785,9 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             label_suffix = (
                 f"[CPA {target:.2f}$]" if target > 0 else "[CPA вышестоящего уровня]"
             )
-            indicator = "🟢" if enabled_ad else "⚪️"
-            text_btn = f"{indicator} {name} {label_suffix}".strip()
+            # Индикатор ⚠️ только если объявление активно, его адсет активен и алёрт включён.
+            indicator = "⚠️ " if enabled_ad else ""
+            text_btn = f"{indicator}{name} {label_suffix}".strip()
 
             kb_rows.append(
                 [
