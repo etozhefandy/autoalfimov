@@ -2439,7 +2439,17 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Отвечай кратко (до 5–7 строк обычного текста), без JSON."
             )
 
-            user_msg = json.dumps(summary, ensure_ascii=False)
+            summary_for_ai = dict(summary or {})
+            try:
+                raw = json.dumps(summary_for_ai, ensure_ascii=False)
+                if len(raw) > 30000:
+                    days = summary_for_ai.get("days") or []
+                    summary_for_ai["days"] = days[-3:]
+                    raw = json.dumps(summary_for_ai, ensure_ascii=False)
+            except Exception:
+                raw = json.dumps(summary, ensure_ascii=False)
+
+            user_msg = raw
 
             ds_resp = await ask_deepseek(
                 [

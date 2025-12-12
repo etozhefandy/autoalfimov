@@ -41,7 +41,7 @@ def deepseek_chat(
     if extra_params:
         payload.update(extra_params)
 
-    resp = requests.post(url, headers=headers, json=payload, timeout=20)
+    resp = requests.post(url, headers=headers, json=payload, timeout=12)
     resp.raise_for_status()
     return resp.json()
 
@@ -120,7 +120,7 @@ async def ask_deepseek(messages: List[Dict[str, str]], json_mode: bool = False) 
         payload["response_format"] = {"type": "json_object"}
 
     def _do_request() -> Dict[str, Any]:
-        resp = requests.post(url, headers=headers, json=payload, timeout=60)
+        resp = requests.post(url, headers=headers, json=payload, timeout=12)
         resp.raise_for_status()
         return resp.json()
 
