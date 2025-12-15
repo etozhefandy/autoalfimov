@@ -1696,7 +1696,10 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if status != "ok":
             text_lines.append("\n⚠️ При обработке запроса возникла ошибка, проверь данные вручную.")
 
-        await update.message.reply_text(
+        # Мы находимся внутри callback-хэндлера, поэтому update.message == None.
+        # Отправляем ответ через bot.send_message в текущий чат.
+        await context.bot.send_message(
+            chat_id,
             "\n".join(text_lines),
             reply_markup=focus_ai_recommendation_kb(level, rec, float(delta), objects),
         )
