@@ -1,8 +1,23 @@
 import os
 import asyncio
+import json
+import time
 from typing import Any, Dict, List, Optional
 
 import requests
+
+
+print("[ai_focus] loaded from:", __file__)
+
+
+def _dbg_env() -> None:
+    keys = ["DS_FOCUS", "DS_focus", "DS-focus"]
+    present = {k: bool(os.getenv(k)) for k in keys}
+    print("[ai_focus] env present:", present)
+
+
+_dbg_env()
+
 
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 DEEPSEEK_ENDPOINT = os.getenv("DEEPSEEK_ENDPOINT", "/v1/chat/completions")
@@ -10,7 +25,11 @@ DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 
 
 def _get_api_key() -> str | None:
-    return os.getenv("DS-focus")
+    return (
+        os.getenv("DS_FOCUS")
+        or os.getenv("DS_focus")
+        or os.getenv("DS-focus")
+    )
 
 
 def deepseek_chat(
@@ -41,9 +60,28 @@ def deepseek_chat(
     if extra_params:
         payload.update(extra_params)
 
-    resp = requests.post(url, headers=headers, json=payload, timeout=12)
-    resp.raise_for_status()
-    return resp.json()
+    t0 = time.time()
+    try:
+        raw = json.dumps(payload, ensure_ascii=False)
+        print("[ai_focus] deepseek_chat start len=", len(raw))
+    except Exception:
+        print("[ai_focus] deepseek_chat start (len=unknown)")
+
+    try:
+        resp = requests.post(
+            url,
+            headers=headers,
+            json=payload,
+            timeout=(5, 15),  # connect, read
+        )
+        elapsed = round(time.time() - t0, 2)
+        print("[ai_focus] deepseek_chat status=", resp.status_code, "elapsed=", elapsed)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        elapsed = round(time.time() - t0, 2)
+        print("[ai_focus] deepseek_chat error=", repr(e), "elapsed=", elapsed)
+        raise
 
 
 def get_focus_comment(context: Dict[str, Any]) -> str:
@@ -101,9 +139,9 @@ async def ask_deepseek(messages: List[Dict[str, str]], json_mode: bool = False) 
     включает JSON-режим ответа через response_format.
     """
 
-    api_key = os.getenv("DS-focus")
+    api_key = _get_api_key()
     if not api_key:
-        raise RuntimeError("DeepSeek API key is missing (DS-focus)")
+        raise RuntimeError("DeepSeek API key is missing (DS_FOCUS/DS-focus)")
 
     url = f"{DEEPSEEK_BASE_URL.rstrip('/')}{DEEPSEEK_ENDPOINT}"
     headers = {
@@ -120,16 +158,35 @@ async def ask_deepseek(messages: List[Dict[str, str]], json_mode: bool = False) 
         payload["response_format"] = {"type": "json_object"}
 
     def _do_request() -> Dict[str, Any]:
-        resp = requests.post(url, headers=headers, json=payload, timeout=12)
-        resp.raise_for_status()
-        return resp.json()
+        t0 = time.time()
+        try:
+            raw = json.dumps(payload, ensure_ascii=False)
+            print("[ai_focus] ask_deepseek start len=", len(raw))
+        except Exception:
+            print("[ai_focus] ask_deepseek start (len=unknown)")
+
+        try:
+            resp = requests.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=(5, 15),  # connect, read
+            )
+            elapsed = round(time.time() - t0, 2)
+            print("[ai_focus] ask_deepseek status=", resp.status_code, "elapsed=", elapsed)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            elapsed = round(time.time() - t0, 2)
+            print("[ai_focus] ask_deepseek error=", repr(e), "elapsed=", elapsed)
+            raise
 
     return await asyncio.to_thread(_do_request)
 
 
 # ======== Продвинутые настройки DeepSeek для Focus-ИИ (WS) ========
 
-DEEPSEEK_API_KEY = os.getenv("DS-focus")
+DEEPSEEK_API_KEY = _get_api_key()
 DEEPSEEK_MODEL = "deepseek-reasoner"
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEEPSEEK_CHAT_COMPLETIONS = "/v1/chat/completions"
