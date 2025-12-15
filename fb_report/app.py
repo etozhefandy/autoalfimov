@@ -953,6 +953,16 @@ def settings_kb(aid: str) -> InlineKeyboardMarkup:
     a_on = st.get("alerts", {}).get("enabled", False) and (
         st.get("alerts", {}).get("target_cpl", 0) or 0
     ) > 0
+
+    mr = st.get("morning_report") or {}
+    mr_enabled = bool(mr.get("enabled", True))
+    levels = mr.get("levels") or {}
+    mr_acc = bool(levels.get("account", True))
+    mr_camp = bool(levels.get("campaigns", False))
+    mr_adset = bool(levels.get("adsets", False))
+
+    mr_en_text = "🌅 Утренний отчёт: ВКЛ" if mr_enabled else "🌅 Утренний отчёт: ВЫКЛ"
+
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton(en_text, callback_data=f"toggle_enabled|{aid}")],
@@ -981,6 +991,25 @@ def settings_kb(aid: str) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     "✏️ Задать target CPA", callback_data=f"set_cpa|{aid}"
                 )
+            ],
+            [
+                InlineKeyboardButton(
+                    mr_en_text, callback_data=f"mr_toggle|{aid}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    ("✅ " if mr_acc else "") + "Аккаунт",
+                    callback_data=f"mr_level|{aid}|account",
+                ),
+                InlineKeyboardButton(
+                    ("✅ " if mr_camp else "") + "Кампании",
+                    callback_data=f"mr_level|{aid}|campaigns",
+                ),
+                InlineKeyboardButton(
+                    ("✅ " if mr_adset else "") + "Адсеты",
+                    callback_data=f"mr_level|{aid}|adsets",
+                ),
             ],
             [
                 InlineKeyboardButton(
@@ -1208,6 +1237,58 @@ async def _on_cb_internal(
 
     if data == "menu":
         await safe_edit_message(q, "🤖 Выберите действие:", reply_markup=main_menu())
+        return
+
+    if data.startswith("mr_toggle|"):
+        aid = data.split("|", 1)[1]
+        st = load_accounts()
+        row = st.get(aid, {})
+        mr = row.get("morning_report") or {}
+        if not mr:
+            mr = {
+                "enabled": True,
+                "levels": {
+                    "account": True,
+                    "campaigns": False,
+                    "adsets": False,
+                },
+            }
+        mr["enabled"] = not bool(mr.get("enabled", True))
+        row["morning_report"] = mr
+        st[aid] = row
+        save_accounts(st)
+
+        await q.edit_message_text(
+            f"Настройки: {get_account_name(aid)}",
+            reply_markup=settings_kb(aid),
+        )
+        return
+
+    if data.startswith("mr_level|"):
+        _, aid, level_key = data.split("|", 3)
+        if level_key not in ("account", "campaigns", "adsets"):
+            return
+
+        st = load_accounts()
+        row = st.get(aid, {})
+        mr = row.get("morning_report") or {}
+        levels = mr.get("levels") or {}
+
+        cur = bool(levels.get(level_key, level_key == "account"))
+        levels[level_key] = not cur
+        mr["levels"] = levels
+        # Гарантируем, что хотя бы уровень "account" включён по умолчанию,
+        # чтобы отчёт не оказался совсем пустым.
+        if not any(levels.get(k, False) for k in ("account", "campaigns", "adsets")):
+            levels["account"] = True
+            mr["levels"] = levels
+
+        row["morning_report"] = mr
+        st[aid] = row
+        save_accounts(st)
+
+        new_data = f"morning_report|{aid}"
+        await _on_cb_internal(update, context, q, chat_id, new_data)
         return
 
     # ==== CPA-алёрты по объявлениям: тихий режим и выключение ====
