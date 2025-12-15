@@ -60,28 +60,60 @@ def deepseek_chat(
     if extra_params:
         payload.update(extra_params)
 
-    t0 = time.time()
-    try:
-        raw = json.dumps(payload, ensure_ascii=False)
-        print("[ai_focus] deepseek_chat start len=", len(raw))
-    except Exception:
-        print("[ai_focus] deepseek_chat start (len=unknown)")
+    # Один запрос + 1 повтор с небольшим backoff, чтобы не висеть бесконечно.
+    last_err: Exception | None = None
+    for attempt in range(2):
+        t0 = time.time()
+        try:
+            raw = json.dumps(payload, ensure_ascii=False)
+            print(
+                "[ai_focus] deepseek_chat start attempt=",
+                attempt + 1,
+                "len=",
+                len(raw),
+            )
+        except Exception:
+            print(
+                "[ai_focus] deepseek_chat start attempt=",
+                attempt + 1,
+                "(len=unknown)",
+            )
 
-    try:
-        resp = requests.post(
-            url,
-            headers=headers,
-            json=payload,
-            timeout=(5, 15),  # connect, read
-        )
-        elapsed = round(time.time() - t0, 2)
-        print("[ai_focus] deepseek_chat status=", resp.status_code, "elapsed=", elapsed)
-        resp.raise_for_status()
-        return resp.json()
-    except Exception as e:
-        elapsed = round(time.time() - t0, 2)
-        print("[ai_focus] deepseek_chat error=", repr(e), "elapsed=", elapsed)
-        raise
+        try:
+            resp = requests.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=(5, 30),  # connect, read
+            )
+            elapsed = round(time.time() - t0, 2)
+            print(
+                "[ai_focus] deepseek_chat status=",
+                resp.status_code,
+                "elapsed=",
+                elapsed,
+                "attempt=",
+                attempt + 1,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            last_err = e
+            elapsed = round(time.time() - t0, 2)
+            print(
+                "[ai_focus] deepseek_chat error=",
+                repr(e),
+                "elapsed=",
+                elapsed,
+                "attempt=",
+                attempt + 1,
+            )
+            if attempt == 0:
+                time.sleep(2.0)
+
+    # Если обе попытки не удались — пробрасываем последнюю ошибку.
+    assert last_err is not None
+    raise last_err
 
 
 def get_focus_comment(context: Dict[str, Any]) -> str:
@@ -158,28 +190,58 @@ async def ask_deepseek(messages: List[Dict[str, str]], json_mode: bool = False) 
         payload["response_format"] = {"type": "json_object"}
 
     def _do_request() -> Dict[str, Any]:
-        t0 = time.time()
-        try:
-            raw = json.dumps(payload, ensure_ascii=False)
-            print("[ai_focus] ask_deepseek start len=", len(raw))
-        except Exception:
-            print("[ai_focus] ask_deepseek start (len=unknown)")
+        last_err: Exception | None = None
+        for attempt in range(2):
+            t0 = time.time()
+            try:
+                raw = json.dumps(payload, ensure_ascii=False)
+                print(
+                    "[ai_focus] ask_deepseek start attempt=",
+                    attempt + 1,
+                    "len=",
+                    len(raw),
+                )
+            except Exception:
+                print(
+                    "[ai_focus] ask_deepseek start attempt=",
+                    attempt + 1,
+                    "(len=unknown)",
+                )
 
-        try:
-            resp = requests.post(
-                url,
-                headers=headers,
-                json=payload,
-                timeout=(5, 15),  # connect, read
-            )
-            elapsed = round(time.time() - t0, 2)
-            print("[ai_focus] ask_deepseek status=", resp.status_code, "elapsed=", elapsed)
-            resp.raise_for_status()
-            return resp.json()
-        except Exception as e:
-            elapsed = round(time.time() - t0, 2)
-            print("[ai_focus] ask_deepseek error=", repr(e), "elapsed=", elapsed)
-            raise
+            try:
+                resp = requests.post(
+                    url,
+                    headers=headers,
+                    json=payload,
+                    timeout=(5, 30),  # connect, read
+                )
+                elapsed = round(time.time() - t0, 2)
+                print(
+                    "[ai_focus] ask_deepseek status=",
+                    resp.status_code,
+                    "elapsed=",
+                    elapsed,
+                    "attempt=",
+                    attempt + 1,
+                )
+                resp.raise_for_status()
+                return resp.json()
+            except Exception as e:
+                last_err = e
+                elapsed = round(time.time() - t0, 2)
+                print(
+                    "[ai_focus] ask_deepseek error=",
+                    repr(e),
+                    "elapsed=",
+                    elapsed,
+                    "attempt=",
+                    attempt + 1,
+                )
+                if attempt == 0:
+                    time.sleep(2.0)
+
+        assert last_err is not None
+        raise last_err
 
     return await asyncio.to_thread(_do_request)
 

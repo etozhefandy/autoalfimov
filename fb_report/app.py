@@ -2464,8 +2464,12 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             choice = (ds_resp.get("choices") or [{}])[0]
             focus_comment = (choice.get("message") or {}).get("content")
-        except Exception:
-            focus_comment = None
+        except Exception as e:
+            # Явно помечаем, что ИИ-анализ недоступен, чтобы пользователь видел причину.
+            focus_comment = (
+                "Фокус-ИИ по тепловой карте сейчас недоступен (ошибка ИИ-сервиса). "
+                f"Причина: {type(e).__name__}. Данные выше показаны без анализа."
+            )
         finally:
             stop_event.set()
             try:

@@ -727,8 +727,11 @@ async def _cpa_alerts_job(context: ContextTypes.DEFAULT_TYPE):
 
                 choice = (ds_resp.get("choices") or [{}])[0]
                 focus_comment = (choice.get("message") or {}).get("content")
-            except Exception:
-                focus_comment = None
+            except Exception as e:
+                focus_comment = (
+                    "Фокус-ИИ сейчас недоступен для этого CPA-алёрта "
+                    f"(ошибка {type(e).__name__}). Оцени ситуацию по цифрам выше."
+                )
 
             if focus_comment:
                 text = f"{text}\n\n🤖 Комментарий Фокус-ИИ:\n{focus_comment.strip()}"
