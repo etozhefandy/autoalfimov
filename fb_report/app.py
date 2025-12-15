@@ -1191,6 +1191,16 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = q.data or ""
     chat_id = str(q.message.chat.id)
 
+    await _on_cb_internal(update, context, q, chat_id, data)
+
+
+async def _on_cb_internal(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    q,
+    chat_id: str,
+    data: str,
+):
     if data == "version":
         text = _build_version_text()
         await context.bot.send_message(chat_id, text)
@@ -2658,9 +2668,8 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_accounts(st)
 
         # После переключения статуса возвращаемся к списку кампаний
-        data = f"cpa_campaigns|{aid}"
-        update.callback_query.data = data
-        await on_cb(update, context)
+        new_data = f"cpa_campaigns|{aid}"
+        await _on_cb_internal(update, context, q, chat_id, new_data)
         return
 
     if data.startswith("cpa_campaign_set|"):
@@ -2708,9 +2717,8 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         st[aid] = row
         save_accounts(st)
 
-        data = f"cpa_campaign|{aid}|{campaign_id}"
-        update.callback_query.data = data
-        await on_cb(update, context)
+        new_data = f"cpa_campaign|{aid}|{campaign_id}"
+        await _on_cb_internal(update, context, q, chat_id, new_data)
         return
 
     if data.startswith("cpa_ai|"):
@@ -2920,9 +2928,8 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_accounts(st)
 
         # Перерисовываем экран настроек адсета
-        data = f"cpa_adset|{aid}|{adset_id}"
-        update.callback_query.data = data
-        await on_cb(update, context)
+        new_data = f"cpa_adset|{aid}|{adset_id}"
+        await _on_cb_internal(update, context, q, chat_id, new_data)
         return
 
     if data.startswith("cpa_ads|"):
@@ -3119,9 +3126,8 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_accounts(st)
 
         # После переключения статуса возвращаемся к списку объявлений
-        data = f"cpa_ads|{aid}"
-        update.callback_query.data = data
-        await on_cb(update, context)
+        new_data = f"cpa_ads|{aid}"
+        await _on_cb_internal(update, context, q, chat_id, new_data)
         return
 
     if data.startswith("cpa_ad_cfg_set|"):
@@ -3166,9 +3172,8 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         st[aid] = row
         save_accounts(st)
 
-        data = f"cpa_ad_cfg|{aid}|{ad_id}"
-        update.callback_query.data = data
-        await on_cb(update, context)
+        new_data = f"cpa_ad_cfg|{aid}|{ad_id}"
+        await _on_cb_internal(update, context, q, chat_id, new_data)
         return
 
     if data.startswith("cpa_adset_set|"):
@@ -3214,9 +3219,8 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         st[aid] = row
         save_accounts(st)
 
-        data = f"cpa_adset|{aid}|{adset_id}"
-        update.callback_query.data = data
-        await on_cb(update, context)
+        new_data = f"cpa_adset|{aid}|{adset_id}"
+        await _on_cb_internal(update, context, q, chat_id, new_data)
         return
 
     if data.startswith("toggle_m|"):
