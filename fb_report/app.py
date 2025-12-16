@@ -1287,8 +1287,10 @@ async def _on_cb_internal(
         st[aid] = row
         save_accounts(st)
 
-        new_data = f"morning_report|{aid}"
-        await _on_cb_internal(update, context, q, chat_id, new_data)
+        await q.edit_message_text(
+            f"Настройки: {get_account_name(aid)}",
+            reply_markup=settings_kb(aid),
+        )
         return
 
     # ==== CPA-алёрты по объявлениям: тихий режим и выключение ====
