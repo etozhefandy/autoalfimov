@@ -4,3 +4,5 @@ fx_cache.json
 forecast_cache.json
 accounts.json
 ad_accounts.json
+
+.DS_Store
