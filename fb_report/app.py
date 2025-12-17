@@ -955,13 +955,15 @@ def settings_kb(aid: str) -> InlineKeyboardMarkup:
     ) > 0
 
     mr = st.get("morning_report") or {}
-    mr_enabled = bool(mr.get("enabled", True))
-    levels = mr.get("levels") or {}
-    mr_acc = bool(levels.get("account", True))
-    mr_camp = bool(levels.get("campaigns", False))
-    mr_adset = bool(levels.get("adsets", False))
+    level = str(mr.get("level", "ACCOUNT")).upper()
+    level_human = {
+        "OFF": "Выкл",
+        "ACCOUNT": "Аккаунт",
+        "CAMPAIGN": "Кампании",
+        "ADSET": "Адсеты",
+    }.get(level, "Аккаунт")
 
-    mr_en_text = "🌅 Утренний отчёт: ВКЛ" if mr_enabled else "🌅 Утренний отчёт: ВЫКЛ"
+    mr_text = f"🌅 Утренний отчёт: {level_human}"
 
     return InlineKeyboardMarkup(
         [
@@ -994,22 +996,9 @@ def settings_kb(aid: str) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
-                    mr_en_text, callback_data=f"mr_toggle|{aid}"
+                    mr_text,
+                    callback_data=f"mr_menu|{aid}",
                 )
-            ],
-            [
-                InlineKeyboardButton(
-                    ("✅ " if mr_acc else "") + "Аккаунт",
-                    callback_data=f"mr_level|{aid}|account",
-                ),
-                InlineKeyboardButton(
-                    ("✅ " if mr_camp else "") + "Кампании",
-                    callback_data=f"mr_level|{aid}|campaigns",
-                ),
-                InlineKeyboardButton(
-                    ("✅ " if mr_adset else "") + "Адсеты",
-                    callback_data=f"mr_level|{aid}|adsets",
-                ),
             ],
             [
                 InlineKeyboardButton(
@@ -1239,55 +1228,85 @@ async def _on_cb_internal(
         await safe_edit_message(q, "🤖 Выберите действие:", reply_markup=main_menu())
         return
 
-    if data.startswith("mr_toggle|"):
+    if data.startswith("mr_menu|"):
         aid = data.split("|", 1)[1]
         st = load_accounts()
         row = st.get(aid, {})
         mr = row.get("morning_report") or {}
-        if not mr:
-            mr = {
-                "enabled": True,
-                "levels": {
-                    "account": True,
-                    "campaigns": False,
-                    "adsets": False,
-                },
-            }
-        mr["enabled"] = not bool(mr.get("enabled", True))
-        row["morning_report"] = mr
-        st[aid] = row
-        save_accounts(st)
+        level = str(mr.get("level", "ACCOUNT")).upper()
 
-        await q.edit_message_text(
-            f"Настройки: {get_account_name(aid)}",
-            reply_markup=settings_kb(aid),
+        kb = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "❌ Выкл",
+                        callback_data=f"mr_level|{aid}|OFF",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🏦 Аккаунт",
+                        callback_data=f"mr_level|{aid}|ACCOUNT",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "📣 Кампании",
+                        callback_data=f"mr_level|{aid}|CAMPAIGN",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🧩 Адсеты",
+                        callback_data=f"mr_level|{aid}|ADSET",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "⬅️ Назад",
+                        callback_data=f"set1|{aid}",
+                    )
+                ],
+            ]
+        )
+
+        await safe_edit_message(
+            q,
+            "Выберите уровень утреннего отчёта:",
+            reply_markup=kb,
         )
         return
 
     if data.startswith("mr_level|"):
-        _, aid, level_key = data.split("|", 3)
-        if level_key not in ("account", "campaigns", "adsets"):
+        try:
+            _prefix, aid, lvl = data.split("|", 2)
+        except ValueError:
+            await q.answer("Некорректные данные уровня утреннего отчёта.", show_alert=True)
+            return
+
+        lvl = str(lvl).upper()
+        if lvl not in {"OFF", "ACCOUNT", "CAMPAIGN", "ADSET"}:
+            await q.answer("Неизвестный уровень утреннего отчёта.", show_alert=True)
             return
 
         st = load_accounts()
         row = st.get(aid, {})
         mr = row.get("morning_report") or {}
-        levels = mr.get("levels") or {}
-
-        cur = bool(levels.get(level_key, level_key == "account"))
-        levels[level_key] = not cur
-        mr["levels"] = levels
-        # Гарантируем, что хотя бы уровень "account" включён по умолчанию,
-        # чтобы отчёт не оказался совсем пустым.
-        if not any(levels.get(k, False) for k in ("account", "campaigns", "adsets")):
-            levels["account"] = True
-            mr["levels"] = levels
-
+        mr["level"] = lvl
         row["morning_report"] = mr
         st[aid] = row
         save_accounts(st)
 
-        await q.edit_message_text(
+        human = {
+            "OFF": "Выкл",
+            "ACCOUNT": "Аккаунт",
+            "CAMPAIGN": "Кампании",
+            "ADSET": "Адсеты",
+        }.get(lvl, "Аккаунт")
+
+        await q.answer(f"Уровень утреннего отчёта: {human}")
+        await safe_edit_message(
+            q,
             f"Настройки: {get_account_name(aid)}",
             reply_markup=settings_kb(aid),
         )

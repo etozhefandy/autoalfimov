@@ -105,6 +105,64 @@ def _migrate_alerts_schema(store: dict) -> dict:
     return store
 
 
+def _migrate_morning_report_schema(store: dict) -> dict:
+    """Мягкая миграция блока morning_report к новой схеме с полем level.
+
+    Новая истина:
+    - row["morning_report"]["level"] в одном из значений
+      {"OFF", "ACCOUNT", "CAMPAIGN", "ADSET"}.
+
+    Обратная совместимость:
+    - если level отсутствует, но есть enabled:
+        * enabled == False  -> level = "OFF"
+        * enabled == True   -> level = "ACCOUNT" (дефолт)
+    - если level отсутствует и есть levels.account/campaigns/adsets, то
+      выбираем максимально детализированный включённый уровень:
+        * adsets -> "ADSET"
+        * campaigns -> "CAMPAIGN"
+        * иначе -> "ACCOUNT".
+    """
+
+    VALID_LEVELS = {"OFF", "ACCOUNT", "CAMPAIGN", "ADSET"}
+
+    for aid, row in (store or {}).items():
+        if not isinstance(row, dict):
+            continue
+
+        mr = row.get("morning_report") or {}
+        if not isinstance(mr, dict):
+            mr = {}
+
+        level_raw = mr.get("level")
+
+        if level_raw is None:
+            enabled = mr.get("enabled")
+            levels = mr.get("levels") or {}
+
+            if enabled is False:
+                level = "OFF"
+            else:
+                # Если явно включены уровни, берём максимально детализированный.
+                if bool(levels.get("adsets")):
+                    level = "ADSET"
+                elif bool(levels.get("campaigns")):
+                    level = "CAMPAIGN"
+                else:
+                    # enabled == True или не задан → считаем, что нужен аккаунт.
+                    level = "ACCOUNT"
+        else:
+            level = str(level_raw).upper()
+
+        if level not in VALID_LEVELS:
+            level = "ACCOUNT"
+
+        mr["level"] = level
+        row["morning_report"] = mr
+        store[aid] = row
+
+    return store
+
+
 def load_accounts() -> dict:
     try:
         with open(ACCOUNTS_JSON, "r", encoding="utf-8") as f:
@@ -113,7 +171,12 @@ def load_accounts() -> dict:
         return {}
 
     # Мягко мигрируем alerts к новой схеме при каждом чтении
-    return _migrate_alerts_schema(data)
+    store = _migrate_alerts_schema(data)
+
+    # Мягкая миграция схемы morning_report к полю level
+    store = _migrate_morning_report_schema(store)
+
+    return store
 
 
 def save_accounts(d: dict):

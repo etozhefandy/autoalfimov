@@ -72,9 +72,13 @@ def _yesterday_period():
 async def full_daily_scan_job(context: ContextTypes.DEFAULT_TYPE):
     """Утренний отчёт (🌅): вчера vs позавчера по уровням.
 
-    Настройки берутся из row["morning_report"]:
-    - enabled: вкл/выкл отчёт;
-    - levels.account / campaigns / adsets: какие блоки показывать.
+    Настройки берутся из row["morning_report"]["level"], где level один из
+    OFF / ACCOUNT / CAMPAIGN / ADSET:
+
+    - OFF      — отчёт не отправляется;
+    - ACCOUNT  — только итоговый блок по аккаунту;
+    - CAMPAIGN — аккаунт + проблемные кампании;
+    - ADSET    — аккаунт + проблемные кампании + проблемные адсеты.
 
     Пороги ухудшения фиксированы:
     - 🔴 CPA вырос ≥25% или лиды упали ≥25%;
@@ -136,17 +140,14 @@ async def full_daily_scan_job(context: ContextTypes.DEFAULT_TYPE):
             continue
 
         mr = (row or {}).get("morning_report") or {}
-        if not mr.get("enabled", True):
+        level = str(mr.get("level", "ACCOUNT")).upper()
+
+        if level == "OFF":
             continue
 
-        levels = mr.get("levels") or {}
-        lvl_acc = bool(levels.get("account", True))
-        lvl_camp = bool(levels.get("campaigns", False))
-        lvl_adset = bool(levels.get("adsets", False))
-
-        # На всякий случай: если всё выключено, ничего не шлём.
-        if not (lvl_acc or lvl_camp or lvl_adset):
-            continue
+        lvl_acc = level in {"ACCOUNT", "CAMPAIGN", "ADSET"}
+        lvl_camp = level in {"CAMPAIGN", "ADSET"}
+        lvl_adset = level in {"ADSET"}
 
         acc_name = get_account_name(aid)
 
