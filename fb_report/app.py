@@ -7,7 +7,7 @@ from telegram import (
     ReplyKeyboardRemove,
 )
 from telegram.constants import ChatAction
-from telegram.error import BadRequest
+from telegram.error import BadRequest, NetworkError, TimedOut, RetryAfter
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -16,6 +16,8 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+
+import logging
 
 from billing_watch import init_billing_watch
 from autopilat.actions import apply_budget_change
@@ -47,6 +49,7 @@ from .reporting import (
     send_period_report,
     parse_range,
     parse_two_ranges,
+    build_account_report,
 )
 from .insights import build_heatmap_for_account, build_hourly_heatmap_for_account
 from .creatives import fetch_instagram_active_ads_links, format_instagram_ads_links
@@ -2047,24 +2050,21 @@ async def _on_cb_internal(
                 )
                 return
 
-        # Кампании / адсеты / объявления: используем analyze_*/fetch_instagram_active_ads_links
-        # и выбранный пресет периода.
-        from .storage import metrics_flags
-
-        flags = metrics_flags(aid)
-
-        # Определяем количество дней и человекочитаемый лейбл
         if kind == "today":
-            days = 1
+            period = "today"
             label = "сегодня"
         elif kind == "yday":
-            days = 1
+            period = "yesterday"
             label = "вчера"
         elif kind == "week":
-            days = 7
+            until = datetime.now(ALMATY_TZ) - timedelta(days=1)
+            since = until - timedelta(days=6)
+            period = {
+                "since": since.strftime("%Y-%m-%d"),
+                "until": until.strftime("%Y-%m-%d"),
+            }
             label = "последние 7 дней"
         else:
-            # Для кампаний/адсетов сравнение периодов пока не поддерживаем
             await safe_edit_message(
                 q,
                 "Сравнение периодов пока доступно только для общего отчёта по аккаунту.",
@@ -2078,45 +2078,12 @@ async def _on_cb_internal(
                 q,
                 f"Готовлю отчёт по кампаниям для {name} ({label})…",
             )
-            camps = analyze_campaigns(aid, days=days)
-            if not camps:
-                await context.bot.send_message(
-                    chat_id,
-                    f"Нет данных по кампаниям для {name} ({label}).",
-                )
-                return
-
-            lines = [f"📊 Кампании — {name} ({label})"]
-            for idx, c in enumerate(camps, start=1):
-                spend = c.get("spend", 0.0) or 0.0
-                impr = c.get("impr", 0) or 0
-                clicks = c.get("clicks", 0) or 0
-                msgs = c.get("msgs", 0) or 0
-                leads = c.get("leads", 0) or 0
-
-                eff_msgs = msgs if flags.get("messaging") else 0
-                eff_leads = leads if flags.get("leads") else 0
-                eff_total = eff_msgs + eff_leads
-                cpa_eff = (spend / eff_total) if eff_total > 0 else None
-
-                parts = [
-                    f"{idx}. {c.get('name')}",
-                    f"   👀 {impr}  🔍 {clicks}  💵 {spend:.2f} $",
-                ]
-                if flags.get("messaging"):
-                    parts.append(f"   💬 {msgs}")
-                if flags.get("leads"):
-                    parts.append(f"   📩 {leads}")
-                if flags.get("messaging") or flags.get("leads"):
-                    parts.append(
-                        f"   Итого: {eff_total}  CPA: {cpa_eff:.2f}$"
-                        if cpa_eff is not None
-                        else f"   Итого: {eff_total}  CPA: —"
-                    )
-
-                lines.append("\n".join(parts))
-
-            await context.bot.send_message(chat_id, "\n".join(lines))
+            txt = build_account_report(aid, period, "CAMPAIGN", label=label)
+            await context.bot.send_message(
+                chat_id,
+                txt or "Нет данных/нет доступа.",
+                parse_mode="HTML",
+            )
             return
 
         if mode == "adsets":
@@ -2124,50 +2091,12 @@ async def _on_cb_internal(
                 q,
                 f"Готовлю отчёт по адсетам для {name} ({label})…",
             )
-            adsets = analyze_adsets(aid, days=days)
-            if not adsets:
-                await context.bot.send_message(
-                    chat_id,
-                    f"Нет данных по адсетам для {name} ({label}).",
-                )
-                return
-
-            # сортируем по spend по убыванию
-            adsets_sorted = sorted(
-                adsets, key=lambda x: x.get("spend", 0.0), reverse=True
+            txt = build_account_report(aid, period, "ADSET", label=label)
+            await context.bot.send_message(
+                chat_id,
+                txt or "Нет данных/нет доступа.",
+                parse_mode="HTML",
             )
-
-            lines = [f"📊 Адсеты — {name} ({label})"]
-            for idx, a in enumerate(adsets_sorted, start=1):
-                spend = a.get("spend", 0.0) or 0.0
-                impr = a.get("impr", 0) or 0
-                clicks = a.get("clicks", 0) or 0
-                msgs = a.get("msgs", 0) or 0
-                leads = a.get("leads", 0) or 0
-
-                eff_msgs = msgs if flags.get("messaging") else 0
-                eff_leads = leads if flags.get("leads") else 0
-                eff_total = eff_msgs + eff_leads
-                cpa_eff = (spend / eff_total) if eff_total > 0 else None
-
-                parts = [
-                    f"{idx}. {a.get('name')}",
-                    f"   👀 {impr}  🔍 {clicks}  💵 {spend:.2f} $",
-                ]
-                if flags.get("messaging"):
-                    parts.append(f"   💬 {msgs}")
-                if flags.get("leads"):
-                    parts.append(f"   📩 {leads}")
-                if flags.get("messaging") or flags.get("leads"):
-                    parts.append(
-                        f"   Итого: {eff_total}  CPA: {cpa_eff:.2f}$"
-                        if cpa_eff is not None
-                        else f"   Итого: {eff_total}  CPA: —"
-                    )
-
-                lines.append("\n".join(parts))
-
-            await context.bot.send_message(chat_id, "\n".join(lines))
             return
 
     if data.startswith("adrep|"):
@@ -3665,6 +3594,23 @@ async def on_text_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def build_app() -> Application:
     app = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    async def _on_error(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        err = context.error
+        if isinstance(err, (NetworkError, TimedOut, RetryAfter)):
+            logging.getLogger(__name__).warning(
+                "Telegram transient error: %s: %s",
+                type(err).__name__,
+                err,
+            )
+            return
+
+        logging.getLogger(__name__).exception(
+            "Unhandled error while processing update",
+            exc_info=err,
+        )
+
+    app.add_error_handler(_on_error)
 
     app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.add_handler(CommandHandler("start", cmd_start))

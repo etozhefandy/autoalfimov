@@ -10,7 +10,7 @@ from telegram.ext import ContextTypes, Application
 
 from .constants import ALMATY_TZ, DEFAULT_REPORT_CHAT, ALLOWED_USER_IDS
 from .storage import load_accounts, get_account_name
-from .reporting import send_period_report, get_cached_report
+from .reporting import send_period_report, get_cached_report, build_account_report
 from .adsets import fetch_adset_insights_7d
 
 # Для Railway могут быть разные пути импорта services.*.
@@ -90,50 +90,13 @@ async def full_daily_scan_job(context: ContextTypes.DEFAULT_TYPE):
 
     now = datetime.now(ALMATY_TZ).date()
     yday = now - timedelta(days=1)
-    prev = now - timedelta(days=2)
 
     period_yday = {
         "since": yday.strftime("%Y-%m-%d"),
         "until": yday.strftime("%Y-%m-%d"),
     }
-    period_prev = {
-        "since": prev.strftime("%Y-%m-%d"),
-        "until": prev.strftime("%Y-%m-%d"),
-    }
 
     store = load_accounts() or {}
-
-    # Пороги ухудшения
-    CPA_RED = 25.0
-    CPA_YELLOW = 10.0
-    LEADS_RED = 25.0
-    LEADS_YELLOW = 10.0
-
-    def _pct_change(old: float, new: float):
-        if old == 0:
-            return None
-        try:
-            return (new - old) / old * 100.0
-        except Exception:
-            return None
-
-    def _grade(cpa_pct, leads_pct) -> str:
-        red = False
-        yellow = False
-        if cpa_pct is not None and cpa_pct >= CPA_RED:
-            red = True
-        if leads_pct is not None and leads_pct <= -LEADS_RED:
-            red = True
-        if not red:
-            if cpa_pct is not None and cpa_pct >= CPA_YELLOW:
-                yellow = True
-            if leads_pct is not None and leads_pct <= -LEADS_YELLOW:
-                yellow = True
-        if red:
-            return "🔴"
-        if yellow:
-            return "🟡"
-        return "🟢"
 
     for aid, row in store.items():
         if not (row or {}).get("enabled", True):
@@ -145,181 +108,13 @@ async def full_daily_scan_job(context: ContextTypes.DEFAULT_TYPE):
         if level == "OFF":
             continue
 
-        lvl_acc = level in {"ACCOUNT", "CAMPAIGN", "ADSET"}
-        lvl_camp = level in {"CAMPAIGN", "ADSET"}
-        lvl_adset = level in {"ADSET"}
-
-        acc_name = get_account_name(aid)
-
-        lines: list[str] = []
-        lines.append(f"🌅 Утренний отчёт — {acc_name}")
-        lines.append("Вчера vs позавчера")
-        lines.append("")
-
-        # ===== Уровень аккаунта =====
-        if lvl_acc:
-            try:
-                acc_y = analyze_account(aid, period=period_yday) or {}
-                acc_p = analyze_account(aid, period=period_prev) or {}
-            except Exception:
-                acc_y = {"metrics": None}
-                acc_p = {"metrics": None}
-
-            my = (acc_y.get("metrics") or {}) if isinstance(acc_y, dict) else {}
-            mp = (acc_p.get("metrics") or {}) if isinstance(acc_p, dict) else {}
-
-            spend_y = float(my.get("spend", 0.0) or 0.0)
-            spend_p = float(mp.get("spend", 0.0) or 0.0)
-            leads_y = int(my.get("leads", 0) or 0)
-            leads_p = int(mp.get("leads", 0) or 0)
-            cpa_y = my.get("cpa")
-            cpa_p = mp.get("cpa")
-
-            cpa_pct = None
-            if cpa_y is not None and cpa_p not in (None, 0):
-                cpa_pct = _pct_change(float(cpa_p), float(cpa_y))
-            leads_pct = _pct_change(float(leads_p), float(leads_y))
-
-            grade = _grade(cpa_pct, leads_pct)
-
-            def _fmt_pct(p):
-                if p is None:
-                    return "н/д"
-                return f"{p:+.0f}%"
-
-            lines.append("🧾 Аккаунт")
-            lines.append(
-                f"Spend: {spend_p:.2f} → {spend_y:.2f}"
-            )
-            lines.append(
-                f"Leads: {leads_p} → {leads_y} ({_fmt_pct(leads_pct)})"
-            )
-            if cpa_p is not None or cpa_y is not None:
-                cpa_p_str = f"{float(cpa_p):.2f}" if cpa_p is not None else "н/д"
-                cpa_y_str = f"{float(cpa_y):.2f}" if cpa_y is not None else "н/д"
-                lines.append(
-                    f"CPA: {cpa_p_str} → {cpa_y_str} ({_fmt_pct(cpa_pct)}) {grade}"
-                )
-            else:
-                lines.append(f"CPA: н/д {grade}")
-
-            lines.append("")
-
-        # ===== Уровень кампаний =====
-        if lvl_camp:
-            try:
-                camps_y = analyze_campaigns(aid, period=period_yday) or []
-            except Exception:
-                camps_y = []
-            try:
-                camps_p = analyze_campaigns(aid, period=period_prev) or []
-            except Exception:
-                camps_p = []
-
-            by_id_y = {str(c.get("campaign_id")): c for c in camps_y}
-            by_id_p = {str(c.get("campaign_id")): c for c in camps_p}
-
-            worsened_lines: list[str] = []
-
-            for cid, cy in by_id_y.items():
-                cp = by_id_p.get(cid) or {}
-
-                spend_y = float(cy.get("spend", 0.0) or 0.0)
-                spend_p = float(cp.get("spend", 0.0) or 0.0)
-                leads_y = int(cy.get("leads", 0) or 0)
-                leads_p = int(cp.get("leads", 0) or 0)
-                cpa_y = cy.get("cpa")
-                cpa_p = cp.get("cpa")
-
-                cpa_pct = None
-                if cpa_y is not None and cpa_p not in (None, 0):
-                    cpa_pct = _pct_change(float(cpa_p), float(cpa_y))
-                leads_pct = _pct_change(float(leads_p), float(leads_y))
-
-                grade = _grade(cpa_pct, leads_pct)
-                if grade == "🟢":
-                    continue
-
-                def _fmt_pct_short(p):
-                    if p is None:
-                        return "н/д"
-                    return f"{p:+.0f}%"
-
-                name = cy.get("name") or cid
-                parts = [grade, name]
-                if cpa_pct is not None:
-                    parts.append(f"— CPA {_fmt_pct_short(cpa_pct)}")
-                if leads_pct is not None:
-                    parts.append(f"Leads {_fmt_pct_short(leads_pct)}")
-
-                worsened_lines.append(" ".join(parts))
-
-            if worsened_lines:
-                lines.append("📊 Кампании")
-                lines.extend(worsened_lines)
-                lines.append("")
-
-        # ===== Уровень адсетов =====
-        if lvl_adset:
-            try:
-                adsets_y = analyze_adsets(aid, period=period_yday) or []
-            except Exception:
-                adsets_y = []
-            try:
-                adsets_p = analyze_adsets(aid, period=period_prev) or []
-            except Exception:
-                adsets_p = []
-
-            by_id_y = {str(a.get("adset_id")): a for a in adsets_y}
-            by_id_p = {str(a.get("adset_id")): a for a in adsets_p}
-
-            worsened_lines: list[str] = []
-
-            for adset_id, ay in by_id_y.items():
-                ap = by_id_p.get(adset_id) or {}
-
-                spend_y = float(ay.get("spend", 0.0) or 0.0)
-                spend_p = float(ap.get("spend", 0.0) or 0.0)
-                leads_y = int(ay.get("leads", 0) or 0)
-                leads_p = int(ap.get("leads", 0) or 0)
-                cpa_y = ay.get("cpa")
-                cpa_p = ap.get("cpa")
-
-                cpa_pct = None
-                if cpa_y is not None and cpa_p not in (None, 0):
-                    cpa_pct = _pct_change(float(cpa_p), float(cpa_y))
-                leads_pct = _pct_change(float(leads_p), float(leads_y))
-
-                grade = _grade(cpa_pct, leads_pct)
-                if grade == "🟢":
-                    continue
-
-                def _fmt_pct_short(p):
-                    if p is None:
-                        return "н/д"
-                    return f"{p:+.0f}%"
-
-                name = ay.get("name") or adset_id
-                parts = [grade, name]
-                if cpa_pct is not None:
-                    parts.append(f"— CPA {_fmt_pct_short(cpa_pct)}")
-                if leads_pct is not None:
-                    parts.append(f"Leads {_fmt_pct_short(leads_pct)}")
-
-                worsened_lines.append(" ".join(parts))
-
-            if worsened_lines:
-                lines.append("🧩 Адсеты")
-                lines.extend(worsened_lines)
-                lines.append("")
-
-        # Если кроме заголовка ничего нет — пропускаем отчёт для этого аккаунта.
-        body = "\n".join([ln for ln in lines if ln.strip()])
-        if not body.strip():
+        label = yday.strftime("%d.%m.%Y")
+        body = build_account_report(aid, period_yday, level, label=label)
+        if not body:
             continue
 
         try:
-            await context.bot.send_message(chat_id, body)
+            await context.bot.send_message(chat_id, body, parse_mode="HTML")
             await asyncio.sleep(0.5)
         except Exception:
             # Утренний отчёт не должен ломать остальные джобы.
