@@ -2,6 +2,7 @@
 
 from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime, timedelta
+import logging
 
 from services.facebook_api import (
     fetch_insights,
@@ -306,42 +307,64 @@ def fetch_insights_by_level(aid: str, entity_id: str, period: Dict[str, str], le
     """
     from facebook_business.adobjects.adaccount import AdAccount
 
-    params = {
-        "level": level,
-        "time_range": {
-            "since": period["since"],
-            "until": period["until"],
-        },
-        "filtering": [
-            {
-                "field": f"{level}.id",
-                "operator": "EQUAL",
-                "value": entity_id,
-            }
-        ],
-    }
+    from services.facebook_api import safe_api_call, _period_to_params
+    from services.storage import load_local_insights, save_local_insights, period_key
+
+    log = logging.getLogger(__name__)
+
+    pkey = period_key(period)
+    cache_key = f"{pkey}|lvl:{str(level)}|id:{str(entity_id)}"
+    store = load_local_insights(aid)
+
+    # Для периода "today" всегда берём свежие данные.
+    use_cache = not (isinstance(period, str) and period == "today")
+    if use_cache and cache_key in store:
+        return store.get(cache_key)
+
+    params = _period_to_params(period)
+    params["level"] = level
+    params["filtering"] = [
+        {
+            "field": f"{level}.id",
+            "operator": "EQUAL",
+            "value": entity_id,
+        }
+    ]
 
     fields = ["impressions", "clicks", "spend", "actions", "cpm", "cpc", "frequency"]
-
     acc = AdAccount(aid)
-
-    try:
-        data = acc.get_insights(fields=fields, params=params)
-    except Exception as e:
-        print(f"[fetch_insights_by_level] {e}")
-        return None
+    data = safe_api_call(acc.get_insights, fields=fields, params=params)
 
     if not data:
+        store[cache_key] = None
+        save_local_insights(aid, store)
         return None
 
-    row = data[0]
+    row = data[0] if len(data) > 0 else None
     if hasattr(row, "export_all_data"):
-        return row.export_all_data()
+        out = row.export_all_data()
+    else:
+        try:
+            out = dict(row)
+        except Exception:
+            out = None
 
+    # Быстрая диагностика: spend>0 есть, но ответ не парсится
     try:
-        return dict(row)
+        if out and float((out or {}).get("spend", 0) or 0) > 0 and not isinstance(out, dict):
+            log.warning(
+                "fetch_insights_by_level returned unexpected type for spend>0: aid=%s level=%s id=%s type=%s",
+                aid,
+                level,
+                entity_id,
+                type(out).__name__,
+            )
     except Exception:
-        return None
+        pass
+
+    store[cache_key] = out
+    save_local_insights(aid, store)
+    return out
 
 
 # ============================================================

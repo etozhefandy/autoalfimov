@@ -248,6 +248,26 @@ def format_blended_block(total_spend: float, msgs: int, leads: int) -> str:
     )
 
 
+def _strip_leading_separator(block: str) -> str:
+    if not block:
+        return block
+    lines = block.split("\n")
+    if lines and lines[0].strip() == "────────────":
+        lines = lines[1:]
+    return "\n".join(lines)
+
+
+def _collapse_double_separators(text: str) -> str:
+    if not text:
+        return text
+    out: list[str] = []
+    for line in text.split("\n"):
+        if out and out[-1].strip() == "────────────" and line.strip() == "────────────":
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
 def get_account_blended_totals(aid: str, period) -> tuple[float, int, int]:
     try:
         _, ins = fetch_insight(aid, period)
@@ -305,6 +325,7 @@ def build_account_report(
 
     acc_spend, acc_msgs, acc_leads = get_account_blended_totals(aid, period)
     acc_blended_block = format_blended_block(acc_spend, acc_msgs, acc_leads)
+    acc_blended_after_sections = _strip_leading_separator(acc_blended_block)
 
     from .storage import load_accounts
 
@@ -363,12 +384,12 @@ def build_account_report(
         else:
             chunks.append("📣 Кампании (топ)\n" + "\n".join(camp_lines))
         if show_blended_after_sections:
-            chunks.append(acc_blended_block)
+            chunks.append(acc_blended_after_sections)
     else:
         camp_lines.append("нет данных за период")
         chunks.append("📣 Кампании (топ)\n" + "\n".join(camp_lines))
         if show_blended_after_sections:
-            chunks.append(acc_blended_block)
+            chunks.append(acc_blended_after_sections)
 
     if lvl == "ADSET":
         adsets: list[dict] = []
@@ -414,15 +435,16 @@ def build_account_report(
             else:
                 chunks.append("🧩 Адсеты (топ)\n" + "\n".join(adset_lines))
             if show_blended_after_sections:
-                chunks.append(acc_blended_block)
+                chunks.append(acc_blended_after_sections)
         else:
             adset_lines.append("нет данных за период")
             chunks.append("🧩 Адсеты (топ)\n" + "\n".join(adset_lines))
             if show_blended_after_sections:
-                chunks.append(acc_blended_block)
+                chunks.append(acc_blended_after_sections)
 
     # Разделитель обязателен между блоками.
-    return base + sep + (sep.join(chunks))
+    text = base + sep + (sep.join(chunks))
+    return _collapse_double_separators(text)
 
 
 async def send_period_report(

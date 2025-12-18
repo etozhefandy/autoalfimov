@@ -1242,12 +1242,6 @@ async def _on_cb_internal(
             [
                 [
                     InlineKeyboardButton(
-                        "❌ Выкл",
-                        callback_data=f"mr_level|{aid}|OFF",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
                         "🏦 Аккаунт",
                         callback_data=f"mr_level|{aid}|ACCOUNT",
                     )
@@ -1288,7 +1282,14 @@ async def _on_cb_internal(
             return
 
         lvl = str(lvl).upper()
-        if lvl not in {"OFF", "ACCOUNT", "CAMPAIGN", "ADSET"}:
+        if lvl == "OFF":
+            await q.answer(
+                "Недоступно. Используй 'Выключить кабинет'.",
+                show_alert=True,
+            )
+            return
+
+        if lvl not in {"ACCOUNT", "CAMPAIGN", "ADSET"}:
             await q.answer("Неизвестный уровень утреннего отчёта.", show_alert=True)
             return
 
@@ -1301,7 +1302,6 @@ async def _on_cb_internal(
         save_accounts(st)
 
         human = {
-            "OFF": "Выкл",
             "ACCOUNT": "Аккаунт",
             "CAMPAIGN": "Кампании",
             "ADSET": "Адсеты",
