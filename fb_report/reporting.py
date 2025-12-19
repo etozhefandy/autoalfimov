@@ -291,20 +291,26 @@ def format_entity_line(
     eff_msgs = int(msgs or 0) if flags.get("messaging") else 0
     eff_leads = int(leads or 0) if flags.get("leads") else 0
 
-    # Если обе цели выключены или по ним 0 — строку не показываем.
-    if eff_msgs <= 0 and eff_leads <= 0:
-        return None
+    # Если обе цели выключены или по ним 0 — строку всё равно показываем,
+    # чтобы кампании/адсеты со spend>0 не пропадали из отчёта.
 
     spend_f = float(spend or 0.0)
     parts = [f"{idx}) {name}", f"$ {spend_f:.2f}"]
 
     # Одна цель на строку: доминирующая по количеству, при равенстве — лиды.
     if eff_leads >= eff_msgs:
+        # При равенстве (в т.ч. 0/0) — лиды.
         parts.append(f"♿️ лиды {eff_leads}")
-        parts.append(f"цена лида $ {spend_f / float(eff_leads):.2f}")
+        if eff_leads > 0:
+            parts.append(f"цена лида $ {spend_f / float(eff_leads):.2f}")
+        else:
+            parts.append("цена лида —")
     else:
         parts.append(f"переписки {eff_msgs}")
-        parts.append(f"цена переписки $ {spend_f / float(eff_msgs):.2f}")
+        if eff_msgs > 0:
+            parts.append(f"цена переписки $ {spend_f / float(eff_msgs):.2f}")
+        else:
+            parts.append("цена переписки —")
 
     return " — ".join(parts)
 
