@@ -222,8 +222,9 @@ def build_report(aid: str, period, label: str = "") -> str:
         else:
             body.append("♿️💲 Цена лида: —")
 
-    # Blended CPA (всегда показываем отдельным блоком)
-    body.extend(format_blended_block(spend, msgs, leads).split("\n"))
+    # Blended CPA показываем только при включённых переписках и лидах одновременно
+    if flags.get("messaging") and flags.get("leads"):
+        body.extend(format_blended_block(spend, msgs, leads).split("\n"))
 
     return hdr + "\n".join(body)
 
@@ -323,6 +324,8 @@ def build_account_report(
     if not base:
         return ""
 
+    flags = metrics_flags(aid)
+
     acc_spend, acc_msgs, acc_leads = get_account_blended_totals(aid, period)
     acc_blended_block = format_blended_block(acc_spend, acc_msgs, acc_leads)
     acc_blended_after_sections = _strip_leading_separator(acc_blended_block)
@@ -333,11 +336,13 @@ def build_account_report(
     mr = (store.get(aid, {}) or {}).get("morning_report", {}) or {}
     show_blended_after_sections = mr.get("show_blended_after_sections", True)
 
+    # Blended показываем только при включённых переписках и лидах одновременно.
+    show_blended = bool(flags.get("messaging")) and bool(flags.get("leads"))
+
     if lvl == "ACCOUNT":
         return base
 
     sep = "\n────────────\n"
-    flags = metrics_flags(aid)
 
     chunks: list[str] = []
 
@@ -383,12 +388,12 @@ def build_account_report(
             chunks.append("📣 Кампании (топ)\n" + "\n".join(camp_lines))
         else:
             chunks.append("📣 Кампании (топ)\n" + "\n".join(camp_lines))
-        if show_blended_after_sections:
+        if show_blended_after_sections and show_blended:
             chunks.append(acc_blended_after_sections)
     else:
         camp_lines.append("нет данных за период")
         chunks.append("📣 Кампании (топ)\n" + "\n".join(camp_lines))
-        if show_blended_after_sections:
+        if show_blended_after_sections and show_blended:
             chunks.append(acc_blended_after_sections)
 
     if lvl == "ADSET":
@@ -434,12 +439,12 @@ def build_account_report(
                 chunks.append("🧩 Адсеты (топ)\n" + "\n".join(adset_lines))
             else:
                 chunks.append("🧩 Адсеты (топ)\n" + "\n".join(adset_lines))
-            if show_blended_after_sections:
+            if show_blended_after_sections and show_blended:
                 chunks.append(acc_blended_after_sections)
         else:
             adset_lines.append("нет данных за период")
             chunks.append("🧩 Адсеты (топ)\n" + "\n".join(adset_lines))
-            if show_blended_after_sections:
+            if show_blended_after_sections and show_blended:
                 chunks.append(acc_blended_after_sections)
 
     # Разделитель обязателен между блоками.
