@@ -19,17 +19,32 @@ def _dbg_env() -> None:
 _dbg_env()
 
 
+# --- DeepSeek config (safe defaults) ---
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 DEEPSEEK_ENDPOINT = os.getenv("DEEPSEEK_ENDPOINT", "/v1/chat/completions")
-DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+
+# Быстрая модель по умолчанию
+DEEPSEEK_MODEL_FAST = os.getenv(
+    "DEEPSEEK_MODEL_FAST",
+    os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
+)
+# "Думающая" модель — только если явно включим
+DEEPSEEK_MODEL_REASON = os.getenv("DEEPSEEK_MODEL_REASON", "deepseek-reasoner")
+
+# Таймауты и ретраи (чтобы не висеть и не ронять бота)
+DEEPSEEK_CONNECT_TIMEOUT = float(os.getenv("DEEPSEEK_CONNECT_TIMEOUT", "10"))
+DEEPSEEK_READ_TIMEOUT = float(os.getenv("DEEPSEEK_READ_TIMEOUT", "60"))
+DEEPSEEK_RETRIES = int(os.getenv("DEEPSEEK_RETRIES", "2"))
+DEEPSEEK_BACKOFF_S = float(os.getenv("DEEPSEEK_BACKOFF_S", "2.0"))
 
 
 def _get_api_key() -> str | None:
-    return (
-        os.getenv("DS_FOCUS")
-        or os.getenv("DS_focus")
-        or os.getenv("DS-focus")
-    )
+    # новый приоритетный ключ
+    k = os.getenv("DEEPSEEK_API_KEY")
+    if k:
+        return k
+    # backward compatibility (как было)
+    return os.getenv("DS_FOCUS") or os.getenv("DS_focus") or os.getenv("DS-focus")
 
 
 def deepseek_chat(
@@ -51,7 +66,7 @@ def deepseek_chat(
     }
 
     payload: Dict[str, Any] = {
-        "model": model or DEEPSEEK_MODEL,
+        "model": model or DEEPSEEK_MODEL_FAST,
         "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
@@ -62,7 +77,7 @@ def deepseek_chat(
 
     # Один запрос + 1 повтор с небольшим backoff, чтобы не висеть бесконечно.
     last_err: Exception | None = None
-    for attempt in range(2):
+    for attempt in range(DEEPSEEK_RETRIES):
         t0 = time.time()
         try:
             raw = json.dumps(payload, ensure_ascii=False)
@@ -84,7 +99,7 @@ def deepseek_chat(
                 url,
                 headers=headers,
                 json=payload,
-                timeout=(5, 30),  # connect, read
+                timeout=(DEEPSEEK_CONNECT_TIMEOUT, DEEPSEEK_READ_TIMEOUT),  # connect, read
             )
             elapsed = round(time.time() - t0, 2)
             print(
@@ -108,8 +123,8 @@ def deepseek_chat(
                 "attempt=",
                 attempt + 1,
             )
-            if attempt == 0:
-                time.sleep(2.0)
+            if attempt < DEEPSEEK_RETRIES - 1:
+                time.sleep(DEEPSEEK_BACKOFF_S * (attempt + 1))
 
     # Если обе попытки не удались — пробрасываем последнюю ошибку.
     assert last_err is not None
@@ -173,7 +188,8 @@ async def ask_deepseek(messages: List[Dict[str, str]], json_mode: bool = False) 
 
     api_key = _get_api_key()
     if not api_key:
-        raise RuntimeError("DeepSeek API key is missing (DS_FOCUS/DS-focus)")
+        print("[ai_focus] ask_deepseek: DeepSeek API key is missing; returning empty result")
+        return {"choices": [{"message": {"content": ""}}], "error": "missing_api_key"}
 
     url = f"{DEEPSEEK_BASE_URL.rstrip('/')}{DEEPSEEK_ENDPOINT}"
     headers = {
@@ -182,7 +198,7 @@ async def ask_deepseek(messages: List[Dict[str, str]], json_mode: bool = False) 
     }
 
     payload: Dict[str, Any] = {
-        "model": DEEPSEEK_MODEL,
+        "model": DEEPSEEK_MODEL_FAST if not json_mode else DEEPSEEK_MODEL_REASON,
         "messages": messages,
     }
 
@@ -191,7 +207,7 @@ async def ask_deepseek(messages: List[Dict[str, str]], json_mode: bool = False) 
 
     def _do_request() -> Dict[str, Any]:
         last_err: Exception | None = None
-        for attempt in range(2):
+        for attempt in range(DEEPSEEK_RETRIES):
             t0 = time.time()
             try:
                 raw = json.dumps(payload, ensure_ascii=False)
@@ -213,7 +229,7 @@ async def ask_deepseek(messages: List[Dict[str, str]], json_mode: bool = False) 
                     url,
                     headers=headers,
                     json=payload,
-                    timeout=(5, 30),  # connect, read
+                    timeout=(DEEPSEEK_CONNECT_TIMEOUT, DEEPSEEK_READ_TIMEOUT),  # connect, read
                 )
                 elapsed = round(time.time() - t0, 2)
                 print(
@@ -237,18 +253,10 @@ async def ask_deepseek(messages: List[Dict[str, str]], json_mode: bool = False) 
                     "attempt=",
                     attempt + 1,
                 )
-                if attempt == 0:
-                    time.sleep(2.0)
+                if attempt < DEEPSEEK_RETRIES - 1:
+                    time.sleep(DEEPSEEK_BACKOFF_S * (attempt + 1))
 
-        assert last_err is not None
-        raise last_err
+        print("[ai_focus] ask_deepseek failed; returning empty result to avoid crashing bot")
+        return {"choices": [{"message": {"content": ""}}], "error": str(last_err)}
 
     return await asyncio.to_thread(_do_request)
-
-
-# ======== Продвинутые настройки DeepSeek для Focus-ИИ (WS) ========
-
-DEEPSEEK_API_KEY = _get_api_key()
-DEEPSEEK_MODEL = "deepseek-reasoner"
-DEEPSEEK_BASE_URL = "https://api.deepseek.com"
-DEEPSEEK_CHAT_COMPLETIONS = "/v1/chat/completions"
