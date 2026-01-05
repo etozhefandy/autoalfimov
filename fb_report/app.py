@@ -311,29 +311,29 @@ def monitoring_menu_kb() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
-                    "❌ Вчера vs позавчера", callback_data="mon_yday_vs_byday"
+                    "Вчера vs позавчера", callback_data="mon_yday_vs_byday"
                 )
             ],
             [
                 InlineKeyboardButton(
-                    "❌ Прошлая неделя vs позапрошлая",
+                    "Прошлая неделя vs позапрошлая",
                     callback_data="mon_lastweek_vs_prevweek",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    "❌ Текущая неделя vs прошлая (по вчера)",
+                    "Текущая неделя vs прошлая (по вчера)",
                     callback_data="mon_curweek_vs_lastweek",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    "❌ Кастомный период", callback_data="mon_custom_period"
+                    "Кастомный период", callback_data="mon_custom_period"
                 )
             ],
             [
                 InlineKeyboardButton(
-                    "❌ ⚙️ Настройки мониторинга",
+                    "⚙️ Настройки мониторинга",
                     callback_data="mon_settings",
                 )
             ],
@@ -351,7 +351,7 @@ def monitoring_menu_kb() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
-                    "❌ 📈 План заявок", callback_data="leads_plan_soon"
+                    "📈 План заявок (скоро)", callback_data="leads_plan_soon"
                 )
             ],
             [InlineKeyboardButton("⬅️ В меню", callback_data="menu")],
@@ -444,17 +444,17 @@ def focus_ai_level_kb_settings() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
-                    "❌ Кампания", callback_data="focus_ai_set_level|campaign"
+                    "Кампания", callback_data="focus_ai_set_level|campaign"
                 )
             ],
             [
                 InlineKeyboardButton(
-                    "❌ Адсет", callback_data="focus_ai_set_level|adset"
+                    "Адсет", callback_data="focus_ai_set_level|adset"
                 )
             ],
             [
                 InlineKeyboardButton(
-                    "❌ Объявление", callback_data="focus_ai_set_level|ad"
+                    "Объявление", callback_data="focus_ai_set_level|ad"
                 )
             ],
             [InlineKeyboardButton("⬅️ Назад", callback_data="focus_ai_settings")],
@@ -476,17 +476,17 @@ def focus_ai_level_kb_now() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
-                    "❌ Кампания", callback_data="focus_ai_now_level|campaign"
+                    "Кампания", callback_data="focus_ai_now_level|campaign"
                 )
             ],
             [
                 InlineKeyboardButton(
-                    "❌ Адсет", callback_data="focus_ai_now_level|adset"
+                    "Адсет", callback_data="focus_ai_now_level|adset"
                 )
             ],
             [
                 InlineKeyboardButton(
-                    "❌ Объявление", callback_data="focus_ai_now_level|ad"
+                    "Объявление", callback_data="focus_ai_now_level|ad"
                 )
             ],
             [InlineKeyboardButton("⬅️ Назад", callback_data="focus_ai_now")],
