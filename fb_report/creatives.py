@@ -68,6 +68,7 @@ def fetch_instagram_active_ads_links(account_id: str) -> List[Dict[str, Any]]:
         adsets_map[a.get("id")] = {
             "name": a.get("name") or a.get("id"),
             "campaign_id": a.get("campaign_id"),
+            "effective_status": a.get("effective_status"),
         }
 
     acc = AdAccount(account_id)
@@ -94,6 +95,12 @@ def fetch_instagram_active_ads_links(account_id: str) -> List[Dict[str, Any]]:
 
     for row in ads:
         try:
+            # Дублируем фильтрацию на нашей стороне, чтобы не зависеть от того,
+            # как именно SDK/версия API применит params effective_status.
+            eff = row.get("effective_status")
+            if eff != "ACTIVE":
+                continue
+
             adset_id = row.get("adset_id")
             campaign_id = row.get("campaign_id")
 
@@ -107,6 +114,10 @@ def fetch_instagram_active_ads_links(account_id: str) -> List[Dict[str, Any]]:
 
             adset_info = adsets_map.get(adset_id, {}) if adset_id else {}
             adset_name = adset_info.get("name") or adset_id or "Без названия адсета"
+
+            adset_eff = adset_info.get("effective_status")
+            if adset_eff is not None and adset_eff != "ACTIVE":
+                continue
 
             # Получаем id креатива из поля creative
             creative_info = row.get("creative") or {}

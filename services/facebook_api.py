@@ -243,7 +243,7 @@ def fetch_adsets(aid: str) -> List[Dict[str, Any]]:
     acc = AdAccount(aid)
     data = safe_api_call(
         acc.get_ad_sets,
-        fields=["id", "name", "daily_budget", "status", "campaign_id"]
+        fields=["id", "name", "daily_budget", "status", "effective_status", "campaign_id"]
     )
 
     if not data:
@@ -258,6 +258,7 @@ def fetch_adsets(aid: str) -> List[Dict[str, Any]]:
                 "campaign_id": row.get("campaign_id"),
                 "daily_budget": float(row.get("daily_budget", 0)) / 100.0,
                 "status": row.get("status"),
+                "effective_status": row.get("effective_status"),
             })
         except Exception:
             continue
