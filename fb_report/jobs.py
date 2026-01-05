@@ -11,6 +11,11 @@ from telegram.ext import ContextTypes, Application
 from .constants import ALMATY_TZ, DEFAULT_REPORT_CHAT, ALLOWED_USER_IDS
 from .storage import load_accounts, get_account_name
 from .reporting import send_period_report, get_cached_report, build_account_report
+from .cpa_monitoring import (
+    build_monitor_snapshot,
+    evaluate_rules,
+    format_cpa_anomaly_message,
+)
 from .adsets import fetch_adset_insights_7d
 
 # Для Railway могут быть разные пути импорта services.*.
@@ -356,7 +361,6 @@ async def _cpa_alerts_job(context: ContextTypes.DEFAULT_TYPE):
         # Сохраняем метрики кампаний в словарь, чтобы переиспользовать для
         # сообщений по объявлениям (CPA кампании и её таргет).
         campaign_stats: dict[str, dict] = {}
-        problematic_campaign_lines: list[str] = []
 
         try:
             camp_metrics = analyze_campaigns(aid, period=period_dict) or []
@@ -384,46 +388,77 @@ async def _cpa_alerts_job(context: ContextTypes.DEFAULT_TYPE):
             if not c_cpa or c_spend <= 0 or c_total <= 0:
                 continue
 
+            # Новый Monitoring Engine + Rules (3 дня по умолчанию)
+            try:
+                snap = build_monitor_snapshot(
+                    aid=aid,
+                    entity_id=str(cid),
+                    level="campaign",
+                    history_days=3,
+                    target_cpa=effective_target_c,
+                )
+                rules = evaluate_rules(snap)
+            except Exception:
+                rules = []
+                snap = {}
+
+            if not rules:
+                continue
+
             # Сохраняем статистику кампании для последующего использования в
             # мультимесседж-формате по объявлениям.
             cname = camp.get("name") or cid
+            cpa_series = snap.get("cpa_series") or []
+            last_cpa = next((v for v in reversed(cpa_series) if v is not None), None)
             campaign_stats[str(cid)] = {
                 "name": cname,
-                "cpa": float(c_cpa),
+                "cpa": float(last_cpa) if last_cpa is not None else None,
                 "target": float(effective_target_c),
             }
 
-            if c_cpa <= effective_target_c:
-                continue
+            ai_text = None
+            ai_conf = None
+            if alerts.get("ai_enabled", True):
+                try:
+                    from services.ai_focus import get_focus_comment
+
+                    ai_ctx = {
+                        "entity": {"id": str(cid), "name": cname, "level": "campaign"},
+                        "metrics": {
+                            "cpa_series": snap.get("cpa_series"),
+                            "delta_pct": snap.get("delta_pct"),
+                            "frequency": snap.get("frequency"),
+                            "spend_trend": snap.get("spend_trend"),
+                        },
+                        "triggered_rules": [r.get("rule") for r in rules if r.get("rule")],
+                    }
+                    ai_text = get_focus_comment(ai_ctx)
+                    if snap.get("spike"):
+                        ai_conf = 82
+                    elif snap.get("violates_target"):
+                        ai_conf = 75
+                    else:
+                        ai_conf = 70
+                except Exception:
+                    ai_text = None
+                    ai_conf = None
 
             try:
-                overspend_pct_c = (c_cpa / effective_target_c - 1.0) * 100.0
-            except ZeroDivisionError:
-                overspend_pct_c = 0.0
-
-            problematic_campaign_lines.append(
-                "\n".join(
-                    [
-                        f"{cname}",
-                        f"• CPA: {c_cpa:.2f} $",
-                        f"• Target: {effective_target_c:.2f} $",
-                        f"• Перерасход: +{overspend_pct_c:.0f}%",
-                    ]
+                text_msg = format_cpa_anomaly_message(
+                    snapshot=snap,
+                    entity_name=str(cname),
+                    level_human="Кампания",
+                    triggered_rules=rules,
+                    ai_text=ai_text,
+                    ai_confidence=ai_conf,
                 )
-            )
-
-        if problematic_campaign_lines:
-            header_camps = f"⚠️ CPA-алёрты по кампаниям для {acc_name}"
-            text_camps = header_camps + "\n\n" + "\n\n".join(problematic_campaign_lines)
-            try:
-                await context.bot.send_message(chat_id, text_camps)
-                await asyncio.sleep(1.0)
+                await context.bot.send_message(chat_id, text_msg)
+                await asyncio.sleep(0.5)
             except Exception:
                 pass
 
         # ====== 3) Новый алёрт по адсетам ======
 
-        problematic_adset_lines: list[str] = []
         # Статистика по адсетам (для сообщений по объявлениям)
         adset_stats: dict[str, dict] = {}
 
@@ -463,51 +498,74 @@ async def _cpa_alerts_job(context: ContextTypes.DEFAULT_TYPE):
                 if effective_target_a <= 0:
                     continue
 
-                ad_spend = float(ad.get("spend", 0.0) or 0.0)
-                ad_total = int(ad.get("total", 0) or 0)
-                ad_cpa = ad.get("cpa")
-                if ad_cpa is None and ad_total > 0 and ad_spend > 0:
-                    ad_cpa = ad_spend / ad_total
+                # Новый Monitoring Engine + Rules (3 дня по умолчанию)
+                try:
+                    snap = build_monitor_snapshot(
+                        aid=aid,
+                        entity_id=str(adset_id),
+                        level="adset",
+                        history_days=3,
+                        target_cpa=effective_target_a,
+                    )
+                    rules = evaluate_rules(snap)
+                except Exception:
+                    rules = []
+                    snap = {}
 
-                if not ad_cpa or ad_total <= 0 or ad_spend <= 0:
+                if not rules:
                     continue
 
                 # Сохраняем статистику адсета для последующего использования
                 # в мультимесседж-формате по объявлениям.
                 adset_name = ad.get("name") or adset_id
+                a_series = snap.get("cpa_series") or []
+                a_last = next((v for v in reversed(a_series) if v is not None), None)
                 adset_stats[str(adset_id)] = {
                     "name": adset_name,
-                    "cpa": float(ad_cpa),
+                    "cpa": float(a_last) if a_last is not None else None,
                     "target": float(effective_target_a),
                 }
 
-                if ad_cpa <= effective_target_a:
-                    continue
+                ai_text = None
+                ai_conf = None
+                if alerts.get("ai_enabled", True):
+                    try:
+                        from services.ai_focus import get_focus_comment
+
+                        ai_ctx = {
+                            "entity": {"id": str(adset_id), "name": adset_name, "level": "adset"},
+                            "metrics": {
+                                "cpa_series": snap.get("cpa_series"),
+                                "delta_pct": snap.get("delta_pct"),
+                                "frequency": snap.get("frequency"),
+                                "spend_trend": snap.get("spend_trend"),
+                            },
+                            "triggered_rules": [r.get("rule") for r in rules if r.get("rule")],
+                        }
+                        ai_text = get_focus_comment(ai_ctx)
+                        if snap.get("spike"):
+                            ai_conf = 82
+                        elif snap.get("violates_target"):
+                            ai_conf = 75
+                        else:
+                            ai_conf = 70
+                    except Exception:
+                        ai_text = None
+                        ai_conf = None
 
                 try:
-                    overspend_pct_a = (ad_cpa / effective_target_a - 1.0) * 100.0
-                except ZeroDivisionError:
-                    overspend_pct_a = 0.0
-
-                problematic_adset_lines.append(
-                    "\n".join(
-                        [
-                            f"{adset_name}",
-                            f"• CPA: {ad_cpa:.2f} $",
-                            f"• Target: {effective_target_a:.2f} $",
-                            f"• Перерасход: +{overspend_pct_a:.0f}%",
-                        ]
+                    text_msg = format_cpa_anomaly_message(
+                        snapshot=snap,
+                        entity_name=str(adset_name),
+                        level_human="Адсет",
+                        triggered_rules=rules,
+                        ai_text=ai_text,
+                        ai_confidence=ai_conf,
                     )
-                )
-
-        if problematic_adset_lines:
-            header_adsets = f"⚠️ CPA-алёрты по адсетам для {acc_name}"
-            text_adsets = header_adsets + "\n\n" + "\n\n".join(problematic_adset_lines)
-            try:
-                await context.bot.send_message(chat_id, text_adsets)
-                await asyncio.sleep(1.0)
-            except Exception:
-                pass
+                    await context.bot.send_message(chat_id, text_msg)
+                    await asyncio.sleep(0.5)
+                except Exception:
+                    pass
 
         # ====== 4) Новый алёрт по объявлениям ======
 
@@ -589,7 +647,21 @@ async def _cpa_alerts_job(context: ContextTypes.DEFAULT_TYPE):
             if not a_cpa or a_spend <= 0 or a_total <= 0:
                 continue
 
-            if a_cpa <= effective_target_ad:
+            # Новый Monitoring Engine + Rules (3 дня по умолчанию)
+            try:
+                snap = build_monitor_snapshot(
+                    aid=aid,
+                    entity_id=str(ad_id),
+                    level="ad",
+                    history_days=3,
+                    target_cpa=effective_target_ad,
+                )
+                rules = evaluate_rules(snap)
+            except Exception:
+                rules = []
+                snap = {}
+
+            if not rules:
                 continue
 
             # Есть ли альтернативы внутри того же адсета за последние 7 дней
@@ -631,6 +703,8 @@ async def _cpa_alerts_job(context: ContextTypes.DEFAULT_TYPE):
                     "cpa": float(a_cpa),
                     "target": float(effective_target_ad),
                     "has_alternative_in_adset": bool(has_alternative),
+                    "snap": snap,
+                    "rules": rules,
                 }
             )
 
@@ -701,18 +775,49 @@ async def _cpa_alerts_job(context: ContextTypes.DEFAULT_TYPE):
                     ad_name_txt = ad_info.get("ad_name") or ad_id
                     cpa_val = float(ad_info.get("cpa", 0.0) or 0.0)
                     tgt_val = float(ad_info.get("target", 0.0) or 0.0)
+                    snap = ad_info.get("snap") or {}
+                    rules = ad_info.get("rules") or []
                     has_alt_flag = bool(ad_info.get("has_alternative_in_adset"))
 
                     alt_str = "да" if has_alt_flag else "нет"
 
+                    ai_text = None
+                    ai_conf = None
+                    if alerts.get("ai_enabled", True):
+                        try:
+                            from services.ai_focus import get_focus_comment
+
+                            ai_ctx = {
+                                "entity": {"id": str(ad_id), "name": ad_name_txt, "level": "ad"},
+                                "metrics": {
+                                    "cpa_series": snap.get("cpa_series"),
+                                    "delta_pct": snap.get("delta_pct"),
+                                    "frequency": snap.get("frequency"),
+                                    "spend_trend": snap.get("spend_trend"),
+                                },
+                                "triggered_rules": [r.get("rule") for r in rules if r.get("rule")],
+                            }
+                            ai_text = get_focus_comment(ai_ctx)
+                            if snap.get("spike"):
+                                ai_conf = 82
+                            elif snap.get("violates_target"):
+                                ai_conf = 75
+                            else:
+                                ai_conf = 70
+                        except Exception:
+                            ai_text = None
+                            ai_conf = None
+
                     ad_lines = [
-                        f"🟨 Объявление: {ad_name_txt}",
+                        format_cpa_anomaly_message(
+                            snapshot=snap,
+                            entity_name=str(ad_name_txt),
+                            level_human="Объявление",
+                            triggered_rules=rules,
+                            ai_text=ai_text,
+                            ai_confidence=ai_conf,
+                        ),
                         "",
-                        f"CPA креатива: {cpa_val:.2f} $",
-                        f"Таргет: {tgt_val:.2f} $",
-                        f"Перерасход: +{max(0.0, (cpa_val / tgt_val - 1.0) * 100.0):.0f}%"
-                        if tgt_val > 0
-                        else "Перерасход: н/д",
                         f"Есть альтернативы в адсете: {alt_str}",
                     ]
 
@@ -742,55 +847,8 @@ async def _cpa_alerts_job(context: ContextTypes.DEFAULT_TYPE):
                     except Exception:
                         pass
 
-        # ====== 5) Пытаемся добавить комментарий Фокус-ИИ (DeepSeek) ======
-
-        if alerts.get("ai_enabled", True):
-            focus_comment = None
-            try:
-                data_for_analysis = {
-                    "account_id": aid,
-                    "account_name": acc_name,
-                    "date": label,
-                    "spend": spend,
-                    "total_conversions": total_convs,
-                    "cpa": cpa,
-                    "target_cpa": target_cpl,
-                }
-
-                system_msg = (
-                    "Ты — продвинутый аналитик (Focus-ИИ) для CPA-алёртов. "
-                    "Отвечай ТОЛЬКО на русском языке. "
-                    "Тебе даны затраты, количество заявок и фактический CPA относительно таргет CPA. "
-                    "Кратко оцени ситуацию и предложи одно-два действия: оставить бюджет, мягко повысить/понизить бюджет (10–30%), либо проверить креативы/аудитории. "
-                    "Отвечай очень кратко (1–2 предложения) в виде обычного текста, без JSON."
-                )
-
-                user_msg = json.dumps(data_for_analysis, ensure_ascii=False)
-
-                ds_resp = await ask_deepseek(
-                    [
-                        {"role": "system", "content": system_msg},
-                        {"role": "user", "content": user_msg},
-                    ],
-                    json_mode=False,
-                )
-
-                choice = (ds_resp.get("choices") or [{}])[0]
-                focus_comment = (choice.get("message") or {}).get("content")
-            except Exception as e:
-                focus_comment = (
-                    "Фокус-ИИ сейчас недоступен для этого CPA-алёрта "
-                    f"(ошибка {type(e).__name__}). Оцени ситуацию по цифрам выше."
-                )
-
-            if focus_comment:
-                text = f"{text}\n\n🤖 Комментарий Фокус-ИИ:\n{focus_comment.strip()}"
-
-        try:
-            await context.bot.send_message(chat_id, text_adsets)
-            await asyncio.sleep(1.0)
-        except Exception:
-            continue
+        # NB: ИИ-комментарии добавляются на уровне конкретных алёртов (кампания/адсет/объявление)
+        # и не должны ломать мониторинг.
 
 
 async def _hourly_snapshot_job(context: ContextTypes.DEFAULT_TYPE):

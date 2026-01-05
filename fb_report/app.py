@@ -60,7 +60,7 @@ from .jobs import full_daily_scan_job, daily_report_job, schedule_cpa_alerts, _r
 from services.analytics import analyze_campaigns, analyze_adsets, analyze_account, analyze_ads
 from services.facebook_api import pause_ad, fetch_adsets, fetch_ads
 from services.ai_focus import get_focus_comment, ask_deepseek
-from monitor_anomalies import build_anomaly_messages_for_account
+from fb_report.cpa_monitoring import build_anomaly_messages_for_account
 import json
 import asyncio
 
