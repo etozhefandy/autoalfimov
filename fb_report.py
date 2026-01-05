@@ -20,18 +20,10 @@ if __name__ == "__main__":
                 app.run_polling(
                     allowed_updates=Update.ALL_TYPES,
                     bootstrap_retries=-1,
-                    connect_timeout=20,
-                    read_timeout=30,
-                    write_timeout=30,
-                    pool_timeout=30,
                 )
             except TypeError:
                 app.run_polling(
                     allowed_updates=Update.ALL_TYPES,
-                    connect_timeout=20,
-                    read_timeout=30,
-                    write_timeout=30,
-                    pool_timeout=30,
                 )
         except (NetworkError, TimedOut, RetryAfter) as e:
             log.warning(

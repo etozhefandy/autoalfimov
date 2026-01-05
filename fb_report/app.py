@@ -51,7 +51,12 @@ from .reporting import (
     parse_two_ranges,
     build_account_report,
 )
-from .insights import build_heatmap_for_account, build_hourly_heatmap_for_account
+from .insights import (
+    build_heatmap_for_account,
+    build_hourly_heatmap_for_account,
+    build_weekday_heatmap_for_account,
+    build_heatmap_monitoring_summary,
+)
 from .creatives import fetch_instagram_active_ads_links, format_instagram_ads_links
 from .adsets import send_adset_report
 from .billing import send_billing, send_billing_forecast, billing_digest_job
@@ -119,18 +124,9 @@ def main_menu() -> InlineKeyboardMarkup:
     last_sync = human_last_sync()
     return InlineKeyboardMarkup(
         [
-            [
-                InlineKeyboardButton(
-                    "📊 Отчёты", callback_data="reports_menu"
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    "🆘 Мониторинг", callback_data="monitoring_menu"
-                )
-            ],
+            [InlineKeyboardButton("📊 Отчёты", callback_data="reports_menu")],
+            [InlineKeyboardButton("🆘 Мониторинг", callback_data="monitoring_menu")],
             [InlineKeyboardButton("💳 Биллинг", callback_data="billing")],
-            [InlineKeyboardButton("🔥 Тепловая карта", callback_data="hm_menu")],
             [InlineKeyboardButton("🔗 Ссылки на рекламу", callback_data="insta_links_menu")],
             [InlineKeyboardButton("⚙️ Настройки", callback_data="choose_acc_settings")],
             [
@@ -140,6 +136,56 @@ def main_menu() -> InlineKeyboardMarkup:
                 )
             ],
             [InlineKeyboardButton("ℹ️ Версия", callback_data="version")],
+        ]
+    )
+
+
+def heatmap_monitoring_accounts_kb() -> InlineKeyboardMarkup:
+    store = load_accounts()
+    if store:
+        enabled_ids = [aid for aid, row in store.items() if row.get("enabled", True)]
+        disabled_ids = [aid for aid, row in store.items() if not row.get("enabled", True)]
+        ids = enabled_ids + disabled_ids
+    else:
+        from .constants import AD_ACCOUNTS_FALLBACK
+
+        ids = AD_ACCOUNTS_FALLBACK
+
+    rows = []
+    for aid in ids:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"{_flag_line(aid)}  {get_account_name(aid)}",
+                    callback_data=f"mon_hm_acc|{aid}",
+                )
+            ]
+        )
+    rows.append([InlineKeyboardButton("⬅️ Мониторинг", callback_data="monitoring_menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+def heatmap_monitoring_modes_kb(aid: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🕒 По часам", callback_data=f"mon_hmh|{aid}")],
+            [InlineKeyboardButton("📅 По дням недели", callback_data=f"mon_hmdow|{aid}")],
+            [InlineKeyboardButton("🧠 Сводная + ИИ", callback_data=f"mon_hmsum|{aid}")],
+            [InlineKeyboardButton("⬅️ К аккаунтам", callback_data="mon_heatmap_menu")],
+        ]
+    )
+
+
+def heatmap_monitoring_hourly_periods_kb(aid: str) -> InlineKeyboardMarkup:
+    base = f"mon_hmh_p|{aid}"
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Сегодня", callback_data=f"{base}|today"),
+                InlineKeyboardButton("Вчера", callback_data=f"{base}|yday"),
+            ],
+            [InlineKeyboardButton("Последние 7 дней", callback_data=f"{base}|7d")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data=f"mon_hm_acc|{aid}")],
         ]
     )
 
@@ -299,8 +345,8 @@ def monitoring_menu_kb() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
-                    "🔥 Тепловая карта по часам",
-                    callback_data="hm_hourly_menu",
+                    "🔥 Тепловая карта",
+                    callback_data="mon_heatmap_menu",
                 )
             ],
             [
@@ -2449,6 +2495,154 @@ async def _on_cb_internal(
         )
         return
 
+    if data == "mon_heatmap_menu":
+        await safe_edit_message(
+            q,
+            "Выберите аккаунт для тепловой карты:",
+            reply_markup=heatmap_monitoring_accounts_kb(),
+        )
+        return
+
+    if data.startswith("mon_hm_acc|"):
+        aid = data.split("|", 1)[1]
+        await safe_edit_message(
+            q,
+            f"🔥 Тепловая карта — {get_account_name(aid)}\nВыберите режим:",
+            reply_markup=heatmap_monitoring_modes_kb(aid),
+        )
+        return
+
+    if data.startswith("mon_hmh|"):
+        aid = data.split("|", 1)[1]
+        await safe_edit_message(
+            q,
+            f"Выберите период для почасовой тепловой карты по {get_account_name(aid)}:",
+            reply_markup=heatmap_monitoring_hourly_periods_kb(aid),
+        )
+        return
+
+    if data.startswith("mon_hmh_p|"):
+        _, aid, mode = data.split("|", 2)
+
+        text_hm, summary = build_hourly_heatmap_for_account(aid, get_account_name, mode)
+        await safe_edit_message(q, text_hm)
+
+        try:
+            total_convs_all = int((summary or {}).get("total_conversions_all", 0) or 0)
+            total_spend_all = float((summary or {}).get("total_spend_all", 0.0) or 0.0)
+            live_today = (summary or {}).get("live_today") or {}
+            live_spend = float((live_today or {}).get("spend", 0.0) or 0.0)
+            live_total = int((live_today or {}).get("total_conversions", 0) or 0)
+        except Exception:
+            total_convs_all = 0
+            total_spend_all = 0.0
+            live_spend = 0.0
+            live_total = 0
+
+        if total_convs_all <= 0 and total_spend_all <= 0 and live_spend <= 0 and live_total <= 0:
+            return
+
+        chat_id = str(q.message.chat.id)
+        stop_event = asyncio.Event()
+        typing_task = asyncio.create_task(_typing_loop(context.bot, chat_id, stop_event))
+
+        focus_comment = None
+        try:
+            system_msg = (
+                "Ты — продвинутый аналитик по почасовой активности рекламы. "
+                "Отвечай ТОЛЬКО на русском языке. "
+                "Тебе дана матрица заявок по дням и часам, а также суммарные заявки и затраты. "
+                "Определи лучшие часы по заявкам, 'мёртвые' часы, различия между буднями и выходными (если есть) "
+                "и предложи 2–3 практических рекомендации по бюджетам/ставкам. "
+                "Отвечай кратко (до 5–7 строк обычного текста), без JSON."
+            )
+
+            summary_for_ai = dict(summary or {})
+            user_msg = json.dumps(summary_for_ai, ensure_ascii=False)
+
+            ds_resp = await ask_deepseek(
+                [
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": user_msg},
+                ],
+                json_mode=False,
+            )
+            choice = (ds_resp.get("choices") or [{}])[0]
+            focus_comment = (choice.get("message") or {}).get("content")
+        except Exception as e:
+            focus_comment = (
+                "Фокус-ИИ по тепловой карте сейчас недоступен (ошибка ИИ-сервиса). "
+                f"Причина: {type(e).__name__}. Данные выше показаны без анализа."
+            )
+        finally:
+            stop_event.set()
+            try:
+                await typing_task
+            except Exception:
+                pass
+
+        if focus_comment:
+            await context.bot.send_message(
+                chat_id,
+                f"🤖 Анализ почасовой тепловой карты:\n{focus_comment.strip()}",
+            )
+        return
+
+    if data.startswith("mon_hmdow|"):
+        aid = data.split("|", 1)[1]
+        text_dow, _summary = build_weekday_heatmap_for_account(aid, get_account_name)
+        await safe_edit_message(q, text_dow)
+        return
+
+    if data.startswith("mon_hmsum|"):
+        aid = data.split("|", 1)[1]
+        text_sum, summary = build_heatmap_monitoring_summary(aid, get_account_name)
+        await safe_edit_message(q, text_sum)
+
+        chat_id = str(q.message.chat.id)
+        stop_event = asyncio.Event()
+        typing_task = asyncio.create_task(_typing_loop(context.bot, chat_id, stop_event))
+
+        focus_comment = None
+        try:
+            system_msg = (
+                "Ты — продвинутый аналитик по недельной и почасовой активности рекламы. "
+                "Отвечай ТОЛЬКО на русском языке. "
+                "Тебе дана сводка по дням недели и по часам (агрегаты заявок и затрат). "
+                "Сформулируй рекомендации: какие дни недели и часы усиливать, какие можно отключать/снижать, "
+                "и как перераспределить бюджеты в течение недели. "
+                "Отвечай кратко (до 7–10 строк обычного текста), без JSON."
+            )
+
+            user_msg = json.dumps(summary or {}, ensure_ascii=False)
+            ds_resp = await ask_deepseek(
+                [
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": user_msg},
+                ],
+                json_mode=False,
+            )
+            choice = (ds_resp.get("choices") or [{}])[0]
+            focus_comment = (choice.get("message") or {}).get("content")
+        except Exception as e:
+            focus_comment = (
+                "Фокус-ИИ по тепловой карте сейчас недоступен (ошибка ИИ-сервиса). "
+                f"Причина: {type(e).__name__}. Данные выше показаны без анализа."
+            )
+        finally:
+            stop_event.set()
+            try:
+                await typing_task
+            except Exception:
+                pass
+
+        if focus_comment:
+            await context.bot.send_message(
+                chat_id,
+                f"🤖 Рекомендации по тепловой карте:\n{focus_comment.strip()}",
+            )
+        return
+
     if data.startswith("hmh_acc|"):
         aid = data.split("|", 1)[1]
         await safe_edit_message(
@@ -2464,6 +2658,21 @@ async def _on_cb_internal(
         text_hm, summary = build_hourly_heatmap_for_account(aid, get_account_name, mode)
 
         await safe_edit_message(q, text_hm)
+
+        try:
+            total_convs_all = int((summary or {}).get("total_conversions_all", 0) or 0)
+            total_spend_all = float((summary or {}).get("total_spend_all", 0.0) or 0.0)
+            live_today = (summary or {}).get("live_today") or {}
+            live_spend = float((live_today or {}).get("spend", 0.0) or 0.0)
+            live_total = int((live_today or {}).get("total_conversions", 0) or 0)
+        except Exception:
+            total_convs_all = 0
+            total_spend_all = 0.0
+            live_spend = 0.0
+            live_total = 0
+
+        if total_convs_all <= 0 and total_spend_all <= 0 and live_spend <= 0 and live_total <= 0:
+            return
 
         # ИИ-анализ почасовой карты с анимацией "бот печатает"
         chat_id = str(q.message.chat.id)
@@ -3593,7 +3802,25 @@ async def on_text_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def build_app() -> Application:
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    builder = Application.builder().token(TELEGRAM_TOKEN)
+
+    # Настройка таймаутов getUpdates через ApplicationBuilder (PTB>=20.7).
+    # Это заменяет deprecated-параметры connect_timeout/read_timeout/write_timeout/pool_timeout в run_polling.
+    try:
+        builder = (
+            builder.get_updates_connect_timeout(20)
+            .get_updates_read_timeout(45)
+            .get_updates_write_timeout(30)
+            .get_updates_pool_timeout(30)
+        )
+    except (AttributeError, TypeError) as e:
+        logging.getLogger(__name__).warning(
+            "PTB ApplicationBuilder.get_updates_*_timeout is not available (%s). "
+            "Upgrade python-telegram-bot to remove run_polling timeout deprecation warning.",
+            type(e).__name__,
+        )
+
+    app = builder.build()
 
     async def _on_error(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         err = context.error

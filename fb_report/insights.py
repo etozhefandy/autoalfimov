@@ -296,6 +296,16 @@ def build_hourly_heatmap_for_account(
     days = _iter_days_for_hourly_mode(mode)
     hours = [f"{h:02d}" for h in range(24)]
 
+    def _get_bucket(day_stats: dict, hour_key: str) -> dict:
+        b = (day_stats or {}).get(hour_key)
+        if b:
+            return b
+        try:
+            alt = str(int(hour_key))
+        except Exception:
+            alt = hour_key
+        return (day_stats or {}).get(alt) or {}
+
     matrix: List[Dict[str, Any]] = []
     max_convs = 0
     total_convs_all = 0
@@ -312,7 +322,7 @@ def build_hourly_heatmap_for_account(
         day_spend = 0.0
 
         for h in hours:
-            bucket = day_stats.get(h) or {}
+            bucket = _get_bucket(day_stats, h)
             val = int(bucket.get("total", 0) or 0)
             sp = float(bucket.get("spend", 0.0) or 0.0)
             row_totals.append(val)
@@ -340,8 +350,41 @@ def build_hourly_heatmap_for_account(
     lines.append(f"Период: {mode_label}")
     lines.append("")
 
+    live_today: Dict[str, Any] = {}
+    if mode == "today" and len(days) == 1:
+        today_key = days[0].strftime("%Y-%m-%d")
+        today_stats = acc_stats.get(today_key) or {}
+        if not isinstance(today_stats, dict):
+            today_stats = {}
+
+        has_any_hour_data = False
+        for h in hours:
+            if _get_bucket(today_stats, h):
+                has_any_hour_data = True
+                break
+
+        if not has_any_hour_data:
+            try:
+                ins_live = fetch_insights(aid, "today") or {}
+                spend, msgs, leads, total, _ = _blend_totals(ins_live)
+                live_today = {
+                    "spend": float(spend or 0.0),
+                    "messages": int(msgs or 0),
+                    "leads": int(leads or 0),
+                    "total_conversions": int(total or 0),
+                }
+            except Exception:
+                live_today = {}
+
     if not matrix or total_convs_all == 0:
-        lines.append("За выбранный период нет заявок (💬+📩) по часам.")
+        if live_today.get("spend", 0.0) > 0 or live_today.get("total_conversions", 0) > 0:
+            lines.append(
+                "Почасовой кэш за сегодня ещё не накоплен. "
+                f"Текущее за сегодня: {int(live_today.get('total_conversions', 0))} заявок, "
+                f"затраты: {float(live_today.get('spend', 0.0)):.2f} $."
+            )
+        else:
+            lines.append("За выбранный период нет заявок (💬+📩) по часам.")
     else:
         lines.append(
             f"Итого за период: {total_convs_all} заявок, затраты: {total_spend_all:.2f} $"
@@ -383,6 +426,7 @@ def build_hourly_heatmap_for_account(
         ],
         "total_conversions_all": total_convs_all,
         "total_spend_all": total_spend_all,
+        "live_today": live_today,
     }
 
     return text, summary
@@ -500,3 +544,117 @@ def build_heatmap_for_account(
     lines.append("▩ — пиковая активность")
 
     return "\n".join(lines)
+
+
+def build_weekday_heatmap_for_account(
+    aid: str,
+    get_account_name_fn=get_account_name,
+    mode: str = "7",
+) -> Tuple[str, Dict[str, Any]]:
+    acc_name = get_account_name_fn(aid)
+
+    daily = _load_daily_totals_for_account(aid, mode)
+
+    # 0=Mon..6=Sun
+    by_wd: Dict[int, Dict[str, Any]] = {
+        i: {"convs": 0, "spend": 0.0, "days": 0} for i in range(7)
+    }
+    for row in daily:
+        day: datetime = row["date"]
+        wd = int(day.weekday())
+        by_wd[wd]["convs"] += int(row.get("total_conversions", 0) or 0)
+        by_wd[wd]["spend"] += float(row.get("spend", 0.0) or 0.0)
+        by_wd[wd]["days"] += 1
+
+    wd_labels = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+    wd_rows: List[Dict[str, Any]] = []
+    max_convs = 0
+    total_convs_all = 0
+    total_spend_all = 0.0
+    for i in range(7):
+        convs = int(by_wd[i]["convs"] or 0)
+        spend = float(by_wd[i]["spend"] or 0.0)
+        days_cnt = int(by_wd[i]["days"] or 0)
+        avg = (convs / float(days_cnt)) if days_cnt > 0 else 0.0
+        if convs > max_convs:
+            max_convs = convs
+        total_convs_all += convs
+        total_spend_all += spend
+        wd_rows.append(
+            {
+                "weekday": i,
+                "weekday_label": wd_labels[i],
+                "conversions": convs,
+                "spend": spend,
+                "days": days_cnt,
+                "avg_conversions": avg,
+            }
+        )
+
+    lines: List[str] = []
+    lines.append(f"📅 Тепловая карта по дням недели (💬+📩) — {acc_name}")
+    lines.append(f"Период: { _mode_label(mode) }")
+    lines.append("")
+
+    if total_convs_all <= 0:
+        lines.append("За выбранный период нет заявок (💬+📩).")
+    else:
+        lines.append(
+            f"Итого: {total_convs_all} заявок, затраты: {total_spend_all:.2f} $"
+        )
+        lines.append("")
+        lines.append("День  Инт.  Заявки  Ср/день  💵")
+        lines.append("-" * 28)
+        for r in wd_rows:
+            symbol = _heat_symbol(int(r["conversions"]), max_convs)
+            lines.append(
+                f"{r['weekday_label']:<3}  {symbol}   {int(r['conversions']):>3}     {float(r['avg_conversions']):>5.1f}  {float(r['spend']):>6.2f} $"
+            )
+
+        lines.append("")
+        lines.append("Легенда интенсивности:")
+        lines.append("⬜ — нет заявок")
+        lines.append("▢ — низкая активность")
+        lines.append("▤ — средняя активность")
+        lines.append("▦ — высокая активность")
+        lines.append("▩ — пиковая активность")
+
+    summary: Dict[str, Any] = {
+        "account_id": aid,
+        "account_name": acc_name,
+        "mode": mode,
+        "mode_label": _mode_label(mode),
+        "weekdays": wd_rows,
+        "total_conversions_all": total_convs_all,
+        "total_spend_all": total_spend_all,
+    }
+
+    return "\n".join(lines), summary
+
+
+def build_heatmap_monitoring_summary(
+    aid: str,
+    get_account_name_fn=get_account_name,
+) -> Tuple[str, Dict[str, Any]]:
+    acc_name = get_account_name_fn(aid)
+
+    text_wd, summary_wd = build_weekday_heatmap_for_account(aid, get_account_name_fn, mode="7")
+    text_hr, summary_hr = build_hourly_heatmap_for_account(aid, get_account_name_fn, mode="7d")
+
+    summary: Dict[str, Any] = {
+        "account_id": aid,
+        "account_name": acc_name,
+        "weekday": summary_wd,
+        "hourly": summary_hr,
+    }
+
+    lines: List[str] = []
+    lines.append(f"🔥 Тепловая карта — сводная (неделя + часы) — {acc_name}")
+    lines.append("")
+    lines.append("=== По дням недели ===")
+    lines.append(text_wd)
+    lines.append("")
+    lines.append("=== По часам ===")
+    lines.append(text_hr)
+
+    return "\n".join(lines), summary
