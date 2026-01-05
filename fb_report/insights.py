@@ -48,6 +48,21 @@ def extract_actions(insight: dict) -> Dict[str, float]:
     return out
 
 
+def extract_costs(insight: dict) -> Dict[str, float]:
+    costs = insight.get("cost_per_action_type", []) or []
+    out: Dict[str, float] = {}
+    for c in costs:
+        at = (c or {}).get("action_type")
+        if not at:
+            continue
+        try:
+            val = float((c or {}).get("value", 0) or 0)
+        except Exception:
+            val = 0.0
+        out[at] = val
+    return out
+
+
 def _blend_totals(ins: dict):
     """
     Полностью как в старом боте:

@@ -51,6 +51,8 @@ def parse_insight(ins: Dict[str, Any]) -> Dict[str, Any]:
             "leads": 0,
             "total": 0,
             "cpa": None,
+            "msg_cpa": None,
+            "lead_cpa": None,
             "cpm": 0.0,
             "cpc": 0.0,
             "ctr": 0.0,
@@ -62,11 +64,23 @@ def parse_insight(ins: Dict[str, Any]) -> Dict[str, Any]:
     spend = to_float(ins.get("spend", 0) or 0)
 
     actions = ins.get("actions", []) or []
+    costs = ins.get("cost_per_action_type", []) or []
+
+    costs_map: Dict[str, float] = {}
+    for c in costs:
+        t = (c or {}).get("action_type")
+        if not t:
+            continue
+        costs_map[t] = to_float((c or {}).get("value", 0))
+
+    actions_map: Dict[str, float] = {}
     msgs = 0
     leads = 0
     for a in actions:
         t = a.get("action_type")
         v = to_float(a.get("value", 0))
+        if t:
+            actions_map[t] = actions_map.get(t, 0.0) + float(v)
         if t == "onsite_conversion.messaging_conversation_started_7d":
             msgs += int(v)
         if t in {
@@ -76,6 +90,29 @@ def parse_insight(ins: Dict[str, Any]) -> Dict[str, Any]:
             "lead",
         }:
             leads += int(v)
+
+    msg_action = "onsite_conversion.messaging_conversation_started_7d"
+    msg_count = int(actions_map.get(msg_action, 0) or 0)
+    msg_cpa = costs_map.get(msg_action)
+
+    lead_actions = [
+        "Website Submit Applications",
+        "offsite_conversion.fb_pixel_submit_application",
+        "offsite_conversion.fb_pixel_lead",
+        "lead",
+    ]
+    leads_cost_total = 0.0
+    leads_count_total = 0
+    for lt in lead_actions:
+        cnt = int(actions_map.get(lt, 0) or 0)
+        if cnt <= 0:
+            continue
+        leads_count_total += cnt
+        cpa_val = costs_map.get(lt)
+        if cpa_val is not None and float(cpa_val) > 0:
+            leads_cost_total += float(cpa_val) * float(cnt)
+
+    lead_cpa = (leads_cost_total / float(leads_count_total)) if leads_count_total > 0 and leads_cost_total > 0 else None
 
     total = msgs + leads
     cpa = (spend / total) if total > 0 else None
@@ -92,6 +129,8 @@ def parse_insight(ins: Dict[str, Any]) -> Dict[str, Any]:
         "leads": leads,
         "total": total,
         "cpa": cpa,
+        "msg_cpa": msg_cpa if msg_count > 0 else None,
+        "lead_cpa": lead_cpa,
         "cpm": cpm,
         "cpc": cpc,
         "ctr": ctr,
@@ -331,7 +370,16 @@ def fetch_insights_by_level(aid: str, entity_id: str, period: Dict[str, str], le
         }
     ]
 
-    fields = ["impressions", "clicks", "spend", "actions", "cpm", "cpc", "frequency"]
+    fields = [
+        "impressions",
+        "clicks",
+        "spend",
+        "actions",
+        "cost_per_action_type",
+        "cpm",
+        "cpc",
+        "frequency",
+    ]
     acc = AdAccount(aid)
     data = safe_api_call(acc.get_insights, fields=fields, params=params)
 

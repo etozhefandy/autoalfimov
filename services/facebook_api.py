@@ -99,7 +99,15 @@ def fetch_insights(aid: str, period: Any) -> Optional[Dict[str, Any]]:
     # --- 2. FACEBOOK API REQUEST ---
     params = _period_to_params(period)
     params["level"] = "account"
-    fields = ["impressions", "cpm", "clicks", "cpc", "spend", "actions"]
+    fields = [
+        "impressions",
+        "cpm",
+        "clicks",
+        "cpc",
+        "spend",
+        "actions",
+        "cost_per_action_type",
+    ]
 
     acc = AdAccount(aid)
     data = safe_api_call(acc.get_insights, fields=fields, params=params)

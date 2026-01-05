@@ -24,6 +24,7 @@ from .insights import (
     load_local_insights,
     save_local_insights,
     extract_actions,
+    extract_costs,
     _blend_totals,
 )
 
@@ -91,7 +92,15 @@ def fetch_insight(aid: str, period):
 
     acc = AdAccount(aid)
     # минимальный набор полей, с которыми у нас всё работает
-    fields = ["impressions", "cpm", "clicks", "cpc", "spend", "actions"]
+    fields = [
+        "impressions",
+        "cpm",
+        "clicks",
+        "cpc",
+        "spend",
+        "actions",
+        "cost_per_action_type",
+    ]
 
     params: dict[str, Any] = {"level": "account"}
     if isinstance(period, dict):
@@ -177,6 +186,7 @@ def build_report(aid: str, period, label: str = "") -> str:
     spend = float(ins.get("spend", 0) or 0)
 
     acts = extract_actions(ins)
+    costs = extract_costs(ins)
     flags = metrics_flags(aid)
 
     # link_click берём из actions (action_type="link_click"),
@@ -192,38 +202,69 @@ def build_report(aid: str, period, label: str = "") -> str:
     # (он уже использует те же action_type, что и раньше).
     _, msgs, leads, total_conv, blended_cpa = _blend_totals(ins)
 
+    msg_action = "onsite_conversion.messaging_conversation_started_7d"
+    msg_cpa = costs.get(msg_action)
+    if msgs <= 0:
+        msg_cpa = None
+
+    lead_actions = [
+        "Website Submit Applications",
+        "offsite_conversion.fb_pixel_submit_application",
+        "offsite_conversion.fb_pixel_lead",
+        "lead",
+    ]
+    leads_cost_total = 0.0
+    leads_count_total = 0
+    for lt in lead_actions:
+        cnt = int(acts.get(lt, 0) or 0)
+        if cnt <= 0:
+            continue
+        leads_count_total += cnt
+        cpa_val = costs.get(lt)
+        if cpa_val is not None and float(cpa_val) > 0:
+            leads_cost_total += float(cpa_val) * float(cnt)
+    lead_cpa = (
+        (leads_cost_total / float(leads_count_total))
+        if leads_count_total > 0 and leads_cost_total > 0
+        else None
+    )
+
     body = []
     body.append(f"👁 Показы: {fmt_int(impressions)}")
     body.append(f"🎯 CPM: {cpm:.2f} $")
     body.append(f"🖱 Клики (все): {fmt_int(clicks_all)}")
     body.append(f"📈 CTR (все клики): {ctr_all:.2f} %")
 
-    if link_clicks > 0:
-        body.append(f"🔗 Клики (по ссылке): {fmt_int(link_clicks)}")
-        body.append(f"📈 CTR (по ссылке): {ctr_link:.2f} %")
+    body.append(f"🔗 Клики (по ссылке): {fmt_int(link_clicks)}")
+    body.append(f"📈 CTR (по ссылке): {ctr_link:.2f} %")
 
     if cpc > 0:
         body.append(f"💸 CPC: {cpc:.2f} $")
+    else:
+        body.append("💸 CPC: —")
 
     if spend > 0:
         body.append(f"💵 Затраты: {spend:.2f} $")
+    else:
+        body.append("💵 Затраты: —")
 
     if flags["messaging"]:
         body.append(f"✉️ Переписки: {msgs}")
-        if msgs > 0:
-            body.append(f"💬💲 Цена переписки: {(spend / msgs):.2f} $")
+        if msg_cpa is not None and float(msg_cpa) > 0:
+            body.append(f"💬💲 Цена переписки: {float(msg_cpa):.2f} $")
         else:
             body.append("💬💲 Цена переписки: —")
 
     if flags["leads"]:
         body.append(f"♿️ Лиды: {leads}")
-        if leads > 0:
-            body.append(f"♿️💲 Цена лида: $ {(spend / leads):.2f}")
+        if lead_cpa is not None and float(lead_cpa) > 0:
+            body.append(f"♿️💲 Цена лида: $ {float(lead_cpa):.2f}")
         else:
             body.append("♿️💲 Цена лида: —")
 
     # Blended CPA показываем только при включённых переписках и лидах одновременно
-    if flags.get("messaging") and flags.get("leads"):
+    # и когда обе метрики реально > 0.
+    if flags.get("messaging") and flags.get("leads") and msgs > 0 and leads > 0:
         body.extend(format_blended_block(spend, msgs, leads).split("\n"))
 
     return hdr + "\n".join(body)
@@ -286,6 +327,8 @@ def format_entity_line(
     spend: float,
     msgs: int,
     leads: int,
+    msg_cpa: float | None,
+    lead_cpa: float | None,
     flags: dict,
 ) -> str | None:
     eff_msgs = int(msgs or 0) if flags.get("messaging") else 0
@@ -301,18 +344,88 @@ def format_entity_line(
     if eff_leads >= eff_msgs:
         # При равенстве (в т.ч. 0/0) — лиды.
         parts.append(f"♿️ лиды {eff_leads}")
-        if eff_leads > 0:
-            parts.append(f"цена лида $ {spend_f / float(eff_leads):.2f}")
+        if lead_cpa is not None and float(lead_cpa) > 0:
+            parts.append(f"цена лида $ {float(lead_cpa):.2f}")
         else:
             parts.append("цена лида —")
     else:
         parts.append(f"переписки {eff_msgs}")
-        if eff_msgs > 0:
-            parts.append(f"цена переписки $ {spend_f / float(eff_msgs):.2f}")
+        if msg_cpa is not None and float(msg_cpa) > 0:
+            parts.append(f"цена переписки $ {float(msg_cpa):.2f}")
         else:
             parts.append("цена переписки —")
 
     return " — ".join(parts)
+
+
+def _format_entity_block(
+    name: str,
+    spend: float,
+    msgs: int,
+    leads: int,
+    msg_cpa: float | None,
+    lead_cpa: float | None,
+    flags: dict,
+) -> str:
+    lines: list[str] = []
+    lines.append(str(name or "<без названия>"))
+    lines.append(f"Затраты: $ {float(spend or 0.0):.2f}")
+
+    if flags.get("messaging") and int(msgs or 0) > 0:
+        cpa_part = f" (CPA $ {float(msg_cpa):.2f})" if msg_cpa is not None and float(msg_cpa) > 0 else " (CPA —)"
+        lines.append(f"Переписки: {int(msgs or 0)}{cpa_part}")
+
+    if flags.get("leads") and int(leads or 0) > 0:
+        cpa_part = f" (CPA $ {float(lead_cpa):.2f})" if lead_cpa is not None and float(lead_cpa) > 0 else " (CPA —)"
+        lines.append(f"Лиды: {int(leads or 0)}{cpa_part}")
+
+    return "\n".join(lines)
+
+
+def _truncate_entity_blocks(
+    *,
+    header: str,
+    entities: list[dict],
+    flags: dict,
+    max_chars: int,
+    current_chars: int,
+    kind: str,
+) -> tuple[str, int]:
+    shown_blocks: list[str] = []
+    for e in entities:
+        name = str((e or {}).get("name") or "<без названия>")
+        spend = float((e or {}).get("spend", 0.0) or 0.0)
+        msgs = int((e or {}).get("msgs", 0) or 0)
+        leads = int((e or {}).get("leads", 0) or 0)
+        block = _format_entity_block(
+            name,
+            spend,
+            msgs,
+            leads,
+            (e or {}).get("msg_cpa"),
+            (e or {}).get("lead_cpa"),
+            flags,
+        )
+
+        candidate = header
+        if shown_blocks:
+            candidate += "\n\n" + "\n\n".join(shown_blocks)
+        candidate += "\n\n" + block
+
+        if current_chars + len(candidate) > max_chars:
+            break
+        shown_blocks.append(block)
+
+    remaining = max(0, len(entities) - len(shown_blocks))
+    if not shown_blocks:
+        return header + "\nнет данных за период", remaining
+
+    text = header + "\n\n" + "\n\n".join(shown_blocks)
+    if remaining > 0:
+        tail = f"\n\n…и ещё {remaining} {kind}"
+        if current_chars + len(text) + len(tail) <= max_chars:
+            text += tail
+    return text, remaining
 
 
 def build_account_report(
@@ -342,13 +455,22 @@ def build_account_report(
     mr = (store.get(aid, {}) or {}).get("morning_report", {}) or {}
     show_blended_after_sections = mr.get("show_blended_after_sections", True)
 
-    # Blended показываем только при включённых переписках и лидах одновременно.
-    show_blended = bool(flags.get("messaging")) and bool(flags.get("leads"))
+    # Blended показываем только при включённых переписках и лидах одновременно
+    # и когда обе метрики реально > 0.
+    show_blended = (
+        bool(flags.get("messaging"))
+        and bool(flags.get("leads"))
+        and int(acc_msgs or 0) > 0
+        and int(acc_leads or 0) > 0
+    )
 
     if lvl == "ACCOUNT":
         return base
 
     sep = "\n────────────\n"
+
+    tg_max_chars = 3900
+    current_chars = len(base)
 
     chunks: list[str] = []
 
@@ -360,47 +482,20 @@ def build_account_report(
 
     # Единственный обязательный фильтр: spend > 0
     camps_spend = [c for c in (camps or []) if float((c or {}).get("spend", 0.0) or 0.0) > 0]
-    camps_top = sorted(
-        camps_spend,
-        key=lambda x: float((x or {}).get("spend", 0.0) or 0.0),
-        reverse=True,
-    )[: max(0, int(top_n))]
-
-    camp_lines: list[str] = []
-    if camps_top:
-        shown = 0
-        for c in camps_top:
-            name = str((c or {}).get("name") or "<без названия>")
-            spend = float((c or {}).get("spend", 0.0) or 0.0)
-            msgs = int((c or {}).get("msgs", 0) or 0)
-            leads = int((c or {}).get("leads", 0) or 0)
-
-            line = format_entity_line(
-                shown + 1,
-                name,
-                spend,
-                msgs,
-                leads,
-                flags,
-            )
-            if not line:
-                continue
-
-            shown += 1
-            camp_lines.append(line)
-
-        if not camp_lines:
-            camp_lines.append("нет данных за период")
-            chunks.append("📣 Кампании (топ)\n" + "\n".join(camp_lines))
-        else:
-            chunks.append("📣 Кампании (топ)\n" + "\n".join(camp_lines))
-        if show_blended_after_sections and show_blended:
+    camps_text, _ = _truncate_entity_blocks(
+        header="📣 Кампании",
+        entities=camps_spend,
+        flags=flags,
+        max_chars=tg_max_chars,
+        current_chars=current_chars + len(sep),
+        kind="кампаний",
+    )
+    chunks.append(camps_text)
+    current_chars += len(sep) + len(camps_text)
+    if show_blended_after_sections and show_blended:
+        if current_chars + len(sep) + len(acc_blended_after_sections) <= tg_max_chars:
             chunks.append(acc_blended_after_sections)
-    else:
-        camp_lines.append("нет данных за период")
-        chunks.append("📣 Кампании (топ)\n" + "\n".join(camp_lines))
-        if show_blended_after_sections and show_blended:
-            chunks.append(acc_blended_after_sections)
+            current_chars += len(sep) + len(acc_blended_after_sections)
 
     if lvl == "ADSET":
         adsets: list[dict] = []
@@ -411,51 +506,24 @@ def build_account_report(
 
         # Единственный обязательный фильтр: spend > 0
         adsets_spend = [a for a in (adsets or []) if float((a or {}).get("spend", 0.0) or 0.0) > 0]
-        adsets_top = sorted(
-            adsets_spend,
-            key=lambda x: float((x or {}).get("spend", 0.0) or 0.0),
-            reverse=True,
-        )[: max(0, int(top_n))]
-
-        adset_lines: list[str] = []
-        if adsets_top:
-            shown = 0
-            for a in adsets_top:
-                name = str((a or {}).get("name") or (a or {}).get("adset_id") or "<без названия>")
-                spend = float((a or {}).get("spend", 0.0) or 0.0)
-                msgs = int((a or {}).get("msgs", 0) or 0)
-                leads = int((a or {}).get("leads", 0) or 0)
-
-                line = format_entity_line(
-                    shown + 1,
-                    name,
-                    spend,
-                    msgs,
-                    leads,
-                    flags,
-                )
-                if not line:
-                    continue
-
-                shown += 1
-                adset_lines.append(line)
-
-            if not adset_lines:
-                adset_lines.append("нет данных за период")
-                chunks.append("🧩 Адсеты (топ)\n" + "\n".join(adset_lines))
-            else:
-                chunks.append("🧩 Адсеты (топ)\n" + "\n".join(adset_lines))
-            if show_blended_after_sections and show_blended:
+        adsets_text, _ = _truncate_entity_blocks(
+            header="🧩 Адсеты",
+            entities=adsets_spend,
+            flags=flags,
+            max_chars=tg_max_chars,
+            current_chars=current_chars + len(sep),
+            kind="адсетов",
+        )
+        chunks.append(adsets_text)
+        current_chars += len(sep) + len(adsets_text)
+        if show_blended_after_sections and show_blended:
+            if current_chars + len(sep) + len(acc_blended_after_sections) <= tg_max_chars:
                 chunks.append(acc_blended_after_sections)
-        else:
-            adset_lines.append("нет данных за период")
-            chunks.append("🧩 Адсеты (топ)\n" + "\n".join(adset_lines))
-            if show_blended_after_sections and show_blended:
-                chunks.append(acc_blended_after_sections)
+                current_chars += len(sep) + len(acc_blended_after_sections)
 
     # Разделитель обязателен между блоками.
-    text = base + sep + (sep.join(chunks))
-    return _collapse_double_separators(text)
+    out = base + sep + sep.join(chunks)
+    return _collapse_double_separators(out)
 
 
 async def send_period_report(
