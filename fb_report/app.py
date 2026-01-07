@@ -41,6 +41,9 @@ from .storage import (
     human_last_sync,
     upsert_from_bm,
     metrics_flags,
+    get_lead_metric_for_account,
+    set_lead_metric_for_account,
+    clear_lead_metric_for_account,
 )
 from .reporting import (
     fmt_int,
@@ -63,7 +66,7 @@ from .billing import send_billing, send_billing_forecast, billing_digest_job
 from .jobs import full_daily_scan_job, daily_report_job, schedule_cpa_alerts, _resolve_account_cpa
 
 from services.analytics import analyze_campaigns, analyze_adsets, analyze_account, analyze_ads
-from services.facebook_api import pause_ad, fetch_adsets, fetch_ads
+from services.facebook_api import pause_ad, fetch_adsets, fetch_ads, fetch_insights
 from services.ai_focus import get_focus_comment, ask_deepseek, sanitize_ai_text
 from fb_report.cpa_monitoring import build_anomaly_messages_for_account
 import json
@@ -144,6 +147,76 @@ def main_menu() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("ℹ️ Версия", callback_data="version")],
         ]
     )
+
+
+def _lead_metric_label_for_action_type(action_type: str) -> str:
+    at = str(action_type or "").strip()
+    if not at:
+        return "(пусто)"
+
+    known = {
+        "lead": "Лид",
+        "purchase": "Покупка",
+        "submit_application": "Отправка заявок",
+        "Website Submit Applications": "Отправка заявок на сайте",
+        "offsite_conversion.fb_pixel_submit_application": "Отправка заявок (Pixel)",
+        "offsite_conversion.fb_pixel_lead": "Лид (Pixel)",
+        "onsite_conversion.messaging_conversation_started_7d": "Переписка (7d)",
+    }
+    if at in known:
+        return known[at]
+
+    if at.startswith("offsite_conversion.custom"):
+        suffix = at.split(".")[-1]
+        if suffix.isdigit():
+            try:
+                from facebook_business.adobjects.customconversion import CustomConversion
+
+                name = CustomConversion(suffix).api_get(fields=["name"]).get("name")
+                if name:
+                    return f"Custom: {name}"
+            except Exception:
+                pass
+        return f"Custom: {suffix}"
+
+    if at.startswith("offsite_conversion"):
+        return at.replace("offsite_conversion.", "Offsite conversion: ")
+
+    if "_" in at:
+        return at.replace("_", " ").strip().capitalize()
+
+    return at
+
+
+def _discover_lead_metrics_for_account(aid: str) -> list[dict]:
+    now = datetime.now(ALMATY_TZ)
+    yday = (now - timedelta(days=1)).date()
+    period = {
+        "since": yday.strftime("%Y-%m-%d"),
+        "until": yday.strftime("%Y-%m-%d"),
+    }
+    ins = fetch_insights(aid, period) or {}
+    actions = (ins or {}).get("actions") or []
+
+    out = []
+    seen = set()
+    for a in actions:
+        at = (a or {}).get("action_type")
+        if not at:
+            continue
+        try:
+            v = float((a or {}).get("value", 0) or 0)
+        except Exception:
+            v = 0.0
+        if v <= 0:
+            continue
+        if at in seen:
+            continue
+        seen.add(at)
+        out.append({"action_type": str(at), "label": _lead_metric_label_for_action_type(str(at))})
+
+    out.sort(key=lambda x: (x.get("label") or x.get("action_type") or ""))
+    return out
 
 
 def heatmap_monitoring_accounts_kb() -> InlineKeyboardMarkup:
@@ -1053,6 +1126,12 @@ def settings_kb(aid: str) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     mr_text,
                     callback_data=f"mr_menu|{aid}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "📊 Метрика лидов",
+                    callback_data=f"lead_metric|{aid}",
                 )
             ],
             [
@@ -2915,6 +2994,144 @@ async def _on_cb_internal(
             f"Настройки: {get_account_name(aid)}",
             reply_markup=settings_kb(aid),
         )
+        return
+
+    if data.startswith("lead_metric|"):
+        aid = data.split("|", 1)[1]
+        sel = get_lead_metric_for_account(aid)
+        if sel:
+            current = f"✅ {sel.get('label') or sel.get('action_type')}"
+        else:
+            current = "Стандартная (по умолчанию)"
+
+        text = (
+            f"📊 Метрика лидов — {get_account_name(aid)}\n\n"
+            f"Текущая метрика: {current}\n\n"
+            "Если метрика не выбрана, бот считает лиды по стандартным action_type."
+        )
+
+        kb = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "Сменить",
+                        callback_data=f"lead_metric_choose|{aid}",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "Сбросить (стандартная)",
+                        callback_data=f"lead_metric_clear|{aid}",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "Показать action_type (debug)",
+                        callback_data=f"lead_metric_debug|{aid}",
+                    )
+                ],
+                [InlineKeyboardButton("⬅️ Назад", callback_data=f"set1|{aid}")],
+            ]
+        )
+        await safe_edit_message(q, text, reply_markup=kb)
+        return
+
+    if data.startswith("lead_metric_clear|"):
+        aid = data.split("|", 1)[1]
+        clear_lead_metric_for_account(aid)
+        await q.answer("Метрика лидов сброшена.")
+        new_data = f"lead_metric|{aid}"
+        await _on_cb_internal(update, context, q, chat_id, new_data)
+        return
+
+    if data.startswith("lead_metric_debug|"):
+        aid = data.split("|", 1)[1]
+        opts = _discover_lead_metrics_for_account(aid)
+        if not opts:
+            text = (
+                f"action_type за вчера — {get_account_name(aid)}\n\n"
+                "Нет ненулевых action_type за вчера (или нет доступа)."
+            )
+        else:
+            lines = [f"action_type за вчера — {get_account_name(aid)}", ""]
+            for it in opts:
+                lines.append(f"- {it['action_type']}")
+            text = "\n".join(lines)
+        kb = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("⬅️ Назад", callback_data=f"lead_metric|{aid}")]]
+        )
+        await safe_edit_message(q, text, reply_markup=kb)
+        return
+
+    if data.startswith("lead_metric_choose|"):
+        aid = data.split("|", 1)[1]
+        options = _discover_lead_metrics_for_account(aid)
+        if not options:
+            kb = InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ Назад", callback_data=f"lead_metric|{aid}")]]
+            )
+            await safe_edit_message(
+                q,
+                "Не удалось найти ненулевые метрики за вчера. Попробуй позже или включи spend/конверсии и повтори.",
+                reply_markup=kb,
+            )
+            return
+
+        mapping = {str(i): it for i, it in enumerate(options)}
+        context.user_data["lead_metric_options"] = {"aid": aid, "items": mapping}
+
+        current = get_lead_metric_for_account(aid)
+        current_at = (current or {}).get("action_type") if current else None
+
+        rows = []
+        for i, it in mapping.items():
+            label = it.get("label") or it.get("action_type")
+            if current_at and it.get("action_type") == current_at:
+                label = f"✅ {label}"
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        str(label),
+                        callback_data=f"lead_metric_set|{aid}|{i}",
+                    )
+                ]
+            )
+        rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"lead_metric|{aid}")])
+        await safe_edit_message(q, "Выбери метрику лидов (за вчера):", reply_markup=InlineKeyboardMarkup(rows))
+        return
+
+    if data.startswith("lead_metric_set|"):
+        try:
+            _p, aid, idx = data.split("|", 2)
+        except ValueError:
+            await q.answer("Некорректные данные выбора метрики.", show_alert=True)
+            return
+
+        stash = context.user_data.get("lead_metric_options") or {}
+        if stash.get("aid") != aid:
+            await q.answer("Список метрик устарел. Нажми 'Сменить' ещё раз.", show_alert=True)
+            return
+
+        items = stash.get("items") or {}
+        it = items.get(str(idx))
+        if not it:
+            await q.answer("Метрика не найдена. Нажми 'Сменить' ещё раз.", show_alert=True)
+            return
+
+        action_type = it.get("action_type")
+        label = it.get("label")
+        if not action_type:
+            await q.answer("Пустой action_type.", show_alert=True)
+            return
+
+        set_lead_metric_for_account(aid, action_type=str(action_type), label=str(label or action_type))
+        await q.answer("Метрика лидов обновлена.")
+        await context.bot.send_message(
+            chat_id,
+            "Метрика лидов обновлена. Все отчёты и ИИ теперь считают по ней.",
+        )
+        new_data = f"lead_metric|{aid}"
+        await _on_cb_internal(update, context, q, chat_id, new_data)
         return
 
     if data.startswith("toggle_enabled|"):

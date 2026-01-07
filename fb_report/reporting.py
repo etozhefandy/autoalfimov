@@ -29,6 +29,7 @@ from .insights import (
 )
 
 from services.analytics import analyze_campaigns, analyze_adsets
+from services.analytics import lead_cost_and_count
 
 
 # ========= Утилиты форматирования =========
@@ -200,29 +201,14 @@ def build_report(aid: str, period, label: str = "") -> str:
     # Заявки (как в старом боте)
     # msgs + leads и blended CPA рассчитываем через _blend_totals
     # (он уже использует те же action_type, что и раньше).
-    _, msgs, leads, total_conv, blended_cpa = _blend_totals(ins)
+    _, msgs, leads, total_conv, blended_cpa = _blend_totals(ins, aid=aid)
 
     msg_action = "onsite_conversion.messaging_conversation_started_7d"
     msg_cpa = costs.get(msg_action)
     if msgs <= 0:
         msg_cpa = None
 
-    lead_actions = [
-        "Website Submit Applications",
-        "offsite_conversion.fb_pixel_submit_application",
-        "offsite_conversion.fb_pixel_lead",
-        "lead",
-    ]
-    leads_cost_total = 0.0
-    leads_count_total = 0
-    for lt in lead_actions:
-        cnt = int(acts.get(lt, 0) or 0)
-        if cnt <= 0:
-            continue
-        leads_count_total += cnt
-        cpa_val = costs.get(lt)
-        if cpa_val is not None and float(cpa_val) > 0:
-            leads_cost_total += float(cpa_val) * float(cnt)
+    leads_count_total, leads_cost_total = lead_cost_and_count(acts, costs, aid=aid)
     lead_cpa = (
         (leads_cost_total / float(leads_count_total))
         if leads_count_total > 0 and leads_cost_total > 0

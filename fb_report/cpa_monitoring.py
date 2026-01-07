@@ -9,16 +9,11 @@ from fb_report.insights import extract_actions, extract_costs
 from fb_report.storage import get_account_name
 from services.analytics import analyze_adsets
 from services.analytics import fetch_insights_by_level
+from services.analytics import lead_cost_and_count
 from services.facebook_api import fetch_insights
 
 
 MSG_ACTION = "onsite_conversion.messaging_conversation_started_7d"
-LEAD_ACTIONS = [
-    "Website Submit Applications",
-    "offsite_conversion.fb_pixel_submit_application",
-    "offsite_conversion.fb_pixel_lead",
-    "lead",
-]
 
 
 def _build_day_period(day: datetime) -> Dict[str, str]:
@@ -33,7 +28,7 @@ def _iter_last_days(days: int) -> List[Dict[str, str]]:
     return [_build_day_period(now - timedelta(days=i)) for i in range(max(1, int(days)))]
 
 
-def compute_effective_cpa(insight: Dict[str, Any]) -> Tuple[Optional[float], int]:
+def compute_effective_cpa(insight: Dict[str, Any], *, aid: str) -> Tuple[Optional[float], int]:
     """CPA по cost_per_action_type для (переписки + лиды).
 
     Возвращает (cpa, total_actions). Если total_actions=0 или нет cost-данных → (None, total_actions).
@@ -55,14 +50,10 @@ def compute_effective_cpa(insight: Dict[str, Any]) -> Tuple[Optional[float], int
         if msg_cpa is not None and float(msg_cpa) > 0:
             total_cost += float(msg_cpa) * float(msg_cnt)
 
-    for lt in LEAD_ACTIONS:
-        cnt = int(acts.get(lt, 0) or 0)
-        if cnt <= 0:
-            continue
-        total_actions += cnt
-        cpa_val = costs.get(lt)
-        if cpa_val is not None and float(cpa_val) > 0:
-            total_cost += float(cpa_val) * float(cnt)
+    lead_cnt, lead_cost = lead_cost_and_count(acts, costs, aid=aid)
+    if lead_cnt > 0:
+        total_actions += int(lead_cnt)
+        total_cost += float(lead_cost)
 
     if total_actions <= 0:
         return None, 0
@@ -130,7 +121,7 @@ def build_monitor_snapshot(
             else:
                 ins = fetch_insights_by_level(aid, str(entity_id), p, level=lvl)
 
-        cpa, total_actions = compute_effective_cpa(ins or {})
+        cpa, total_actions = compute_effective_cpa(ins or {}, aid=aid)
         series.append(cpa)
         totals.append(int(total_actions or 0))
         spend_series.append(float((ins or {}).get("spend", 0.0) or 0.0))

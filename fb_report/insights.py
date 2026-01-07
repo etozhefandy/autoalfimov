@@ -13,6 +13,8 @@ from services.storage import (
 from .constants import ALMATY_TZ
 from .storage import get_account_name
 
+from services.analytics import count_leads_from_actions
+
 
 # ================== ЛОКАЛЬНЫЙ КЭШ ИНСАЙТОВ ==================
 def load_local_insights(aid: str) -> dict:
@@ -63,7 +65,7 @@ def extract_costs(insight: dict) -> Dict[str, float]:
     return out
 
 
-def _blend_totals(ins: dict):
+def _blend_totals(ins: dict, *, aid: Optional[str] = None):
     """
     Полностью как в старом боте:
 
@@ -84,13 +86,7 @@ def _blend_totals(ins: dict):
         acts.get("onsite_conversion.messaging_conversation_started_7d", 0) or 0
     )
 
-    leads = int(
-        acts.get("Website Submit Applications", 0)
-        or acts.get("offsite_conversion.fb_pixel_submit_application", 0)
-        or acts.get("offsite_conversion.fb_pixel_lead", 0)
-        or acts.get("lead", 0)
-        or 0
-    )
+    leads = count_leads_from_actions(acts, aid=aid)
 
     total = msgs + leads
     blended = (spend / total) if total > 0 else None
@@ -182,7 +178,7 @@ def _load_daily_totals_for_account(
             )
             continue
 
-        spend, msgs, leads, total, _ = _blend_totals(ins)
+        spend, msgs, leads, total, _ = _blend_totals(ins, aid=aid)
         result.append(
             {
                 "date": day,
@@ -366,7 +362,7 @@ def build_hourly_heatmap_for_account(
         if not has_any_hour_data:
             try:
                 ins_live = fetch_insights(aid, "today") or {}
-                spend, msgs, leads, total, _ = _blend_totals(ins_live)
+                spend, msgs, leads, total, _ = _blend_totals(ins_live, aid=aid)
                 live_today = {
                     "spend": float(spend or 0.0),
                     "messages": int(msgs or 0),

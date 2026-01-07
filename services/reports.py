@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 
 from config import ALMATY_TZ
 from services.facebook_api import fetch_insights
+from services.analytics import count_leads_from_actions
 from services.storage import (
     load_accounts,
     save_accounts,
@@ -42,7 +43,11 @@ def extract_actions(ins: Dict[str, Any]) -> Dict[str, float]:
     return out
 
 
-def blend_totals(ins: Dict[str, Any]) -> Tuple[float, int, int, int, Optional[float]]:
+def blend_totals(
+    ins: Dict[str, Any],
+    *,
+    aid: Optional[str] = None,
+) -> Tuple[float, int, int, int, Optional[float]]:
     """
     Возвращает:
     (spend, msgs, leads, total, blended_cpa)
@@ -53,13 +58,7 @@ def blend_totals(ins: Dict[str, Any]) -> Tuple[float, int, int, int, Optional[fl
     msgs = int(
         acts.get("onsite_conversion.messaging_conversation_started_7d", 0) or 0
     )
-    leads = int(
-        acts.get("Website Submit Applications", 0)
-        or acts.get("offsite_conversion.fb_pixel_submit_application", 0)
-        or acts.get("offsite_conversion.fb_pixel_lead", 0)
-        or acts.get("lead", 0)
-        or 0
-    )
+    leads = count_leads_from_actions(acts, aid=aid)
 
     total = msgs + leads
     blended = (spend / total) if total > 0 else None
@@ -139,7 +138,7 @@ def build_report(aid: str, period: Any, label: str = "") -> str:
     cpm = float(ins.get("cpm", 0) or 0)
     clicks_all = int(ins.get("clicks", 0) or 0)
     cpc = float(ins.get("cpc", 0) or 0)
-    spend, msgs, leads, total_conv, blended_cpa = blend_totals(ins)
+    spend, msgs, leads, total_conv, blended_cpa = blend_totals(ins, aid=aid)
 
     # actions → link_clicks
     acts = extract_actions(ins)
@@ -243,7 +242,7 @@ def build_comparison_report(
         cpm = float(ins.get("cpm", 0) or 0)
         clicks = int(ins.get("clicks", 0) or 0)
         cpc = float(ins.get("cpc", 0) or 0)
-        spend, msgs, leads, total, blended = blend_totals(ins)
+        spend, msgs, leads, total, blended = blend_totals(ins, aid=aid)
         return {
             "impr": impr,
             "cpm": cpm,

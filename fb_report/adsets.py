@@ -54,7 +54,7 @@ def fetch_adset_insights_7d(aid: str):
         adset_id = row.get("adset_id")
         adset_name = row.get("adset_name") or adset_id or "(adset)"
 
-        spend, msgs, leads, total, blended = _blend_totals(row)
+        spend, msgs, leads, total, blended = _blend_totals(row, aid=aid)
         impr = int(row.get("impressions", 0) or 0)
         clicks = int(row.get("clicks", 0) or 0)
 

@@ -2,6 +2,8 @@ import math
 from datetime import datetime, timedelta
 from facebook_business.adobjects.adaccount import AdAccount
 
+from services.analytics import count_leads_from_actions
+
 
 def _extract_actions(insight):
     acts = insight.get("actions", []) or []
@@ -79,11 +81,7 @@ def build_heatmap_for_account(aid, get_account_name, mode: str = "7"):
         acts = _extract_actions(row)
 
         msgs = int(acts.get("onsite_conversion.messaging_conversation_started_7d", 0))
-        leads = int(
-            acts.get("Website Submit Applications", 0)
-            or acts.get("offsite_conversion.fb_pixel_lead", 0)
-            or acts.get("lead", 0)
-        )
+        leads = count_leads_from_actions(acts, aid=aid)
 
         cpa = _calculate_cpa(spend, msgs, leads)
         freq = float(row.get("frequency", 0) or 0)

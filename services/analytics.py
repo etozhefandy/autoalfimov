@@ -1,5 +1,6 @@
 # services/analytics.py
 
+import os
 from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime, timedelta
 import logging
@@ -12,6 +13,132 @@ from services.facebook_api import (
 )
 from services.storage import load_accounts
 from fb_report.constants import ALMATY_TZ
+
+
+def _parse_action_type_patterns(raw: str) -> Tuple[set[str], List[str]]:
+    exact: set[str] = set()
+    prefixes: List[str] = []
+    for part in (raw or "").split(","):
+        p = (part or "").strip()
+        if not p:
+            continue
+        if p.endswith(".*"):
+            prefixes.append(p[:-1])
+            continue
+        if "*" in p:
+            prefixes.append(p.split("*", 1)[0])
+            continue
+        exact.add(p)
+    return exact, prefixes
+
+
+def _lead_action_patterns() -> Tuple[set[str], List[str]]:
+    raw = os.getenv(
+        "FB_LEAD_ACTION_TYPES",
+        "Website Submit Applications,offsite_conversion.fb_pixel_submit_application,offsite_conversion.fb_pixel_lead,lead,submit_application,offsite_conversion.custom.*",
+    )
+    return _parse_action_type_patterns(raw)
+
+
+def _is_match(action_type: str, exact: set[str], prefixes: List[str]) -> bool:
+    if action_type in exact:
+        return True
+    for pref in prefixes:
+        if action_type.startswith(pref):
+            return True
+    return False
+
+
+def get_lead_action_patterns() -> Tuple[set[str], List[str]]:
+    return _lead_action_patterns()
+
+
+def get_selected_lead_action_type(aid: str) -> Optional[str]:
+    try:
+        store = load_accounts() or {}
+        row = store.get(str(aid)) or {}
+        sel = row.get("lead_metric")
+        if isinstance(sel, dict):
+            at = sel.get("action_type")
+        else:
+            at = sel
+        at = (str(at).strip() if at else "")
+        return at or None
+    except Exception:
+        return None
+
+
+def count_leads_from_actions(
+    actions: Dict[str, float],
+    *,
+    aid: Optional[str] = None,
+    lead_action_type: Optional[str] = None,
+) -> int:
+    if lead_action_type is None and aid:
+        lead_action_type = get_selected_lead_action_type(aid)
+
+    total = 0
+    for t, v in (actions or {}).items():
+        if not t:
+            continue
+
+        if lead_action_type:
+            if str(t) != str(lead_action_type):
+                continue
+        else:
+            lead_exact, lead_prefixes = _lead_action_patterns()
+            if not _is_match(str(t), lead_exact, lead_prefixes):
+                continue
+
+        try:
+            total += int(float(v or 0))
+        except Exception:
+            continue
+    return int(total)
+
+
+def lead_cost_and_count(
+    actions: Dict[str, float],
+    costs: Dict[str, float],
+    *,
+    aid: Optional[str] = None,
+    lead_action_type: Optional[str] = None,
+) -> Tuple[int, float]:
+    if lead_action_type is None and aid:
+        lead_action_type = get_selected_lead_action_type(aid)
+
+    total_cnt = 0
+    total_cost = 0.0
+
+    for t, v in (actions or {}).items():
+        if not t:
+            continue
+
+        if lead_action_type:
+            if str(t) != str(lead_action_type):
+                continue
+        else:
+            lead_exact, lead_prefixes = _lead_action_patterns()
+            if not _is_match(str(t), lead_exact, lead_prefixes):
+                continue
+        try:
+            cnt = int(float(v or 0))
+        except Exception:
+            cnt = 0
+        if cnt <= 0:
+            continue
+        total_cnt += cnt
+
+        cpa_val = (costs or {}).get(str(t))
+        if cpa_val is not None:
+            try:
+                cpa_f = float(cpa_val)
+            except Exception:
+                cpa_f = 0.0
+            if cpa_f > 0:
+                total_cost += cpa_f * float(cnt)
+
+    return int(total_cnt), float(total_cost)
 
 
 # ============================================================
@@ -38,7 +165,7 @@ def to_float(v: Any) -> float:
 # 🔥 ПАРСИНГ INSIGHT → нормальные метрики
 # ============================================================
 
-def parse_insight(ins: Dict[str, Any]) -> Dict[str, Any]:
+def parse_insight(ins: Dict[str, Any], *, aid: Optional[str] = None) -> Dict[str, Any]:
     """
     Превращает insight-словарь в нормальные метрики в одном месте.
     """
@@ -75,7 +202,6 @@ def parse_insight(ins: Dict[str, Any]) -> Dict[str, Any]:
 
     actions_map: Dict[str, float] = {}
     msgs = 0
-    leads = 0
     for a in actions:
         t = a.get("action_type")
         v = to_float(a.get("value", 0))
@@ -83,35 +209,20 @@ def parse_insight(ins: Dict[str, Any]) -> Dict[str, Any]:
             actions_map[t] = actions_map.get(t, 0.0) + float(v)
         if t == "onsite_conversion.messaging_conversation_started_7d":
             msgs += int(v)
-        if t in {
-            "Website Submit Applications",
-            "offsite_conversion.fb_pixel_submit_application",
-            "offsite_conversion.fb_pixel_lead",
-            "lead",
-        }:
-            leads += int(v)
+
+    leads = count_leads_from_actions(actions_map, aid=aid)
+
+    if os.getenv("FB_ACTIONS_DEBUG") == "1":
+        log = logging.getLogger(__name__)
+        nonzero = {k: v for k, v in actions_map.items() if float(v or 0) > 0}
+        if nonzero:
+            log.info("[analytics] actions_nonzero=%s", sorted(nonzero.keys()))
 
     msg_action = "onsite_conversion.messaging_conversation_started_7d"
     msg_count = int(actions_map.get(msg_action, 0) or 0)
     msg_cpa = costs_map.get(msg_action)
 
-    lead_actions = [
-        "Website Submit Applications",
-        "offsite_conversion.fb_pixel_submit_application",
-        "offsite_conversion.fb_pixel_lead",
-        "lead",
-    ]
-    leads_cost_total = 0.0
-    leads_count_total = 0
-    for lt in lead_actions:
-        cnt = int(actions_map.get(lt, 0) or 0)
-        if cnt <= 0:
-            continue
-        leads_count_total += cnt
-        cpa_val = costs_map.get(lt)
-        if cpa_val is not None and float(cpa_val) > 0:
-            leads_cost_total += float(cpa_val) * float(cnt)
-
+    leads_count_total, leads_cost_total = lead_cost_and_count(actions_map, costs_map, aid=aid)
     lead_cpa = (leads_cost_total / float(leads_count_total)) if leads_count_total > 0 and leads_cost_total > 0 else None
 
     total = msgs + leads
@@ -192,7 +303,7 @@ def analyze_account(
     if not ins:
         return {"aid": aid, "metrics": None}
 
-    parsed = parse_insight(ins)
+    parsed = parse_insight(ins, aid=aid)
     return {
         "aid": aid,
         "metrics": parsed,
@@ -229,7 +340,7 @@ def analyze_adsets(
         # NB: insights по adset делаются через account.get_insights(level='adset')
         ins = fetch_insights_by_level(aid, adset_id, period, level="adset")
 
-        parsed = parse_insight(ins or {})
+        parsed = parse_insight(ins or {}, aid=aid)
         # Пропускаем адсеты с нулевым spend, чтобы не засорять отчёты
         if (parsed.get("spend") or 0.0) <= 0:
             continue
@@ -275,7 +386,7 @@ def analyze_campaigns(
             continue
 
         ins = fetch_insights_by_level(aid, cid, period, level="campaign")
-        parsed = parse_insight(ins or {})
+        parsed = parse_insight(ins or {}, aid=aid)
         # Пропускаем кампании с нулевым spend
         if (parsed.get("spend") or 0.0) <= 0:
             continue
@@ -318,7 +429,7 @@ def analyze_ads(
 
         ins = fetch_insights_by_level(aid, ad_id, period, level="ad")
 
-        parsed = parse_insight(ins or {})
+        parsed = parse_insight(ins or {}, aid=aid)
         parsed["ad_id"] = ad_id
         parsed["name"] = ad["name"]
         # Дополнительно пробуем сохранить связи с адсетом и кампанией, если есть
