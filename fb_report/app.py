@@ -155,29 +155,20 @@ def _lead_metric_label_for_action_type(action_type: str) -> str:
         return "(пусто)"
 
     known = {
+        "onsite_web_lead": "Заявка с сайта",
         "lead": "Лид",
-        "purchase": "Покупка",
-        "submit_application": "Отправка заявок",
-        "Website Submit Applications": "Отправка заявок на сайте",
-        "offsite_conversion.fb_pixel_submit_application": "Отправка заявок (Pixel)",
+        "submit_application": "Отправка заявки",
+        "website_submit_application": "Отправка заявки (сайт)",
+        "Website Submit Applications": "Отправка заявки (сайт)",
+        "offsite_conversion.fb_pixel_submit_application": "Отправка заявки (Pixel)",
         "offsite_conversion.fb_pixel_lead": "Лид (Pixel)",
-        "onsite_conversion.messaging_conversation_started_7d": "Переписка (7d)",
     }
     if at in known:
         return known[at]
 
     if at.startswith("offsite_conversion.custom"):
         suffix = at.split(".")[-1]
-        if suffix.isdigit():
-            try:
-                from facebook_business.adobjects.customconversion import CustomConversion
-
-                name = CustomConversion(suffix).api_get(fields=["name"]).get("name")
-                if name:
-                    return f"Custom: {name}"
-            except Exception:
-                pass
-        return f"Custom: {suffix}"
+        return f"Заявка с сайта — {suffix}" if suffix else "Заявка с сайта"
 
     if at.startswith("offsite_conversion"):
         return at.replace("offsite_conversion.", "Offsite conversion: ")
@@ -188,7 +179,7 @@ def _lead_metric_label_for_action_type(action_type: str) -> str:
     return at
 
 
-def _discover_lead_metrics_for_account(aid: str) -> list[dict]:
+def _discover_actions_for_account(aid: str) -> list[dict]:
     now = datetime.now(ALMATY_TZ)
     yday = (now - timedelta(days=1)).date()
     period = {
@@ -198,7 +189,7 @@ def _discover_lead_metrics_for_account(aid: str) -> list[dict]:
     ins = fetch_insights(aid, period) or {}
     actions = (ins or {}).get("actions") or []
 
-    out = []
+    out: list[dict] = []
     seen = set()
     for a in actions:
         at = (a or {}).get("action_type")
@@ -213,7 +204,110 @@ def _discover_lead_metrics_for_account(aid: str) -> list[dict]:
         if at in seen:
             continue
         seen.add(at)
-        out.append({"action_type": str(at), "label": _lead_metric_label_for_action_type(str(at))})
+        out.append({"action_type": str(at), "value": float(v)})
+
+    return out
+
+
+def _is_blacklisted_lead_action_type(action_type: str) -> bool:
+    at = str(action_type or "").strip().lower()
+    if not at:
+        return True
+
+    if at.startswith("onsite_conversion.messaging_"):
+        return True
+
+    if at.startswith("post_interaction"):
+        return True
+
+    banned_exact = {
+        "link_click",
+        "landing_page_view",
+        "view_content",
+        "video_view",
+        "page_engagement",
+        "post_engagement",
+        "reaction",
+        "comment",
+        "post",
+        "message",
+        "reply",
+        "connection",
+        "pixel_view_content",
+    }
+    if at in banned_exact:
+        return True
+
+    banned_substrings = [
+        "engagement",
+        "video",
+        "view",
+        "click",
+        "reaction",
+        "comment",
+        "message",
+        "reply",
+        "connection",
+    ]
+    return any(s in at for s in banned_substrings)
+
+
+def _is_site_lead_custom_conversion_name(name: str) -> bool:
+    n = str(name or "").strip().lower()
+    if not n:
+        return False
+    keys = ["lead", "заяв", "application", "form", "request"]
+    return any(k in n for k in keys)
+
+
+def _discover_lead_metrics_for_account(aid: str) -> list[dict]:
+    actions = _discover_actions_for_account(aid)
+
+    whitelist_exact_lower = {
+        "onsite_web_lead",
+        "lead",
+        "submit_application",
+        "website_submit_application",
+        "offsite_conversion.fb_pixel_lead",
+        "offsite_conversion.fb_pixel_submit_application",
+    }
+    whitelist_exact_mixed = {
+        "Website Submit Applications",
+    }
+
+    out: list[dict] = []
+    for row in actions:
+        at = str((row or {}).get("action_type") or "").strip()
+        if not at:
+            continue
+
+        at_lower = at.lower()
+
+        if _is_blacklisted_lead_action_type(at):
+            continue
+
+        if at.startswith("offsite_conversion.custom"):
+            suffix = at.split(".")[-1]
+            if not suffix.isdigit():
+                continue
+            try:
+                from facebook_business.adobjects.customconversion import CustomConversion
+
+                name = CustomConversion(suffix).api_get(fields=["name"]).get("name")
+            except Exception:
+                name = None
+
+            if not _is_site_lead_custom_conversion_name(name or ""):
+                continue
+
+            label = f"Заявка с сайта — {name}" if name else "Заявка с сайта"
+            out.append({"action_type": at, "label": label})
+            continue
+
+        if at not in whitelist_exact_mixed and at_lower not in whitelist_exact_lower:
+            continue
+
+        out.append({"action_type": at, "label": _lead_metric_label_for_action_type(at)})
 
     out.sort(key=lambda x: (x.get("label") or x.get("action_type") or ""))
     return out
@@ -3046,16 +3140,18 @@ async def _on_cb_internal(
 
     if data.startswith("lead_metric_debug|"):
         aid = data.split("|", 1)[1]
-        opts = _discover_lead_metrics_for_account(aid)
-        if not opts:
+        raw = _discover_actions_for_account(aid)
+        if not raw:
             text = (
                 f"action_type за вчера — {get_account_name(aid)}\n\n"
                 "Нет ненулевых action_type за вчера (или нет доступа)."
             )
         else:
             lines = [f"action_type за вчера — {get_account_name(aid)}", ""]
-            for it in opts:
-                lines.append(f"- {it['action_type']}")
+            for it in raw:
+                at = (it or {}).get("action_type")
+                if at:
+                    lines.append(f"- {at}")
             text = "\n".join(lines)
         kb = InlineKeyboardMarkup(
             [[InlineKeyboardButton("⬅️ Назад", callback_data=f"lead_metric|{aid}")]]
@@ -3072,10 +3168,33 @@ async def _on_cb_internal(
             )
             await safe_edit_message(
                 q,
-                "Не удалось найти ненулевые метрики за вчера. Попробуй позже или включи spend/конверсии и повтори.",
+                "❗️Не найдено метрик лидов с сайта за вчера.\n"
+                "Проверь выбранный период или события в Ads Manager.",
                 reply_markup=kb,
             )
             return
+
+        if len(options) == 1:
+            it = options[0] or {}
+            action_type = it.get("action_type")
+            label = it.get("label")
+            if action_type:
+                set_lead_metric_for_account(
+                    aid,
+                    action_type=str(action_type),
+                    label=str(label or action_type),
+                )
+                try:
+                    await q.answer("Метрика выбрана автоматически.")
+                except Exception:
+                    pass
+                await context.bot.send_message(
+                    chat_id,
+                    f"Метрика лидов выбрана автоматически: {label or action_type}",
+                )
+                new_data = f"lead_metric|{aid}"
+                await _on_cb_internal(update, context, q, chat_id, new_data)
+                return
 
         mapping = {str(i): it for i, it in enumerate(options)}
         context.user_data["lead_metric_options"] = {"aid": aid, "items": mapping}
