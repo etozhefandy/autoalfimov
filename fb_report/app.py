@@ -419,10 +419,127 @@ def _ap_generate_actions(aid: str) -> list[dict]:
     rows.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)
     rows = rows[:8]
 
-    allow_apply = mode in {"SEMI", "AUTO_LIMITS"}
+    allow_apply = mode != "ADVISOR"
     for r in rows:
         r["allow_apply"] = allow_apply and (str(r.get("kind") or "") not in {"note"})
     return rows
+
+
+def _ap_daily_budget_limit_usd(aid: str) -> float | None:
+    ap = _autopilot_get(aid)
+    goals = ap.get("goals") or {}
+
+    planned = goals.get("planned_budget")
+    try:
+        planned_f = float(planned) if planned not in (None, "") else None
+    except Exception:
+        planned_f = None
+    if planned_f is None or planned_f <= 0:
+        return None
+
+    period = str(goals.get("period") or "day")
+    today = datetime.now(ALMATY_TZ).date()
+
+    if period == "day":
+        return float(planned_f)
+
+    if period == "week":
+        return float(planned_f) / 7.0
+
+    if period == "month":
+        days_in_month = calendar.monthrange(today.year, today.month)[1]
+        return float(planned_f) / float(days_in_month)
+
+    if period == "until":
+        until_raw = goals.get("until")
+        try:
+            until_dt = datetime.strptime(str(until_raw or ""), "%d.%m.%Y").date()
+        except Exception:
+            return None
+        days_left = (until_dt - today).days + 1
+        if days_left < 1:
+            days_left = 1
+        return float(planned_f) / float(days_left)
+
+    return None
+
+
+def _ap_spend_today_usd(aid: str) -> float:
+    try:
+        ins = fetch_insights(aid, "today") or {}
+    except Exception:
+        ins = {}
+    try:
+        return float((ins or {}).get("spend", 0) or 0)
+    except Exception:
+        return 0.0
+
+
+def _ap_limits(aid: str) -> dict:
+    ap = _autopilot_get(aid)
+    limits = ap.get("limits") or {}
+    return limits if isinstance(limits, dict) else {}
+
+
+def _ap_within_limits_for_auto(aid: str, act: dict) -> tuple[bool, str]:
+    limits = _ap_limits(aid)
+
+    try:
+        max_step = float(limits.get("max_budget_step_pct") or 20)
+    except Exception:
+        max_step = 20.0
+    if max_step <= 0:
+        max_step = 20.0
+
+    try:
+        max_risk = float(limits.get("max_daily_risk_pct") or 0)
+    except Exception:
+        max_risk = 0.0
+    if max_risk < 0:
+        max_risk = 0.0
+
+    kind = str((act or {}).get("kind") or "")
+
+    # NOTE: действия note никогда не автоприменяем.
+    if kind == "note":
+        return False, "note"
+
+    if kind == "budget_pct":
+        try:
+            pct = float((act or {}).get("percent") or 0.0)
+        except Exception:
+            pct = 0.0
+
+        if abs(pct) > float(max_step):
+            return False, f"step>{max_step:.0f}%"
+
+        # Ограничение дневного риска применяем только для увеличений.
+        if pct > 0:
+            daily_limit = _ap_daily_budget_limit_usd(aid)
+            if daily_limit is None:
+                return False, "no_daily_limit"
+            spend_today = _ap_spend_today_usd(aid)
+            allowed = float(daily_limit) * (1.0 + float(max_risk) / 100.0)
+            if spend_today > allowed:
+                return False, f"risk>{max_risk:.0f}%"
+
+        return True, "ok"
+
+    if kind in {"pause_ad", "pause_adset"}:
+        return True, "ok"
+
+    return False, "unknown_kind"
+
+
+def _ap_force_kb(token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ Применить сверх лимитов", callback_data=f"apdo|force|{token}"),
+                InlineKeyboardButton("❌ Отмена", callback_data=f"apdo|cancel|{token}"),
+            ]
+        ]
+    )
 
 
 def _autopilot_analysis_text(aid: str) -> str:
@@ -2391,6 +2508,8 @@ async def _on_cb_internal(
         aid = data.split("|", 1)[1]
         await safe_edit_message(q, f"Генерирую действия для {get_account_name(aid)}…")
 
+        ap = _autopilot_get(aid)
+        mode = str(ap.get("mode") or "OFF").upper()
         actions = _ap_generate_actions(aid) or []
         append_autopilot_event(
             aid,
@@ -2411,9 +2530,120 @@ async def _on_cb_internal(
             return
 
         pending = context.bot_data.setdefault("ap_pending_actions", {})
+        auto_applied = 0
         for act in actions:
-            token = uuid.uuid4().hex[:10]
             act["aid"] = str(aid)
+
+            # ADVISOR: только рекомендации/notice.
+            if mode == "ADVISOR":
+                token = uuid.uuid4().hex[:10]
+                act["token"] = token
+                pending[token] = act
+                kb = _ap_action_kb(allow_apply=False, token=token, allow_edit=False)
+                await context.bot.send_message(chat_id, _ap_action_text(act), reply_markup=kb)
+                continue
+
+            # AUTO_LIMITS: автоприменяем только строго в рамках лимитов.
+            if mode == "AUTO_LIMITS":
+                ok, why = _ap_within_limits_for_auto(aid, act)
+                if ok:
+                    kind = str(act.get("kind") or "")
+                    token = uuid.uuid4().hex[:10]
+                    act["token"] = token
+
+                    if kind == "budget_pct":
+                        try:
+                            pct_f = float(act.get("percent") or 0.0)
+                        except Exception:
+                            pct_f = 0.0
+                        res = apply_budget_change(str(act.get("adset_id") or ""), pct_f)
+                        append_autopilot_event(
+                            aid,
+                            {
+                                "type": "action_auto_apply",
+                                "token": token,
+                                "kind": kind,
+                                "adset_id": str(act.get("adset_id") or ""),
+                                "percent": pct_f,
+                                "status": res.get("status"),
+                                "message": res.get("message"),
+                                "chat_id": str(chat_id),
+                            },
+                        )
+                        await context.bot.send_message(
+                            chat_id,
+                            "🤖 AUTO_LIMITS: автоприменено\n\n" + str(res.get("message") or "") + "\n\n" + _ap_action_text(act),
+                        )
+                        auto_applied += 1
+                        continue
+
+                    if kind == "pause_ad":
+                        ad_id = str(act.get("ad_id") or "")
+                        adset_id = str(act.get("adset_id") or "")
+                        try:
+                            active_cnt = _count_active_ads_in_adset(aid, adset_id)
+                        except Exception:
+                            active_cnt = 0
+
+                        if active_cnt <= 1:
+                            ok = False
+                            why = "single_active_ad"
+                        else:
+                            res = pause_ad(ad_id)
+                            append_autopilot_event(
+                                aid,
+                                {
+                                    "type": "action_auto_apply",
+                                    "token": token,
+                                    "kind": kind,
+                                    "adset_id": adset_id,
+                                    "ad_id": ad_id,
+                                    "status": res.get("status"),
+                                    "message": res.get("message") or res.get("exception"),
+                                    "chat_id": str(chat_id),
+                                },
+                            )
+                            await context.bot.send_message(
+                                chat_id,
+                                "🤖 AUTO_LIMITS: автоприменено\n\n" + str(res.get("message") or res.get("exception") or "") + "\n\n" + _ap_action_text(act),
+                            )
+                            auto_applied += 1
+                            continue
+
+                    if kind == "pause_adset":
+                        # В AUTO_LIMITS всё равно только если явно включено allow_pause_adsets (генератор уже отфильтровал).
+                        res = disable_entity(str(act.get("adset_id") or ""))
+                        append_autopilot_event(
+                            aid,
+                            {
+                                "type": "action_auto_apply",
+                                "token": token,
+                                "kind": kind,
+                                "adset_id": str(act.get("adset_id") or ""),
+                                "status": res.get("status"),
+                                "message": res.get("message"),
+                                "chat_id": str(chat_id),
+                            },
+                        )
+                        await context.bot.send_message(
+                            chat_id,
+                            "🤖 AUTO_LIMITS: автоприменено\n\n" + str(res.get("message") or "") + "\n\n" + _ap_action_text(act),
+                        )
+                        auto_applied += 1
+                        continue
+
+                # не в лимитах -> отправляем как обычную рекомендацию с кнопками
+                token = uuid.uuid4().hex[:10]
+                act["token"] = token
+                pending[token] = act
+                kind = str(act.get("kind") or "")
+                allow_edit = kind == "budget_pct"
+                kb = _ap_action_kb(allow_apply=True, token=token, allow_edit=allow_edit)
+                await context.bot.send_message(chat_id, _ap_action_text(act) + f"\n\n⚠️ Вне лимитов AUTO_LIMITS: {why}", reply_markup=kb)
+                continue
+
+            # SEMI / OFF: SEMI — подтверждение вручную; OFF — по факту тоже не должен предлагать, но оставим безопасно.
+            token = uuid.uuid4().hex[:10]
             act["token"] = token
             pending[token] = act
 
@@ -2425,7 +2655,8 @@ async def _on_cb_internal(
         await safe_edit_message(
             q,
             f"Отправил действий: {len(actions)}\n"
-            "Каждое действие отдельным сообщением ниже.",
+            + (f"Автоприменено: {auto_applied}\n" if auto_applied else "")
+            + "Каждое действие отдельным сообщением ниже.",
             reply_markup=_autopilot_analysis_kb(aid),
         )
         return
@@ -2436,6 +2667,7 @@ async def _on_cb_internal(
             await q.answer("Некорректная кнопка.", show_alert=True)
             return
         _p, op, token = parts
+        orig_op = op
 
         pending = context.bot_data.get("ap_pending_actions") or {}
         act = pending.get(token)
@@ -2445,6 +2677,16 @@ async def _on_cb_internal(
 
         aid = str(act.get("aid") or "")
         kind = str(act.get("kind") or "")
+
+        if op == "force":
+            ap = _autopilot_get(aid)
+            mode = str(ap.get("mode") or "OFF").upper()
+            if mode != "AUTO_LIMITS":
+                await q.answer("Force подтверждение доступно только в AUTO_LIMITS.", show_alert=True)
+                return
+
+            op = "apply"
+
         allow_apply = bool(act.get("allow_apply"))
         if not allow_apply and op in {"apply", "edit"}:
             await q.answer("Режим Советник: применение отключено.", show_alert=True)
@@ -2491,12 +2733,33 @@ async def _on_cb_internal(
                 await q.answer("Нет adset_id.", show_alert=True)
                 return
 
+            ap = _autopilot_get(aid)
+            mode = str(ap.get("mode") or "OFF").upper()
+            if mode == "ADVISOR":
+                await q.answer("Режим Советник: применение отключено.", show_alert=True)
+                return
+
             if kind == "budget_pct":
                 pct = act.get("percent")
                 try:
                     pct_f = float(pct)
                 except Exception:
                     pct_f = 0.0
+
+                if mode == "AUTO_LIMITS":
+                    ok, why = _ap_within_limits_for_auto(aid, act)
+                    if not ok and orig_op != "force":
+                        append_autopilot_event(
+                            aid,
+                            {"type": "action_over_limit", "token": token, "kind": kind, "why": why, "chat_id": str(chat_id)},
+                        )
+                        await safe_edit_message(
+                            q,
+                            _ap_action_text(act) + f"\n\n⚠️ Выходит за лимиты AUTO_LIMITS: {why}\nПодтвердить сверх лимитов?",
+                            reply_markup=_ap_force_kb(token),
+                        )
+                        return
+
                 res = apply_budget_change(adset_id, pct_f)
                 append_autopilot_event(
                     aid,
