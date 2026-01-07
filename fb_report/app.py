@@ -68,6 +68,7 @@ from services.ai_focus import get_focus_comment, ask_deepseek, sanitize_ai_text
 from fb_report.cpa_monitoring import build_anomaly_messages_for_account
 import json
 import asyncio
+import time as pytime
 
 
 def _allowed(update: Update) -> bool:
@@ -118,6 +119,11 @@ def _build_version_text() -> str:
     lines = [f"Версия бота: {BOT_VERSION}", ""]
     lines.extend(BOT_CHANGELOG)
     return "\n".join(lines)
+
+
+FOCUS_AI_DATA_TIMEOUT_S = 120
+FOCUS_AI_DEEPSEEK_TIMEOUT_S = 120
+FOCUS_AI_MAX_OBJECTS = 40
 
 
 def main_menu() -> InlineKeyboardMarkup:
@@ -1728,6 +1734,15 @@ async def _on_cb_internal(
             f"Анализирую данные по аккаунту и уровню '{level_human}' за период: {period_human}...",
         )
 
+        log = logging.getLogger(__name__)
+        t_all = pytime.monotonic()
+        log.info(
+            "[focus_ai_now] start aid=%s level=%s mode=%s",
+            aid,
+            level,
+            mode,
+        )
+
         # Собираем данные по выбранному уровню и периоду.
         from services.analytics import _make_period_for_mode  # локальный импорт, чтобы избежать циклов
 
@@ -1736,8 +1751,40 @@ async def _on_cb_internal(
         period_dict = _make_period_for_mode(mode_for_period)
 
         if level == "account":
-            base_analysis = analyze_account(aid, period=period_dict)
-            heat = build_heatmap_for_account(aid, get_account_name, mode="7")
+            try:
+                t0 = pytime.monotonic()
+                base_analysis = await asyncio.wait_for(
+                    asyncio.to_thread(analyze_account, aid, period=period_dict),
+                    timeout=FOCUS_AI_DATA_TIMEOUT_S,
+                )
+                log.info(
+                    "[focus_ai_now] analyze_account ok elapsed=%.2fs",
+                    pytime.monotonic() - t0,
+                )
+            except asyncio.TimeoutError:
+                log.warning("[focus_ai_now] analyze_account timeout")
+                await safe_edit_message(
+                    q,
+                    "⚠️ Фокус-ИИ: сбор данных занял слишком много времени. "
+                    "Попробуй период '7 дней' или повтори запрос позже.",
+                    reply_markup=focus_ai_main_kb(),
+                )
+                return
+
+            # Теплокарта может быть тяжёлой — тоже под таймаут.
+            try:
+                t0 = pytime.monotonic()
+                heat = await asyncio.wait_for(
+                    asyncio.to_thread(build_heatmap_for_account, aid, get_account_name, mode="7"),
+                    timeout=FOCUS_AI_DATA_TIMEOUT_S,
+                )
+                log.info(
+                    "[focus_ai_now] build_heatmap_for_account ok elapsed=%.2fs",
+                    pytime.monotonic() - t0,
+                )
+            except asyncio.TimeoutError:
+                log.warning("[focus_ai_now] build_heatmap_for_account timeout")
+                heat = {}
 
             data_for_analysis = {
                 "scope": "account",
@@ -1750,7 +1797,28 @@ async def _on_cb_internal(
                 "heatmap_7d": heat,
             }
         elif level == "campaign":
-            camps = analyze_campaigns(aid, period=period_dict) or []
+            try:
+                t0 = pytime.monotonic()
+                camps = await asyncio.wait_for(
+                    asyncio.to_thread(analyze_campaigns, aid, period=period_dict),
+                    timeout=FOCUS_AI_DATA_TIMEOUT_S,
+                )
+                log.info(
+                    "[focus_ai_now] analyze_campaigns ok elapsed=%.2fs count=%s",
+                    pytime.monotonic() - t0,
+                    len(camps or []),
+                )
+            except asyncio.TimeoutError:
+                log.warning("[focus_ai_now] analyze_campaigns timeout")
+                await safe_edit_message(
+                    q,
+                    "⚠️ Фокус-ИИ: сбор данных по кампаниям занял слишком много времени. "
+                    "Попробуй период '7 дней' или повтори запрос позже.",
+                    reply_markup=focus_ai_main_kb(),
+                )
+                return
+
+            camps = (camps or [])[:FOCUS_AI_MAX_OBJECTS]
             data_for_analysis = {
                 "scope": "campaign",
                 "account_id": aid,
@@ -1759,9 +1827,31 @@ async def _on_cb_internal(
                 "period_label": period_human,
                 "period": period_dict,
                 "campaigns": camps,
+                "truncated": True if (camps and len(camps) >= FOCUS_AI_MAX_OBJECTS) else False,
             }
         elif level == "adset":
-            adsets = analyze_adsets(aid, period=period_dict) or []
+            try:
+                t0 = pytime.monotonic()
+                adsets = await asyncio.wait_for(
+                    asyncio.to_thread(analyze_adsets, aid, period=period_dict),
+                    timeout=FOCUS_AI_DATA_TIMEOUT_S,
+                )
+                log.info(
+                    "[focus_ai_now] analyze_adsets ok elapsed=%.2fs count=%s",
+                    pytime.monotonic() - t0,
+                    len(adsets or []),
+                )
+            except asyncio.TimeoutError:
+                log.warning("[focus_ai_now] analyze_adsets timeout")
+                await safe_edit_message(
+                    q,
+                    "⚠️ Фокус-ИИ: сбор данных по адсетам занял слишком много времени. "
+                    "Попробуй период '7 дней' или повтори запрос позже.",
+                    reply_markup=focus_ai_main_kb(),
+                )
+                return
+
+            adsets = (adsets or [])[:FOCUS_AI_MAX_OBJECTS]
             data_for_analysis = {
                 "scope": "adset",
                 "account_id": aid,
@@ -1770,9 +1860,31 @@ async def _on_cb_internal(
                 "period_label": period_human,
                 "period": period_dict,
                 "adsets": adsets,
+                "truncated": True if (adsets and len(adsets) >= FOCUS_AI_MAX_OBJECTS) else False,
             }
         elif level == "ad":
-            ads = analyze_ads(aid, period=period_dict) or []
+            try:
+                t0 = pytime.monotonic()
+                ads = await asyncio.wait_for(
+                    asyncio.to_thread(analyze_ads, aid, period=period_dict),
+                    timeout=FOCUS_AI_DATA_TIMEOUT_S,
+                )
+                log.info(
+                    "[focus_ai_now] analyze_ads ok elapsed=%.2fs count=%s",
+                    pytime.monotonic() - t0,
+                    len(ads or []),
+                )
+            except asyncio.TimeoutError:
+                log.warning("[focus_ai_now] analyze_ads timeout")
+                await safe_edit_message(
+                    q,
+                    "⚠️ Фокус-ИИ: сбор данных по объявлениям занял слишком много времени. "
+                    "Попробуй период '7 дней' или повтори запрос позже.",
+                    reply_markup=focus_ai_main_kb(),
+                )
+                return
+
+            ads = (ads or [])[:FOCUS_AI_MAX_OBJECTS]
             data_for_analysis = {
                 "scope": "ad",
                 "account_id": aid,
@@ -1781,6 +1893,7 @@ async def _on_cb_internal(
                 "period_label": period_human,
                 "period": period_dict,
                 "ads": ads,
+                "truncated": True if (ads and len(ads) >= FOCUS_AI_MAX_OBJECTS) else False,
             }
         else:
             await safe_edit_message(
@@ -1828,18 +1941,37 @@ async def _on_cb_internal(
         user_msg = json.dumps(data_for_analysis, ensure_ascii=False)
 
         try:
-            ds_resp = await ask_deepseek(
-                [
-                    {"role": "system", "content": system_msg},
-                    {"role": "user", "content": user_msg},
-                ],
-                json_mode=True,
+            t0 = pytime.monotonic()
+            ds_resp = await asyncio.wait_for(
+                ask_deepseek(
+                    [
+                        {"role": "system", "content": system_msg},
+                        {"role": "user", "content": user_msg},
+                    ],
+                    json_mode=True,
+                ),
+                timeout=FOCUS_AI_DEEPSEEK_TIMEOUT_S,
+            )
+            log.info(
+                "[focus_ai_now] deepseek ok elapsed=%.2fs total=%.2fs",
+                pytime.monotonic() - t0,
+                pytime.monotonic() - t_all,
             )
 
             choice = (ds_resp.get("choices") or [{}])[0]
             content = (choice.get("message") or {}).get("content") or ""
             parsed = json.loads(content)
+        except asyncio.TimeoutError:
+            log.warning("[focus_ai_now] deepseek timeout total=%.2fs", pytime.monotonic() - t_all)
+            parsed = {
+                "status": "error",
+                "analysis": "Фокус-ИИ не ответил вовремя. Попробуй повторить запрос позже или выбери период 7/30 дней.",
+                "recommendation": "keep",
+                "confidence": 0,
+                "suggested_change_percent": 0,
+            }
         except Exception as e:
+            log.exception("[focus_ai_now] deepseek error: %s", type(e).__name__)
             parsed = {
                 "status": "error",
                 "analysis": "Фокус-ИИ временно недоступен. Используй стандартные отчёты по аккаунту.",
