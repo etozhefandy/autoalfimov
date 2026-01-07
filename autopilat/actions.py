@@ -110,6 +110,42 @@ def apply_budget_change(adset_id: str, percent: float) -> Dict[str, Any]:
     }
 
 
+def set_adset_budget(adset_id: str, new_budget: float) -> Dict[str, Any]:
+    adset = AdSet(adset_id)
+
+    info = safe_api_call(adset.api_get, fields=["daily_budget"])
+    if not info:
+        return {
+            "status": "error",
+            "message": f"Не удалось получить бюджет адсета {adset_id}",
+        }
+
+    old_budget = float(info.get("daily_budget", 0) or 0) / 100.0
+
+    try:
+        nb = float(new_budget)
+    except Exception:
+        nb = 0.0
+
+    if nb < 1.0:
+        nb = 1.0
+
+    new_budget_fb = int(round(nb * 100))
+    res = safe_api_call(adset.api_update, params={"daily_budget": new_budget_fb})
+    if res is None:
+        return {
+            "status": "error",
+            "message": f"Ошибка при обновлении бюджета {adset_id}",
+        }
+
+    return {
+        "status": "ok",
+        "old_budget": old_budget,
+        "new_budget": nb,
+        "message": f"Бюджет {adset_id} обновлён: {old_budget:.2f} → {nb:.2f} $",
+    }
+
+
 # ============================================================
 # 🔥 ВЫКЛЮЧЕНИЕ ADSET
 # ============================================================

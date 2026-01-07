@@ -20,7 +20,7 @@ from telegram.ext import (
 import logging
 
 from billing_watch import init_billing_watch
-from autopilat.actions import apply_budget_change
+from autopilat.actions import apply_budget_change, set_adset_budget
 
 from .constants import (
     ALMATY_TZ,
@@ -336,6 +336,68 @@ def heatmap_monitoring_accounts_kb() -> InlineKeyboardMarkup:
         )
     rows.append([InlineKeyboardButton("⬅️ Мониторинг", callback_data="monitoring_menu")])
     return InlineKeyboardMarkup(rows)
+
+
+def _ai_budget_kb(aid: str, adset_id: str, new_budget: float, current_budget: float | None) -> InlineKeyboardMarkup:
+    cents = int(round(float(new_budget or 0.0) * 100))
+    cb = float(current_budget) if current_budget is not None else None
+    pct = None
+    if cb and cb > 0:
+        pct = (float(new_budget) - cb) / cb * 100.0
+
+    if pct is None:
+        auto_text = f"✅ Применить • ${float(new_budget):.2f}"
+    elif pct > 0.5:
+        auto_text = f"⬆️ Увеличить на {pct:.0f}% • ${float(new_budget):.2f}"
+    elif pct < -0.5:
+        auto_text = f"⬇️ Снизить на {abs(pct):.0f}% • ${float(new_budget):.2f}"
+    else:
+        auto_text = "⏸ Оставить без изменений"
+
+    manual_suffix = f" • ${cb:.2f}" if cb is not None else ""
+
+    rows = [
+        [InlineKeyboardButton(auto_text, callback_data=f"ai_bud_apply|{aid}|{adset_id}|{cents}")],
+        [InlineKeyboardButton(f"✏️ Ручной ввод{manual_suffix}", callback_data=f"ai_bud_manual|{aid}|{adset_id}")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def _ai_ad_pause_kb(aid: str, ad_id: str, adset_id: str, spent: float | None = None) -> InlineKeyboardMarkup:
+    suffix = f" • ${float(spent):.2f}" if spent is not None else ""
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(f"🛑 Отключить объявление{suffix}", callback_data=f"ai_ad_pause|{aid}|{ad_id}|{adset_id}")]]
+    )
+
+
+def _get_adset_budget_map(aid: str) -> dict:
+    out = {}
+    for row in fetch_adsets(aid) or []:
+        adset_id = row.get("id")
+        if not adset_id:
+            continue
+        out[str(adset_id)] = row
+    return out
+
+
+def _get_ads_map(aid: str) -> dict:
+    out = {}
+    for row in fetch_ads(aid) or []:
+        ad_id = row.get("id")
+        if not ad_id:
+            continue
+        out[str(ad_id)] = row
+    return out
+
+
+def _count_active_ads_in_adset(aid: str, adset_id: str) -> int:
+    cnt = 0
+    for row in fetch_ads(aid) or []:
+        if str(row.get("adset_id") or "") != str(adset_id):
+            continue
+        if str(row.get("status") or "").upper() == "ACTIVE":
+            cnt += 1
+    return int(cnt)
 
 
 def heatmap_monitoring_modes_kb(aid: str) -> InlineKeyboardMarkup:
@@ -2107,7 +2169,9 @@ async def _on_cb_internal(
             "\"recommendation\":\"increase_budget\"|\"decrease_budget\"|\"keep\"," 
             "\"suggested_change_percent\":число," 
             "\"confidence\":0-100," 
-            "\"objects\":[{\"id\":\"...\",\"name\":\"...\",\"level\":\"campaign\"|\"adset\"|\"ad\",\"recommendation\":\"increase_budget\"|\"decrease_budget\"|\"keep\",\"suggested_change_percent\":число,\"confidence\":0-100}]"
+            "\"objects\":[{\"id\":\"...\",\"name\":\"...\",\"level\":\"campaign\"|\"adset\"|\"ad\",\"recommendation\":\"increase_budget\"|\"decrease_budget\"|\"keep\",\"suggested_change_percent\":число,\"confidence\":0-100}],"
+            "\"budget_actions\":[{\"level\":\"adset\",\"campaign_id\":\"...\",\"adset_id\":\"...\",\"old_budget\":5.0,\"new_budget\":5.5,\"reason\":\"...\"}],"
+            "\"ads_actions\":[{\"type\":\"pause_ad\"|\"notify_only\",\"campaign_id\":\"...\",\"adset_id\":\"...\",\"ad_id\":\"...\",\"reason\":\"...\",\"confidence\":0.0}]"
             "}"
         )
 
@@ -2160,6 +2224,8 @@ async def _on_cb_internal(
         conf = parsed.get("confidence") or 0
         delta = parsed.get("suggested_change_percent") or 0
         objects = parsed.get("objects") or []
+        budget_actions = parsed.get("budget_actions") or []
+        ads_actions = parsed.get("ads_actions") or []
 
         allowed_recs = {"increase_budget", "decrease_budget", "keep"}
         if rec not in allowed_recs:
@@ -2203,6 +2269,238 @@ async def _on_cb_internal(
             text_out,
             reply_markup=focus_ai_recommendation_kb(level, rec, float(delta), objects),
         )
+
+        # ====== Управляемые действия (кнопки) ======
+        reasons = context.user_data.get("ai_action_reasons")
+        if not isinstance(reasons, dict):
+            reasons = {}
+        context.user_data["ai_action_reasons"] = reasons
+
+        try:
+            adsets_map = _get_adset_budget_map(aid)
+        except Exception:
+            adsets_map = {}
+
+        # Бюджеты: всегда применяем на уровне adset.
+        if isinstance(budget_actions, list):
+            for act in budget_actions:
+                if not isinstance(act, dict):
+                    continue
+                if str(act.get("level") or "").lower() != "adset":
+                    continue
+                adset_id = str(act.get("adset_id") or "").strip()
+                if not adset_id:
+                    continue
+
+                try:
+                    new_budget = float(act.get("new_budget"))
+                except Exception:
+                    continue
+
+                row = adsets_map.get(adset_id) or {}
+                adset_name = row.get("name") or adset_id
+                current_budget = row.get("daily_budget")
+                try:
+                    current_budget = float(current_budget) if current_budget is not None else None
+                except Exception:
+                    current_budget = None
+
+                reason = str(act.get("reason") or "").strip()
+                cents = int(round(new_budget * 100))
+                reasons[f"bud:{aid}:{adset_id}:{cents}"] = reason
+
+                lines = [
+                    f"<b>{adset_name}</b>",
+                ]
+                if current_budget is not None:
+                    lines.append(f"Текущий бюджет: ${current_budget:.2f}")
+                lines.extend(
+                    [
+                        "",
+                        "Рекомендация ИИ:",
+                        f"— установить бюджет: ${new_budget:.2f}",
+                    ]
+                )
+                if reason:
+                    lines.append(f"— причина: {reason}")
+
+                await context.bot.send_message(
+                    chat_id,
+                    "\n".join(lines),
+                    parse_mode="HTML",
+                    reply_markup=_ai_budget_kb(aid, adset_id, new_budget, current_budget),
+                )
+
+        # Объявления: кнопка PAUSE (если не единственное).
+        if isinstance(ads_actions, list):
+            for act in ads_actions:
+                if not isinstance(act, dict):
+                    continue
+                a_type = str(act.get("type") or "").strip()
+                ad_id = str(act.get("ad_id") or "").strip()
+                adset_id = str(act.get("adset_id") or "").strip()
+                if not ad_id:
+                    continue
+
+                reason = str(act.get("reason") or "").strip()
+                try:
+                    conf01 = float(act.get("confidence"))
+                except Exception:
+                    conf01 = None
+
+                if a_type == "notify_only":
+                    txt = reason or "ℹ️ Действие только для уведомления."
+                    await context.bot.send_message(chat_id, txt)
+                    continue
+
+                if a_type != "pause_ad":
+                    continue
+
+                # Safety: если единственное активное объявление в adset — не показываем кнопку.
+                allow_pause = True
+                if adset_id:
+                    try:
+                        active_cnt = _count_active_ads_in_adset(aid, adset_id)
+                        allow_pause = active_cnt > 1
+                    except Exception:
+                        allow_pause = False
+
+                ads_map = {}
+                try:
+                    ads_map = _get_ads_map(aid)
+                except Exception:
+                    ads_map = {}
+                ad_name = (ads_map.get(ad_id) or {}).get("name") or ad_id
+
+                lines = [f"🔴 Объявление: <b>{ad_name}</b>"]
+                if adset_id:
+                    lines.append(f"Adset: <code>{adset_id}</code>")
+                if reason:
+                    lines.append("")
+                    lines.append("Почему отключить:")
+                    lines.append(f"— {reason}")
+                if conf01 is not None:
+                    lines.append(f"\nУверенность: {conf01:.2f}")
+
+                key = f"adpause:{aid}:{ad_id}:{adset_id}"
+                reasons[key] = reason
+
+                if allow_pause and adset_id:
+                    await context.bot.send_message(
+                        chat_id,
+                        "\n".join(lines),
+                        parse_mode="HTML",
+                        reply_markup=_ai_ad_pause_kb(aid, ad_id, adset_id),
+                    )
+                else:
+                    await context.bot.send_message(
+                        chat_id,
+                        "\n".join(lines)
+                        + "\n\nℹ️ Единственное объявление в adset — отключение не рекомендовано",
+                        parse_mode="HTML",
+                    )
+
+        return
+
+    if data.startswith("ai_bud_apply|"):
+        # Формат: ai_bud_apply|{aid}|{adset_id}|{cents}
+        try:
+            _p, aid, adset_id, cents_s = data.split("|", 3)
+            cents = int(cents_s)
+        except Exception:
+            await q.answer("Некорректные данные действия.", show_alert=True)
+            return
+
+        new_budget = float(cents) / 100.0
+        reasons = context.user_data.get("ai_action_reasons") or {}
+        reason = reasons.get(f"bud:{aid}:{adset_id}:{cents}") or ""
+
+        res = set_adset_budget(adset_id, new_budget)
+        if res.get("status") != "ok":
+            msg = res.get("message") or ""
+            await context.bot.send_message(chat_id, f"❌ Не удалось применить действие: {msg}")
+            return
+
+        old_b = res.get("old_budget")
+        new_b = res.get("new_budget")
+        lines = [
+            "✅ Бюджет обновлён",
+            "",
+            f"Adset: {adset_id}",
+        ]
+        try:
+            if old_b is not None and new_b is not None:
+                lines.append(f"Было: ${float(old_b):.2f}")
+                lines.append(f"Стало: ${float(new_b):.2f}")
+        except Exception:
+            pass
+        if reason:
+            lines.append(f"Причина: {reason}")
+
+        await context.bot.send_message(chat_id, "\n".join(lines))
+        return
+
+    if data.startswith("ai_bud_manual|"):
+        # Формат: ai_bud_manual|{aid}|{adset_id}
+        try:
+            _p, aid, adset_id = data.split("|", 2)
+        except Exception:
+            await q.answer("Некорректные данные.", show_alert=True)
+            return
+
+        cur = None
+        try:
+            cur = (_get_adset_budget_map(aid).get(adset_id) or {}).get("daily_budget")
+            cur = float(cur) if cur is not None else None
+        except Exception:
+            cur = None
+
+        context.user_data["await_ai_budget_for"] = {"aid": aid, "adset_id": adset_id}
+        suffix = f" Текущий: ${cur:.2f}." if cur is not None else ""
+        await context.bot.send_message(
+            chat_id,
+            f"Введи новый дневной бюджет для adset {adset_id} в $ (например 5.5).{suffix}",
+        )
+        return
+
+    if data.startswith("ai_ad_pause|"):
+        # Формат: ai_ad_pause|{aid}|{ad_id}|{adset_id}
+        try:
+            _p, aid, ad_id, adset_id = data.split("|", 3)
+        except Exception:
+            await q.answer("Некорректные данные.", show_alert=True)
+            return
+
+        # Safety-check перед применением
+        try:
+            active_cnt = _count_active_ads_in_adset(aid, adset_id)
+        except Exception:
+            active_cnt = 0
+
+        if active_cnt <= 1:
+            await context.bot.send_message(
+                chat_id,
+                "❌ Не удалось применить действие: единственное активное объявление в adset — отключение запрещено.",
+            )
+            return
+
+        reasons = context.user_data.get("ai_action_reasons") or {}
+        reason = reasons.get(f"adpause:{aid}:{ad_id}:{adset_id}") or ""
+
+        res = pause_ad(ad_id)
+        if res.get("status") != "ok":
+            msg = res.get("message") or res.get("exception") or ""
+            await context.bot.send_message(chat_id, f"❌ Не удалось применить действие: {msg}")
+            return
+
+        lines = [
+            "✅ Объявление отключено",
+            f"Ad: {ad_id}",
+            "Статус: ACTIVE → PAUSED",
+        ]
+        if reason:
+            lines.append(f"Причина: {reason}")
+        await context.bot.send_message(chat_id, "\n".join(lines))
         return
 
     if data.startswith("focus_ai_action|"):
@@ -4047,6 +4345,46 @@ async def on_text_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = update.message.text.strip()
+
+    if "await_ai_budget_for" in context.user_data:
+        payload = context.user_data.pop("await_ai_budget_for")
+        aid = payload.get("aid")
+        adset_id = payload.get("adset_id")
+
+        if not aid or not adset_id:
+            await update.message.reply_text(
+                "❌ Не удалось применить действие: не найден контекст adset.")
+            return
+
+        try:
+            val = float(text.replace(",", "."))
+        except Exception:
+            await update.message.reply_text(
+                "Введите число в $ (например 5.5). Попробуй ещё раз.")
+            context.user_data["await_ai_budget_for"] = payload
+            return
+
+        res = set_adset_budget(str(adset_id), float(val))
+        if res.get("status") != "ok":
+            msg = res.get("message") or ""
+            await update.message.reply_text(f"❌ Не удалось применить действие: {msg}")
+            return
+
+        old_b = res.get("old_budget")
+        new_b = res.get("new_budget")
+        lines = [
+            "✅ Бюджет обновлён",
+            "",
+            f"Adset: {adset_id}",
+        ]
+        try:
+            if old_b is not None and new_b is not None:
+                lines.append(f"Было: ${float(old_b):.2f}")
+                lines.append(f"Стало: ${float(new_b):.2f}")
+        except Exception:
+            pass
+        await update.message.reply_text("\n".join(lines))
+        return
 
     # Кастомный диапазон для отчёта "по всем" (rep_all_custom)
     if context.user_data.get("await_all_range_for"):
