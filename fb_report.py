@@ -13,19 +13,43 @@ if __name__ == "__main__":
     log = logging.getLogger(__name__)
     logging.basicConfig(level=logging.INFO)
 
+    # Важно: Application создаём один раз, чтобы не плодить scheduler/jobs и хэндлеры.
+    # Если build_app() упадёт — это должно быть фатально (while-restart не поможет).
+    app = build_app()
+
     while True:
         try:
-            app = build_app()
             try:
                 app.run_polling(
                     allowed_updates=Update.ALL_TYPES,
                     bootstrap_retries=-1,
+                    close_loop=False,
                 )
             except TypeError:
-                app.run_polling(
-                    allowed_updates=Update.ALL_TYPES,
-                )
-        except (NetworkError, TimedOut, RetryAfter) as e:
+                # Для старых версий PTB, где нет bootstrap_retries/close_loop
+                try:
+                    app.run_polling(
+                        allowed_updates=Update.ALL_TYPES,
+                        close_loop=False,
+                    )
+                except TypeError:
+                    app.run_polling(
+                        allowed_updates=Update.ALL_TYPES,
+                    )
+
+            # Если run_polling вернулся без исключений — выходим.
+            break
+
+        except RetryAfter as e:
+            sleep_s = max(int(getattr(e, "retry_after", 0) or 0), 5)
+            log.warning(
+                "Telegram polling rate-limited (RetryAfter=%ss). Restarting polling in %ss...",
+                getattr(e, "retry_after", None),
+                sleep_s,
+            )
+            time.sleep(sleep_s)
+            continue
+        except (NetworkError, TimedOut) as e:
             log.warning(
                 "Telegram polling transient error: %s: %s. Restarting polling in 5s...",
                 type(e).__name__,
@@ -37,7 +61,6 @@ if __name__ == "__main__":
             log.exception(
                 "Telegram polling crashed with unexpected error (%s). Restarting in 10s...",
                 type(e).__name__,
-                exc_info=e,
             )
             time.sleep(10)
             continue
