@@ -66,7 +66,7 @@ from .billing import send_billing, send_billing_forecast, billing_digest_job
 from .jobs import full_daily_scan_job, daily_report_job, schedule_cpa_alerts, _resolve_account_cpa
 
 from services.analytics import analyze_campaigns, analyze_adsets, analyze_account, analyze_ads
-from services.facebook_api import pause_ad, fetch_adsets, fetch_ads, fetch_insights
+from services.facebook_api import pause_ad, fetch_adsets, fetch_ads, fetch_insights, fetch_campaigns
 from services.ai_focus import get_focus_comment, ask_deepseek, sanitize_ai_text
 from fb_report.cpa_monitoring import build_anomaly_messages_for_account
 import json
@@ -965,6 +965,19 @@ def cpa_campaigns_kb(aid: str) -> InlineKeyboardMarkup:
     campaign_alerts = alerts.get("campaign_alerts", {}) or {}
 
     try:
+        fb_campaigns = fetch_campaigns(aid) or []
+    except Exception:
+        fb_campaigns = []
+
+    allowed_campaign_ids = {
+        str(r.get("id"))
+        for r in fb_campaigns
+        if str((r or {}).get("effective_status") or (r or {}).get("status") or "").upper()
+        in {"ACTIVE", "SCHEDULED"}
+        and r.get("id")
+    }
+
+    try:
         camps = analyze_campaigns(aid, days=7) or []
     except Exception:
         camps = []
@@ -973,6 +986,8 @@ def cpa_campaigns_kb(aid: str) -> InlineKeyboardMarkup:
     for camp in camps:
         cid = camp.get("campaign_id")
         if not cid:
+            continue
+        if str(cid) not in allowed_campaign_ids:
             continue
         name = camp.get("name") or cid
         cfg_c = (campaign_alerts.get(cid) or {}) if cid in campaign_alerts else {}
@@ -1024,13 +1039,17 @@ def cpa_adsets_kb(aid: str) -> InlineKeyboardMarkup:
     active_adset_ids = {
         str(r.get("id"))
         for r in fb_adsets
-        if (r or {}).get("status") == "ACTIVE" and r.get("id")
+        if str((r or {}).get("effective_status") or (r or {}).get("status") or "").upper()
+        in {"ACTIVE", "SCHEDULED"}
+        and r.get("id")
     }
 
     kb_rows = []
     for it in adsets:
         adset_id = it.get("id")
         name = it.get("name", adset_id)
+        if adset_id not in active_adset_ids:
+            continue
         cfg = (adset_alerts.get(adset_id) or {}) if adset_id else {}
 
         target = float(cfg.get("target_cpa") or 0.0)
@@ -1038,8 +1057,7 @@ def cpa_adsets_kb(aid: str) -> InlineKeyboardMarkup:
             f"[CPA {target:.2f}$]" if target > 0 else "[CPA аккаунта]"
         )
         enabled_a = bool(cfg.get("enabled", False))
-        is_active = adset_id in active_adset_ids
-        indicator = "⚠️ " if (enabled_a and is_active) else ""
+        indicator = "⚠️ " if enabled_a else ""
         text_btn = f"{indicator}{name} {label_suffix}".strip()
 
         kb_rows.append(
@@ -3677,6 +3695,19 @@ async def _on_cb_internal(
         campaign_alerts = alerts.get("campaign_alerts", {}) or {}
 
         try:
+            fb_campaigns = fetch_campaigns(aid) or []
+        except Exception:
+            fb_campaigns = []
+
+        allowed_campaign_ids = {
+            str(r.get("id"))
+            for r in fb_campaigns
+            if str((r or {}).get("effective_status") or (r or {}).get("status") or "").upper()
+            in {"ACTIVE", "SCHEDULED"}
+            and r.get("id")
+        }
+
+        try:
             camps = analyze_campaigns(aid, days=7) or []
         except Exception:
             camps = []
@@ -3685,6 +3716,8 @@ async def _on_cb_internal(
         for camp in camps:
             cid = camp.get("campaign_id")
             if not cid:
+                continue
+            if str(cid) not in allowed_campaign_ids:
                 continue
             name = camp.get("name") or cid
             cfg_c = (campaign_alerts.get(cid) or {}) if cid in campaign_alerts else {}
@@ -3940,16 +3973,20 @@ async def _on_cb_internal(
         except Exception:
             fb_adsets = []
 
-        active_adset_ids = {
+        allowed_adset_ids = {
             str(row.get("id"))
             for row in fb_adsets
-            if (row or {}).get("status") == "ACTIVE" and row.get("id")
+            if str((row or {}).get("effective_status") or (row or {}).get("status") or "").upper()
+            in {"ACTIVE", "SCHEDULED"}
+            and row.get("id")
         }
 
         kb_rows = []
         for it in adsets:
             adset_id = it.get("id")
             name = it.get("name", adset_id)
+            if adset_id not in allowed_adset_ids:
+                continue
             cfg = (adset_alerts.get(adset_id) or {}) if adset_id else {}
 
             target = float(cfg.get("target_cpa") or 0.0)
@@ -3957,9 +3994,7 @@ async def _on_cb_internal(
                 f"[CPA {target:.2f}$]" if target > 0 else "[CPA аккаунта]"
             )
             enabled_a = bool(cfg.get("enabled", False))
-            is_active = adset_id in active_adset_ids
-            # В списке адсетов показываем ⚠️ только если адсет активен и его CPA-алёрт включён.
-            indicator = "⚠️ " if (enabled_a and is_active) else ""
+            indicator = "⚠️ " if enabled_a else ""
             text_btn = f"{indicator}{name} {label_suffix}".strip()
 
             kb_rows.append(
@@ -4096,7 +4131,7 @@ async def _on_cb_internal(
             ad_id_raw = str(row.get("id") or "")
             if not ad_id_raw:
                 continue
-            ad_status[ad_id_raw] = row.get("status") or ""
+            ad_status[ad_id_raw] = row.get("effective_status") or row.get("status") or ""
             ad_to_adset[ad_id_raw] = str(row.get("adset_id") or "")
 
         # Статусы адсетов
@@ -4105,10 +4140,12 @@ async def _on_cb_internal(
         except Exception:
             fb_adsets = []
 
-        active_adset_ids = {
+        allowed_adset_ids = {
             str(row.get("id"))
             for row in fb_adsets
-            if (row or {}).get("status") == "ACTIVE" and row.get("id")
+            if str((row or {}).get("effective_status") or (row or {}).get("status") or "").upper()
+            in {"ACTIVE", "SCHEDULED"}
+            and row.get("id")
         }
 
         kb_rows = []
@@ -4123,10 +4160,10 @@ async def _on_cb_internal(
 
             status = ad_status.get(str(ad_id), "")
             adset_id = str(ad.get("adset_id") or ad_to_adset.get(str(ad_id)) or "")
-            adset_active = adset_id in active_adset_ids
+            adset_active = adset_id in allowed_adset_ids
 
             # В списке объявлений показываем только активные креативы с активным адсетом.
-            if status != "ACTIVE" or not adset_active:
+            if str(status or "").upper() not in {"ACTIVE", "SCHEDULED"} or not adset_active:
                 continue
 
             name = ad.get("name") or ad_id

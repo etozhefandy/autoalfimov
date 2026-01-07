@@ -284,7 +284,7 @@ def fetch_ads(aid: str) -> List[Dict[str, Any]]:
     acc = AdAccount(aid)
     data = safe_api_call(
         acc.get_ads,
-        fields=["id", "name", "adset_id", "creative", "status"]
+        fields=["id", "name", "adset_id", "creative", "status", "effective_status"]
     )
 
     if not data:
@@ -307,6 +307,7 @@ def fetch_ads(aid: str) -> List[Dict[str, Any]]:
                 "adset_id": row.get("adset_id"),
                 "creative_id": creative_id,
                 "status": row.get("status"),
+                "effective_status": row.get("effective_status"),
             })
         except Exception:
             continue
