@@ -21,7 +21,7 @@ from telegram.ext import (
 import logging
 
 from billing_watch import init_billing_watch
-from autopilat.actions import apply_budget_change, set_adset_budget
+from autopilat.actions import apply_budget_change, set_adset_budget, disable_entity, can_disable, parse_manual_input
 from history_store import append_autopilot_event, read_autopilot_events
 
 from .constants import (
@@ -74,6 +74,7 @@ from fb_report.cpa_monitoring import build_anomaly_messages_for_account
 import json
 import asyncio
 import time as pytime
+import uuid
 
 
 def _allowed(update: Update) -> bool:
@@ -130,11 +131,298 @@ def _autopilot_analysis_kb(aid: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("🔄 Обновить", callback_data=f"ap_analyze|{aid}")],
+            [InlineKeyboardButton("🛠 Предложить действия", callback_data=f"ap_suggest|{aid}")],
             [InlineKeyboardButton("⬅️ Назад", callback_data=f"autopilot_acc|{aid}")],
             [InlineKeyboardButton("⬅️ К аккаунтам", callback_data="autopilot_menu")],
             [InlineKeyboardButton("⬅️ В меню", callback_data="menu")],
         ]
     )
+
+
+def _ap_action_kb(*, allow_apply: bool, token: str, allow_edit: bool) -> InlineKeyboardMarkup:
+    rows = []
+    if allow_apply:
+        row = [InlineKeyboardButton("✅ Применить", callback_data=f"apdo|apply|{token}")]
+        if allow_edit:
+            row.append(InlineKeyboardButton("✏️ Изменить", callback_data=f"apdo|edit|{token}"))
+        row.append(InlineKeyboardButton("❌ Отменить", callback_data=f"apdo|cancel|{token}"))
+        rows.append(row)
+    else:
+        rows.append([InlineKeyboardButton("✅ Понял", callback_data=f"apdo|ack|{token}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _ap_action_text(action: dict) -> str:
+    kind = str(action.get("kind") or "")
+    name = action.get("name") or action.get("adset_id")
+    reason = action.get("reason") or ""
+    sp_t = action.get("spend_today")
+    ld_t = action.get("leads_today")
+    cpl_t = action.get("cpl_today")
+    cpl_3 = action.get("cpl_3d")
+
+    def _fmt_money(v):
+        if v is None:
+            return "—"
+        try:
+            return f"{float(v):.2f} $"
+        except Exception:
+            return "—"
+
+    def _fmt_int(v):
+        try:
+            return str(int(float(v)))
+        except Exception:
+            return "0"
+
+    lines = [f"🧭 Автопилат: действие для adset", f"{name}", f"ID: {action.get('adset_id')}", ""]
+    lines.append(f"Сегодня: spend {_fmt_money(sp_t)} | leads {_fmt_int(ld_t)} | CPL {_fmt_money(cpl_t)}")
+    lines.append(f"Rolling 3d: CPL {_fmt_money(cpl_3)}")
+    lines.append("")
+
+    if kind == "budget_pct":
+        pct = action.get("percent")
+        try:
+            pct_f = float(pct)
+        except Exception:
+            pct_f = 0.0
+        sign = "+" if pct_f >= 0 else ""
+        lines.append(f"👉 Предложение: изменить бюджет на {sign}{pct_f:.0f}%")
+    elif kind == "pause_adset":
+        lines.append("👉 Предложение: остановить adset")
+    elif kind == "pause_ad":
+        ad_name = action.get("ad_name") or action.get("ad_id")
+        lines.append(f"👉 Предложение: отключить объявление ({ad_name})")
+    elif kind == "note":
+        lines.append("ℹ️ Рекомендация без кнопки применения")
+    else:
+        lines.append("👉 Предложение: (неизвестно)")
+
+    if reason:
+        lines.append(f"Причина: {reason}")
+
+    return "\n".join(lines)
+
+
+def _ap_generate_actions(aid: str) -> list[dict]:
+    ap = _autopilot_get(aid)
+    mode = str(ap.get("mode") or "OFF").upper()
+    limits = ap.get("limits") or {}
+
+    try:
+        max_step = float(limits.get("max_budget_step_pct") or 20)
+    except Exception:
+        max_step = 20.0
+    if max_step <= 0:
+        max_step = 20.0
+    if max_step > 30:
+        max_step = 30.0
+
+    allow_pause_ads = bool(limits.get("allow_pause_ads", True))
+    allow_pause_adsets = bool(limits.get("allow_pause_adsets", False))
+
+    now = datetime.now(ALMATY_TZ)
+    yday = (now - timedelta(days=1)).date()
+    period_3d = {
+        "since": (yday - timedelta(days=2)).strftime("%Y-%m-%d"),
+        "until": yday.strftime("%Y-%m-%d"),
+    }
+
+    try:
+        today_rows = analyze_adsets(aid, period="today") or []
+    except Exception:
+        today_rows = []
+
+    try:
+        d3_rows = analyze_adsets(aid, period=period_3d) or []
+    except Exception:
+        d3_rows = []
+
+    try:
+        today_ads = analyze_ads(aid, period="today") or []
+    except Exception:
+        today_ads = []
+
+    ads_by_adset: dict[str, list[dict]] = {}
+    for a in (today_ads or []):
+        adset_id = str((a or {}).get("adset_id") or "")
+        if not adset_id:
+            continue
+        st = str((a or {}).get("effective_status") or (a or {}).get("status") or "").upper()
+        if st != "ACTIVE":
+            continue
+        if float((a or {}).get("spend", 0.0) or 0.0) <= 0:
+            continue
+        ads_by_adset.setdefault(adset_id, []).append(a)
+
+    def _allowed_row(r: dict) -> bool:
+        st = str((r or {}).get("effective_status") or (r or {}).get("status") or "").upper()
+        return st in {"ACTIVE", "SCHEDULED"}
+
+    today_map = {str(r.get("adset_id")): r for r in (today_rows or []) if r.get("adset_id") and _allowed_row(r)}
+    d3_map = {str(r.get("adset_id")): r for r in (d3_rows or []) if r.get("adset_id") and _allowed_row(r)}
+
+    def _to_float(v):
+        try:
+            return float(v)
+        except Exception:
+            return 0.0
+
+    def _to_int(v):
+        try:
+            return int(float(v))
+        except Exception:
+            return 0
+
+    def _cpl(spend: float, leads: int):
+        if leads <= 0:
+            return None
+        if spend <= 0:
+            return 0.0
+        return float(spend) / float(leads)
+
+    target_cpl = (ap.get("goals") or {}).get("target_cpl")
+    try:
+        target_cpl_f = float(target_cpl) if target_cpl not in (None, "") else None
+    except Exception:
+        target_cpl_f = None
+    if target_cpl_f is not None and target_cpl_f <= 0:
+        target_cpl_f = None
+
+    keys = sorted(set(today_map.keys()) | set(d3_map.keys()))
+    rows = []
+    for k in keys:
+        t = today_map.get(k) or {}
+        d = d3_map.get(k) or {}
+        name = t.get("name") or d.get("name") or k
+
+        sp_t = _to_float(t.get("spend"))
+        ld_t = _to_int(t.get("leads"))
+        cpl_t = _cpl(sp_t, ld_t)
+
+        sp_3 = _to_float(d.get("spend"))
+        ld_3 = _to_int(d.get("leads"))
+        cpl_3 = _cpl(sp_3, ld_3)
+
+        if sp_t <= 0:
+            continue
+
+        if ld_t <= 0:
+            # В v1 pausing adset разрешаем ТОЛЬКО отдельным флагом.
+            if allow_pause_adsets and can_disable(aid, k):
+                rows.append(
+                    {
+                        "kind": "pause_adset",
+                        "adset_id": k,
+                        "name": name,
+                        "spend_today": sp_t,
+                        "leads_today": ld_t,
+                        "cpl_today": cpl_t,
+                        "cpl_3d": cpl_3,
+                        "reason": "Сегодня есть расход, но нет лидов.",
+                        "score": sp_t,
+                    }
+                )
+                continue
+
+            # Основной сценарий v1: предлагаем отключить объявление внутри adset.
+            # Кнопка только если >1 активного объявления.
+            try:
+                active_cnt = _count_active_ads_in_adset(aid, k)
+            except Exception:
+                active_cnt = 0
+
+            if allow_pause_ads and active_cnt > 1:
+                cands = ads_by_adset.get(str(k)) or []
+                cands.sort(key=lambda x: float((x or {}).get("spend", 0.0) or 0.0), reverse=True)
+                cand = cands[0] if cands else None
+                ad_id = str((cand or {}).get("ad_id") or "")
+                ad_name = (cand or {}).get("name") if cand else None
+                if ad_id:
+                    rows.append(
+                        {
+                            "kind": "pause_ad",
+                            "ad_id": ad_id,
+                            "ad_name": ad_name,
+                            "adset_id": k,
+                            "name": name,
+                            "spend_today": sp_t,
+                            "leads_today": ld_t,
+                            "cpl_today": cpl_t,
+                            "cpl_3d": cpl_3,
+                            "reason": "Сегодня есть расход, но нет лидов. В adset >1 активного объявления.",
+                            "score": sp_t,
+                        }
+                    )
+                    continue
+
+            # Если объявление одно — только рекомендация (без кнопки отключения).
+            rows.append(
+                {
+                    "kind": "note",
+                    "adset_id": k,
+                    "name": name,
+                    "spend_today": sp_t,
+                    "leads_today": ld_t,
+                    "cpl_today": cpl_t,
+                    "cpl_3d": cpl_3,
+                    "reason": "Сегодня есть расход, но нет лидов. В adset единственное активное объявление — стоит заменить/отключить вручную.",
+                    "score": sp_t,
+                }
+            )
+            continue
+
+        if cpl_t is None:
+            continue
+
+        if target_cpl_f is not None and target_cpl_f > 0:
+            ratio = float(cpl_t) / float(target_cpl_f)
+        elif cpl_3 is not None and float(cpl_3) > 0:
+            ratio = float(cpl_t) / float(cpl_3)
+        else:
+            ratio = None
+
+        if ratio is None:
+            continue
+
+        if ratio <= 1.05:
+            rows.append(
+                {
+                    "kind": "budget_pct",
+                    "adset_id": k,
+                    "name": name,
+                    "percent": +max_step,
+                    "spend_today": sp_t,
+                    "leads_today": ld_t,
+                    "cpl_today": cpl_t,
+                    "cpl_3d": cpl_3,
+                    "reason": "CPL в норме/лучше бенчмарка.",
+                    "score": sp_t,
+                }
+            )
+        elif ratio >= 1.30:
+            rows.append(
+                {
+                    "kind": "budget_pct",
+                    "adset_id": k,
+                    "name": name,
+                    "percent": -max_step,
+                    "spend_today": sp_t,
+                    "leads_today": ld_t,
+                    "cpl_today": cpl_t,
+                    "cpl_3d": cpl_3,
+                    "reason": "CPL хуже бенчмарка.",
+                    "score": sp_t,
+                }
+            )
+
+    rows.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)
+    rows = rows[:8]
+
+    allow_apply = mode in {"SEMI", "AUTO_LIMITS"}
+    for r in rows:
+        r["allow_apply"] = allow_apply and (str(r.get("kind") or "") not in {"note"})
+    return rows
 
 
 def _autopilot_analysis_text(aid: str) -> str:
@@ -391,6 +679,7 @@ def _autopilot_dashboard_text(aid: str) -> str:
     max_step = limits.get("max_budget_step_pct")
     max_risk = limits.get("max_daily_risk_pct")
     allow_pause_ads = bool(limits.get("allow_pause_ads", True))
+    allow_pause_adsets = bool(limits.get("allow_pause_adsets", False))
     allow_redist = bool(limits.get("allow_redistribute", True))
     allow_reenable = bool(limits.get("allow_reenable_ads", False))
 
@@ -440,6 +729,7 @@ def _autopilot_dashboard_text(aid: str) -> str:
         f"• Шаг бюджета: ±{_fmt_int(max_step)}%",
         f"• Допустимый риск/день: +{_fmt_int(max_risk)}%",
         f"• Pause ads: {'✅' if allow_pause_ads else '❌'}",
+        f"• Pause adsets: {'✅' if allow_pause_adsets else '❌'}",
         f"• Перераспределение: {'✅' if allow_redist else '❌'}",
         f"• Re-enable ads: {'✅' if allow_reenable else '❌'}",
     ]
@@ -451,6 +741,7 @@ def _autopilot_kb(aid: str) -> InlineKeyboardMarkup:
     mode = str(ap.get("mode") or "OFF").upper()
     limits = ap.get("limits") or {}
     allow_reenable = bool(limits.get("allow_reenable_ads", False))
+    allow_pause_adsets = bool(limits.get("allow_pause_adsets", False))
 
     rows = [
         [
@@ -490,6 +781,12 @@ def _autopilot_kb(aid: str) -> InlineKeyboardMarkup:
                 ("🔁 Re-enable ads: ON" if allow_reenable else "🔁 Re-enable ads: OFF"),
                 callback_data=f"ap_toggle_reenable|{aid}",
             ),
+        ],
+        [
+            InlineKeyboardButton(
+                ("🧩 Pause adsets: ON" if allow_pause_adsets else "🧩 Pause adsets: OFF"),
+                callback_data=f"ap_toggle_pause_adsets|{aid}",
+            )
         ],
         [InlineKeyboardButton("📊 Анализ (today vs 3d)", callback_data=f"ap_analyze|{aid}")],
         [InlineKeyboardButton("🧾 История", callback_data=f"ap_history|{aid}")],
@@ -2051,6 +2348,28 @@ async def _on_cb_internal(
         await safe_edit_message(q, text, reply_markup=_autopilot_kb(aid))
         return
 
+    if data.startswith("ap_toggle_pause_adsets|"):
+        aid = data.split("|", 1)[1]
+        ap = _autopilot_get(aid)
+        limits = ap.get("limits") or {}
+        if not isinstance(limits, dict):
+            limits = {}
+        cur = bool(limits.get("allow_pause_adsets", False))
+        limits["allow_pause_adsets"] = not cur
+        _autopilot_set(aid, {"limits": limits})
+        append_autopilot_event(
+            aid,
+            {
+                "type": "toggle",
+                "key": "allow_pause_adsets",
+                "value": bool(limits.get("allow_pause_adsets")),
+                "chat_id": str(chat_id),
+            },
+        )
+        text = _autopilot_dashboard_text(aid)
+        await safe_edit_message(q, text, reply_markup=_autopilot_kb(aid))
+        return
+
     if data.startswith("ap_analyze|"):
         aid = data.split("|", 1)[1]
         await safe_edit_message(q, f"Считаю анализ для {get_account_name(aid)}…")
@@ -2067,6 +2386,209 @@ async def _on_cb_internal(
         text = _autopilot_analysis_text(aid)
         await safe_edit_message(q, text, reply_markup=_autopilot_analysis_kb(aid))
         return
+
+    if data.startswith("ap_suggest|"):
+        aid = data.split("|", 1)[1]
+        await safe_edit_message(q, f"Генерирую действия для {get_account_name(aid)}…")
+
+        actions = _ap_generate_actions(aid) or []
+        append_autopilot_event(
+            aid,
+            {
+                "type": "actions_generated",
+                "count": int(len(actions)),
+                "chat_id": str(chat_id),
+            },
+        )
+
+        if not actions:
+            await safe_edit_message(
+                q,
+                "Нет подходящих действий по текущим данным.\n\n"
+                "Подсказка: проверь, что есть spend сегодня и что adset ACTIVE/SCHEDULED.",
+                reply_markup=_autopilot_analysis_kb(aid),
+            )
+            return
+
+        pending = context.bot_data.setdefault("ap_pending_actions", {})
+        for act in actions:
+            token = uuid.uuid4().hex[:10]
+            act["aid"] = str(aid)
+            act["token"] = token
+            pending[token] = act
+
+            kind = str(act.get("kind") or "")
+            allow_edit = kind == "budget_pct"
+            kb = _ap_action_kb(allow_apply=bool(act.get("allow_apply")), token=token, allow_edit=allow_edit)
+            await context.bot.send_message(chat_id, _ap_action_text(act), reply_markup=kb)
+
+        await safe_edit_message(
+            q,
+            f"Отправил действий: {len(actions)}\n"
+            "Каждое действие отдельным сообщением ниже.",
+            reply_markup=_autopilot_analysis_kb(aid),
+        )
+        return
+
+    if data.startswith("apdo|"):
+        parts = data.split("|", 2)
+        if len(parts) < 3:
+            await q.answer("Некорректная кнопка.", show_alert=True)
+            return
+        _p, op, token = parts
+
+        pending = context.bot_data.get("ap_pending_actions") or {}
+        act = pending.get(token)
+        if not act:
+            await q.answer("Действие устарело. Сгенерируй заново.", show_alert=True)
+            return
+
+        aid = str(act.get("aid") or "")
+        kind = str(act.get("kind") or "")
+        allow_apply = bool(act.get("allow_apply"))
+        if not allow_apply and op in {"apply", "edit"}:
+            await q.answer("Режим Советник: применение отключено.", show_alert=True)
+            return
+
+        if op == "cancel":
+            append_autopilot_event(
+                aid,
+                {"type": "action_cancel", "token": token, "kind": kind, "chat_id": str(chat_id)},
+            )
+            pending.pop(token, None)
+            await safe_edit_message(q, "❌ Отменено\n\n" + _ap_action_text(act))
+            return
+
+        if op == "ack":
+            append_autopilot_event(
+                aid,
+                {"type": "action_ack", "token": token, "kind": kind, "chat_id": str(chat_id)},
+            )
+            pending.pop(token, None)
+            await safe_edit_message(q, "✅ Ок\n\n" + _ap_action_text(act))
+            return
+
+        if op == "edit":
+            if kind != "budget_pct":
+                await q.answer("Для этого действия редактирование не поддерживается.", show_alert=True)
+                return
+
+            context.user_data["await_ap_action_edit"] = {
+                "token": token,
+                "chat_id": str(chat_id),
+                "message_id": int(getattr(q.message, "message_id", 0) or 0),
+            }
+            await safe_edit_message(
+                q,
+                _ap_action_text(act)
+                + "\n\n✍️ Введите новый процент изменения бюджета (например -10 или 15):",
+            )
+            return
+
+        if op == "apply":
+            adset_id = str(act.get("adset_id") or "")
+            if not adset_id:
+                await q.answer("Нет adset_id.", show_alert=True)
+                return
+
+            if kind == "budget_pct":
+                pct = act.get("percent")
+                try:
+                    pct_f = float(pct)
+                except Exception:
+                    pct_f = 0.0
+                res = apply_budget_change(adset_id, pct_f)
+                append_autopilot_event(
+                    aid,
+                    {
+                        "type": "action_apply",
+                        "token": token,
+                        "kind": kind,
+                        "adset_id": adset_id,
+                        "percent": pct_f,
+                        "status": res.get("status"),
+                        "message": res.get("message"),
+                        "chat_id": str(chat_id),
+                    },
+                )
+                pending.pop(token, None)
+                await safe_edit_message(q, "✅ Применено\n\n" + (res.get("message") or "") + "\n\n" + _ap_action_text(act))
+                return
+
+            if kind == "pause_ad":
+                ad_id = str(act.get("ad_id") or "")
+                if not ad_id:
+                    await q.answer("Нет ad_id.", show_alert=True)
+                    return
+
+                try:
+                    active_cnt = _count_active_ads_in_adset(aid, adset_id)
+                except Exception:
+                    active_cnt = 0
+
+                if active_cnt <= 1:
+                    await safe_edit_message(
+                        q,
+                        "❌ Нельзя отключить объявление — оно единственное активное в adset.\n\n" + _ap_action_text(act),
+                    )
+                    return
+
+                res = pause_ad(ad_id)
+                append_autopilot_event(
+                    aid,
+                    {
+                        "type": "action_apply",
+                        "token": token,
+                        "kind": kind,
+                        "adset_id": adset_id,
+                        "ad_id": ad_id,
+                        "status": res.get("status"),
+                        "message": res.get("message") or res.get("exception"),
+                        "chat_id": str(chat_id),
+                    },
+                )
+
+                pending.pop(token, None)
+                if res.get("status") != "ok":
+                    await safe_edit_message(
+                        q,
+                        "⚠️ Не удалось применить\n\n" + str(res.get("message") or res.get("exception") or "") + "\n\n" + _ap_action_text(act),
+                    )
+                    return
+
+                await safe_edit_message(
+                    q,
+                    "✅ Применено\n\n" + str(res.get("message") or "") + "\n\n" + _ap_action_text(act),
+                )
+                return
+
+            if kind == "pause_adset":
+                if not can_disable(aid, adset_id):
+                    await safe_edit_message(
+                        q,
+                        "❌ Нельзя остановить adset — иначе аккаунт останется без активных adset.\n\n" + _ap_action_text(act),
+                    )
+                    return
+
+                res = disable_entity(adset_id)
+                append_autopilot_event(
+                    aid,
+                    {
+                        "type": "action_apply",
+                        "token": token,
+                        "kind": kind,
+                        "adset_id": adset_id,
+                        "status": res.get("status"),
+                        "message": res.get("message"),
+                        "chat_id": str(chat_id),
+                    },
+                )
+                pending.pop(token, None)
+                await safe_edit_message(q, "✅ Применено\n\n" + (res.get("message") or "") + "\n\n" + _ap_action_text(act))
+                return
+
+            await q.answer("Неизвестный тип действия.", show_alert=True)
+            return
 
     if data.startswith("ap_history|"):
         aid = data.split("|", 1)[1]
@@ -5004,6 +5526,58 @@ async def on_text_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = update.message.text.strip()
+
+    if "await_ap_action_edit" in context.user_data:
+        payload = context.user_data.pop("await_ap_action_edit") or {}
+        token = payload.get("token")
+        chat_id = payload.get("chat_id")
+        msg_id = payload.get("message_id")
+
+        pct = parse_manual_input(text)
+        if pct is None:
+            await update.message.reply_text("Введите число процента, например -10 или 15")
+            context.user_data["await_ap_action_edit"] = payload
+            return
+
+        pending = context.bot_data.get("ap_pending_actions") or {}
+        act = pending.get(token)
+        if not act:
+            await update.message.reply_text("Действие устарело. Сгенерируй заново.")
+            return
+
+        if str(act.get("kind") or "") != "budget_pct":
+            await update.message.reply_text("Это действие не поддерживает изменение процента.")
+            return
+
+        act["percent"] = float(pct)
+        pending[token] = act
+
+        aid = str(act.get("aid") or "")
+        append_autopilot_event(
+            aid,
+            {
+                "type": "action_edit",
+                "token": str(token),
+                "kind": "budget_pct",
+                "percent": float(pct),
+                "chat_id": str(chat_id or ""),
+            },
+        )
+
+        try:
+            kb = _ap_action_kb(allow_apply=bool(act.get("allow_apply")), token=str(token), allow_edit=True)
+            if chat_id and msg_id:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=int(msg_id),
+                    text=_ap_action_text(act),
+                    reply_markup=kb,
+                )
+        except Exception:
+            pass
+
+        await update.message.reply_text("✅ Процент обновлён")
+        return
 
     if "await_ap_leads_for" in context.user_data:
         payload = context.user_data.pop("await_ap_leads_for") or {}
