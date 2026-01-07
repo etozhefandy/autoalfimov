@@ -126,6 +126,169 @@ def _build_version_text() -> str:
     return "\n".join(lines)
 
 
+def _autopilot_analysis_kb(aid: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🔄 Обновить", callback_data=f"ap_analyze|{aid}")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data=f"autopilot_acc|{aid}")],
+            [InlineKeyboardButton("⬅️ К аккаунтам", callback_data="autopilot_menu")],
+            [InlineKeyboardButton("⬅️ В меню", callback_data="menu")],
+        ]
+    )
+
+
+def _autopilot_analysis_text(aid: str) -> str:
+    now = datetime.now(ALMATY_TZ)
+    yday = (now - timedelta(days=1)).date()
+    period_3d = {
+        "since": (yday - timedelta(days=2)).strftime("%Y-%m-%d"),
+        "until": yday.strftime("%Y-%m-%d"),
+    }
+
+    try:
+        today_rows = analyze_adsets(aid, period="today") or []
+    except Exception:
+        today_rows = []
+
+    try:
+        d3_rows = analyze_adsets(aid, period=period_3d) or []
+    except Exception:
+        d3_rows = []
+
+    def _allowed_row(r: dict) -> bool:
+        st = str((r or {}).get("effective_status") or (r or {}).get("status") or "").upper()
+        return st in {"ACTIVE", "SCHEDULED"}
+
+    today_map = {str(r.get("adset_id")): r for r in (today_rows or []) if r.get("adset_id") and _allowed_row(r)}
+    d3_map = {str(r.get("adset_id")): r for r in (d3_rows or []) if r.get("adset_id") and _allowed_row(r)}
+
+    ap = _autopilot_get(aid)
+    goals = ap.get("goals") or {}
+    target_cpl = goals.get("target_cpl")
+    try:
+        target_cpl_f = float(target_cpl) if target_cpl not in (None, "") else None
+    except Exception:
+        target_cpl_f = None
+    if target_cpl_f is not None and target_cpl_f <= 0:
+        target_cpl_f = None
+
+    def _to_float(v):
+        try:
+            return float(v)
+        except Exception:
+            return 0.0
+
+    def _to_int(v):
+        try:
+            return int(float(v))
+        except Exception:
+            return 0
+
+    def _fmt_money(v):
+        if v is None:
+            return "—"
+        try:
+            return f"{float(v):.2f} $"
+        except Exception:
+            return "—"
+
+    def _cpl(spend: float, leads: int):
+        if leads <= 0:
+            return None
+        if spend <= 0:
+            return 0.0
+        return float(spend) / float(leads)
+
+    def _status(sp_t: float, ld_t: int, cpl_t, cpl_3):
+        # Пустая статистика сегодня
+        if (sp_t or 0.0) <= 0:
+            return "🟡"
+        if ld_t <= 0:
+            return "🔴"
+
+        if target_cpl_f is not None and cpl_t is not None:
+            ratio = float(cpl_t) / float(target_cpl_f) if target_cpl_f > 0 else 999
+        elif cpl_3 is not None and cpl_t is not None and float(cpl_3) > 0:
+            ratio = float(cpl_t) / float(cpl_3)
+        else:
+            return "🟡"
+
+        if ratio <= 1.05:
+            return "🟢"
+        if ratio <= 1.30:
+            return "🟡"
+        if ratio <= 1.70:
+            return "🟠"
+        return "🔴"
+
+    keys = sorted(set(today_map.keys()) | set(d3_map.keys()))
+    merged = []
+    for k in keys:
+        t = today_map.get(k) or {}
+        d = d3_map.get(k) or {}
+        name = t.get("name") or d.get("name") or k
+
+        sp_t = _to_float(t.get("spend"))
+        ld_t = _to_int(t.get("leads"))
+        cpl_t = _cpl(sp_t, ld_t)
+
+        sp_3 = _to_float(d.get("spend"))
+        ld_3 = _to_int(d.get("leads"))
+        cpl_3 = _cpl(sp_3, ld_3)
+
+        emoji = _status(sp_t, ld_t, cpl_t, cpl_3)
+        merged.append(
+            {
+                "id": k,
+                "name": str(name),
+                "emoji": emoji,
+                "sp_t": sp_t,
+                "ld_t": ld_t,
+                "cpl_t": cpl_t,
+                "sp_3": sp_3,
+                "ld_3": ld_3,
+                "cpl_3": cpl_3,
+            }
+        )
+
+    merged.sort(key=lambda x: float(x.get("sp_t") or 0.0), reverse=True)
+
+    sum_sp_t = sum(float(x.get("sp_t") or 0.0) for x in merged)
+    sum_ld_t = sum(int(x.get("ld_t") or 0) for x in merged)
+    sum_cpl_t = _cpl(sum_sp_t, sum_ld_t)
+
+    sum_sp_3 = sum(float(x.get("sp_3") or 0.0) for x in merged)
+    sum_ld_3 = sum(int(x.get("ld_3") or 0) for x in merged)
+    sum_cpl_3 = _cpl(sum_sp_3, sum_ld_3)
+
+    lines = [
+        f"📊 Автопилат — анализ adset: {get_account_name(aid)}",
+        "",
+        f"Сегодня: spend {_fmt_money(sum_sp_t)} | leads {sum_ld_t} | CPL {_fmt_money(sum_cpl_t)}",
+        f"Rolling 3d (до вчера): spend {_fmt_money(sum_sp_3)} | leads {sum_ld_3} | CPL {_fmt_money(sum_cpl_3)}",
+    ]
+    if target_cpl_f is not None:
+        lines.append(f"Целевой CPL: {_fmt_money(target_cpl_f)}")
+
+    lines.append("")
+    if not merged:
+        lines.append("Нет данных по ACTIVE/SCHEDULED адсетам.")
+        return "\n".join(lines)
+
+    lines.append("Топ adset по spend сегодня:")
+    for x in merged[:12]:
+        lines.extend(
+            [
+                f"{x['emoji']} {x['name']}",
+                f"• today: spend {_fmt_money(x['sp_t'])} | leads {x['ld_t']} | CPL {_fmt_money(x['cpl_t'])}",
+                f"• 3d: spend {_fmt_money(x['sp_3'])} | leads {x['ld_3']} | CPL {_fmt_money(x['cpl_3'])}",
+                "",
+            ]
+        )
+
+    return "\n".join(lines).strip()
+
+
 FOCUS_AI_DATA_TIMEOUT_S = 120
 FOCUS_AI_DEEPSEEK_TIMEOUT_S = 240
 FOCUS_AI_MAX_OBJECTS = 40
@@ -328,6 +491,7 @@ def _autopilot_kb(aid: str) -> InlineKeyboardMarkup:
                 callback_data=f"ap_toggle_reenable|{aid}",
             ),
         ],
+        [InlineKeyboardButton("📊 Анализ (today vs 3d)", callback_data=f"ap_analyze|{aid}")],
         [InlineKeyboardButton("🧾 История", callback_data=f"ap_history|{aid}")],
         [InlineKeyboardButton("⬅️ К аккаунтам", callback_data="autopilot_menu")],
         [InlineKeyboardButton("⬅️ В меню", callback_data="menu")],
@@ -1885,6 +2049,23 @@ async def _on_cb_internal(
         )
         text = _autopilot_dashboard_text(aid)
         await safe_edit_message(q, text, reply_markup=_autopilot_kb(aid))
+        return
+
+    if data.startswith("ap_analyze|"):
+        aid = data.split("|", 1)[1]
+        await safe_edit_message(q, f"Считаю анализ для {get_account_name(aid)}…")
+
+        append_autopilot_event(
+            aid,
+            {
+                "type": "analysis_run",
+                "scope": "adset",
+                "chat_id": str(chat_id),
+            },
+        )
+
+        text = _autopilot_analysis_text(aid)
+        await safe_edit_message(q, text, reply_markup=_autopilot_analysis_kb(aid))
         return
 
     if data.startswith("ap_history|"):

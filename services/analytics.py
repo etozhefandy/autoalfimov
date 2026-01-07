@@ -347,6 +347,8 @@ def analyze_adsets(
         parsed["adset_id"] = adset_id
         parsed["name"] = adset["name"]
         parsed["daily_budget"] = adset["daily_budget"]
+        parsed["status"] = adset.get("status")
+        parsed["effective_status"] = adset.get("effective_status")
 
         results.append(parsed)
 
