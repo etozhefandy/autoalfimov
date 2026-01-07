@@ -875,6 +875,7 @@ def cpa_settings_kb(aid: str):
     freq = alerts.get("freq", "3x")
     days = alerts.get("days") or []
     ai_on = bool(alerts.get("ai_enabled", True))
+    ai_ads_on = bool(alerts.get("ai_cpa_ads_enabled", False))
 
     # Статусные строки
     days_labels = [
@@ -884,17 +885,20 @@ def cpa_settings_kb(aid: str):
     ]
     days_str = ", ".join(days_labels) if days_labels else "не выбраны"
     ai_str = "ВКЛ" if ai_on else "ВЫКЛ"
+    ai_ads_str = "ВКЛ" if ai_ads_on else "ВЫКЛ"
 
     text = (
         f"Настройки CPA-алёртов для {get_account_name(aid)}:\n\n"
         f"• Target CPA аккаунта: {account_cpa:.2f} $\n"
         f"• Частота: {_human_cpa_freq(freq)}\n"
         f"• Дни недели: {days_str}\n"
-        f"• ИИ-анализ: {ai_str}"
+        f"• ИИ-анализ: {ai_str}\n"
+        f"• AI CPA-диагностика креативов: {ai_ads_str}"
     )
 
     # Кнопка ИИ-анализ
     ai_btn_text = "🟢 ИИ-анализ: ВКЛ" if ai_on else "🔴 ИИ-анализ: ВЫКЛ"
+    ai_ads_btn_text = "🟢 AI CPA креативы: ВКЛ" if ai_ads_on else "🔴 AI CPA креативы: ВЫКЛ"
 
     # Кнопки частоты
     freq_3x_selected = freq != "hourly"
@@ -915,6 +919,7 @@ def cpa_settings_kb(aid: str):
 
     rows = [
         [InlineKeyboardButton(ai_btn_text, callback_data=f"cpa_ai|{aid}")],
+        [InlineKeyboardButton(ai_ads_btn_text, callback_data=f"cpa_ai_ads|{aid}")],
         [
             InlineKeyboardButton(
                 freq_3x_text, callback_data=f"cpa_freq|{aid}|3x"
@@ -1532,6 +1537,10 @@ async def _on_cb_internal(
     chat_id: str,
     data: str,
 ):
+    if data == "noop":
+        await q.answer("Ок", show_alert=False)
+        return
+
     if data == "version":
         text = _build_version_text()
         await context.bot.send_message(chat_id, text)
@@ -1662,6 +1671,32 @@ async def _on_cb_internal(
         except ValueError:
             await q.answer("Некорректные данные для выключения объявления.", show_alert=True)
             return
+
+        paused = context.application.bot_data.setdefault("cpa_ai_paused", set())
+        key = f"{aid}:{ad_id}"
+        if key in paused:
+            await q.answer("Уже отключено.", show_alert=False)
+            return
+
+        # Пытаемся определить adset_id для safety-check
+        adset_id = None
+        try:
+            ads_map = _get_ads_map(aid)
+            adset_id = (ads_map.get(str(ad_id)) or {}).get("adset_id")
+        except Exception:
+            adset_id = None
+
+        if adset_id:
+            try:
+                active_cnt = _count_active_ads_in_adset(aid, str(adset_id))
+            except Exception:
+                active_cnt = 0
+            if active_cnt <= 1:
+                await q.answer(
+                    "Нельзя отключить: единственное активное объявление в adset.",
+                    show_alert=True,
+                )
+                return
 
         res = pause_ad(ad_id)
         status = res.get("status")
@@ -2588,6 +2623,19 @@ async def _on_cb_internal(
         await safe_edit_message(q, text, reply_markup=kb)
         return
 
+    if data.startswith("cpa_ai_ads|"):
+        aid = data.split("|", 1)[1]
+        st = load_accounts()
+        row = st.get(aid, {"alerts": {}})
+        alerts = row.get("alerts", {}) or {}
+        alerts["ai_cpa_ads_enabled"] = not bool(alerts.get("ai_cpa_ads_enabled", False))
+        row["alerts"] = alerts
+        st[aid] = row
+        save_accounts(st)
+        text, kb = cpa_settings_kb(aid)
+        await safe_edit_message(q, text, reply_markup=kb)
+        return
+
     if data.startswith("focus_ai_obj_confirm|"):
         # Формат: focus_ai_obj_confirm|adset|{adset_id}|inc|20
         _p, obj_level, obj_id, action, delta_str = data.split("|", 4)
@@ -3265,6 +3313,8 @@ async def _on_cb_internal(
                 await typing_task
             except Exception:
                 pass
+
+            return
 
         if focus_comment:
             await context.bot.send_message(

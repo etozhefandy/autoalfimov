@@ -82,6 +82,8 @@ def _migrate_alerts_schema(store: dict) -> dict:
         # По умолчанию ИИ-анализ включён (как в старой системе с комментариями)
         alerts.setdefault("ai_enabled", True)
 
+        alerts.setdefault("ai_cpa_ads_enabled", False)
+
         # Adset-уровень CPA-алёртов: по умолчанию пустой словарь.
         alerts.setdefault("adset_alerts", {})
         # Campaign-уровень CPA-алёртов: по умолчанию пустой словарь.
