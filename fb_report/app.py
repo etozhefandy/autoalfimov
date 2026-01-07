@@ -400,6 +400,29 @@ def _count_active_ads_in_adset(aid: str, adset_id: str) -> int:
     return int(cnt)
 
 
+async def _send_comparison_for_all(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    chat_id: str,
+    period_old,
+    label_old: str,
+    period_new,
+    label_new: str,
+) -> None:
+    store = load_accounts()
+    any_sent = False
+    for aid in get_enabled_accounts_in_order():
+        if not store.get(aid, {}).get("enabled", True):
+            continue
+        txt = build_comparison_report(aid, period_old, label_old, period_new, label_new)
+        if not txt:
+            continue
+        any_sent = True
+        await ctx.bot.send_message(chat_id=chat_id, text=txt, parse_mode="HTML")
+
+    if not any_sent:
+        await ctx.bot.send_message(chat_id=chat_id, text="Нет данных/нет доступа.")
+
+
 def heatmap_monitoring_modes_kb(aid: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
@@ -2902,32 +2925,57 @@ async def _on_cb_internal(
     # ====== Мониторинг: заглушки режимов сравнения и настроек ======
 
     if data == "mon_yday_vs_byday":
-        await safe_edit_message(
-            q,
-            "Вчера vs позавчера — мониторинг пока в разработке.\n"
-            "В финальной версии здесь будет сравнение всех ключевых метрик за вчера "
-            "против позавчера по каждому включённому аккаунту.",
-            reply_markup=monitoring_menu_kb(),
-        )
+        now = datetime.now(ALMATY_TZ)
+        yday = (now - timedelta(days=1)).date()
+        byday = (now - timedelta(days=2)).date()
+
+        period_old = {"since": byday.strftime("%Y-%m-%d"), "until": byday.strftime("%Y-%m-%d")}
+        period_new = {"since": yday.strftime("%Y-%m-%d"), "until": yday.strftime("%Y-%m-%d")}
+        label_old = byday.strftime("%d.%m.%Y")
+        label_new = yday.strftime("%d.%m.%Y")
+
+        await safe_edit_message(q, f"Сравниваю: {label_new} vs {label_old}…", reply_markup=monitoring_menu_kb())
+        await _send_comparison_for_all(context, chat_id, period_old, label_old, period_new, label_new)
         return
 
     if data == "mon_lastweek_vs_prevweek":
-        await safe_edit_message(
-            q,
-            "Прошлая неделя vs позапрошлая — мониторинг пока в разработке.\n"
-            "Позже здесь будет сравнение по неделям (пн–вс) с подсветкой изменений.",
-            reply_markup=monitoring_menu_kb(),
-        )
+        # Полные недели (пн–вс): прошлая vs позапрошлая.
+        now = datetime.now(ALMATY_TZ)
+        start_this_week = (now - timedelta(days=now.weekday())).date()
+        start_last_week = start_this_week - timedelta(days=7)
+        start_prev_week = start_this_week - timedelta(days=14)
+        end_last_week = start_this_week - timedelta(days=1)
+        end_prev_week = start_last_week - timedelta(days=1)
+
+        period_old = {"since": start_prev_week.strftime("%Y-%m-%d"), "until": end_prev_week.strftime("%Y-%m-%d")}
+        period_new = {"since": start_last_week.strftime("%Y-%m-%d"), "until": end_last_week.strftime("%Y-%m-%d")}
+        label_old = f"{start_prev_week.strftime('%d.%m')}-{end_prev_week.strftime('%d.%m')}"
+        label_new = f"{start_last_week.strftime('%d.%m')}-{end_last_week.strftime('%d.%m')}"
+
+        await safe_edit_message(q, f"Сравниваю недели: {label_new} vs {label_old}…", reply_markup=monitoring_menu_kb())
+        await _send_comparison_for_all(context, chat_id, period_old, label_old, period_new, label_new)
         return
 
     if data == "mon_curweek_vs_lastweek":
-        await safe_edit_message(
-            q,
-            "Текущая неделя vs прошлая (по вчера) — в разработке.\n"
-            "План: сравнение накопленных метрик с понедельника по вчерашний день "
-            "против такого же диапазона прошлой недели.",
-            reply_markup=monitoring_menu_kb(),
-        )
+        now = datetime.now(ALMATY_TZ)
+        yday = (now - timedelta(days=1)).date()
+        start_this_week = (now - timedelta(days=now.weekday())).date()
+        start_last_week = start_this_week - timedelta(days=7)
+
+        # Текущая неделя: пн..вчера
+        # Прошлая неделя: пн..(пн+N), где N соответствует "вчера" в текущей неделе
+        days_since_monday = (yday - start_this_week).days
+        if days_since_monday < 0:
+            days_since_monday = 0
+        end_last_week = start_last_week + timedelta(days=days_since_monday)
+
+        period_old = {"since": start_last_week.strftime("%Y-%m-%d"), "until": end_last_week.strftime("%Y-%m-%d")}
+        period_new = {"since": start_this_week.strftime("%Y-%m-%d"), "until": yday.strftime("%Y-%m-%d")}
+        label_old = f"{start_last_week.strftime('%d.%m')}-{end_last_week.strftime('%d.%m')}"
+        label_new = f"{start_this_week.strftime('%d.%m')}-{yday.strftime('%d.%m')}"
+
+        await safe_edit_message(q, f"Сравниваю накопление: {label_new} vs {label_old}…", reply_markup=monitoring_menu_kb())
+        await _send_comparison_for_all(context, chat_id, period_old, label_old, period_new, label_new)
         return
 
     if data == "mon_custom_period":
