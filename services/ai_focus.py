@@ -97,12 +97,12 @@ DEEPSEEK_MODEL_FAST = os.getenv(
     "DEEPSEEK_MODEL_FAST",
     os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
 )
-# "Думающая" модель — только если явно включим
-DEEPSEEK_MODEL_REASON = os.getenv("DEEPSEEK_MODEL_REASON", "deepseek-reasoner")
+# Модель для JSON-режима: по умолчанию используем быструю, чтобы не упираться в долгие ответы.
+DEEPSEEK_MODEL_JSON = os.getenv("DEEPSEEK_MODEL_JSON", DEEPSEEK_MODEL_FAST)
 
 # Таймауты и ретраи (чтобы не висеть и не ронять бота)
 DEEPSEEK_CONNECT_TIMEOUT = float(os.getenv("DEEPSEEK_CONNECT_TIMEOUT", "10"))
-DEEPSEEK_READ_TIMEOUT = float(os.getenv("DEEPSEEK_READ_TIMEOUT", "60"))
+DEEPSEEK_READ_TIMEOUT = float(os.getenv("DEEPSEEK_READ_TIMEOUT", "120"))
 DEEPSEEK_RETRIES = int(os.getenv("DEEPSEEK_RETRIES", "2"))
 DEEPSEEK_BACKOFF_S = float(os.getenv("DEEPSEEK_BACKOFF_S", "2.0"))
 
@@ -281,7 +281,7 @@ async def ask_deepseek(messages: List[Dict[str, str]], json_mode: bool = False) 
     }
 
     payload: Dict[str, Any] = {
-        "model": DEEPSEEK_MODEL_FAST if not json_mode else DEEPSEEK_MODEL_REASON,
+        "model": DEEPSEEK_MODEL_JSON if json_mode else DEEPSEEK_MODEL_FAST,
         "messages": messages,
     }
 
