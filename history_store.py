@@ -74,3 +74,49 @@ def prune_old_history(max_age_days: int = 365):
                     fout.write(line + "\n")
 
         os.replace(tmp, full)
+
+
+def _autopilot_file_for(aid: str) -> str:
+    safe = aid.replace("act_", "")
+    return os.path.join(HISTORY_DIR, f"autopilot_{safe}.jsonl")
+
+
+def append_autopilot_event(aid: str, event: dict, ts: datetime | None = None):
+    if not aid:
+        return
+
+    if ts is None:
+        ts = datetime.now(ALMATY_TZ)
+
+    try:
+        payload = dict(event or {})
+    except Exception:
+        payload = {}
+    payload["ts"] = ts.isoformat()
+
+    path = _autopilot_file_for(str(aid))
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def read_autopilot_events(aid: str, limit: int = 20) -> list[dict]:
+    if not aid:
+        return []
+
+    path = _autopilot_file_for(str(aid))
+    if not os.path.exists(path):
+        return []
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = [ln.strip() for ln in f.readlines() if ln.strip()]
+    except Exception:
+        return []
+
+    out: list[dict] = []
+    for ln in reversed(lines[-max(limit, 0) :]):
+        try:
+            out.append(json.loads(ln))
+        except Exception:
+            continue
+    return out

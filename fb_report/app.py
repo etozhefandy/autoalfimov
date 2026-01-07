@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, time
+import calendar
 
 from telegram import (
     Update,
@@ -21,6 +22,7 @@ import logging
 
 from billing_watch import init_billing_watch
 from autopilat.actions import apply_budget_change, set_adset_budget
+from history_store import append_autopilot_event, read_autopilot_events
 
 from .constants import (
     ALMATY_TZ,
@@ -135,6 +137,7 @@ def main_menu() -> InlineKeyboardMarkup:
         [
             [InlineKeyboardButton("📊 Отчёты", callback_data="reports_menu")],
             [InlineKeyboardButton("🆘 Мониторинг", callback_data="monitoring_menu")],
+            [InlineKeyboardButton("🤖 Автопилат", callback_data="autopilot_menu")],
             [InlineKeyboardButton("💳 Биллинг", callback_data="billing")],
             [InlineKeyboardButton("🔗 Ссылки на рекламу", callback_data="insta_links_menu")],
             [InlineKeyboardButton("⚙️ Настройки", callback_data="choose_acc_settings")],
@@ -177,6 +180,177 @@ def _lead_metric_label_for_action_type(action_type: str) -> str:
         return at.replace("_", " ").strip().capitalize()
 
     return at
+
+
+def _autopilot_get(aid: str) -> dict:
+    st = load_accounts().get(str(aid), {})
+    ap = st.get("autopilot") or {}
+    return ap if isinstance(ap, dict) else {}
+
+
+def _autopilot_set(aid: str, patch: dict) -> None:
+    aid = str(aid)
+    st = load_accounts()
+    row = st.get(aid, {})
+    ap = row.get("autopilot") or {}
+    if not isinstance(ap, dict):
+        ap = {}
+    for k, v in (patch or {}).items():
+        ap[k] = v
+    row["autopilot"] = ap
+    st[aid] = row
+    save_accounts(st)
+
+
+def _autopilot_human_mode(mode: str) -> str:
+    m = str(mode or "OFF").upper()
+    if m == "ADVISOR":
+        return "🧠 Советник"
+    if m == "SEMI":
+        return "🟡 Полуавто"
+    if m == "AUTO_LIMITS":
+        return "🤖 Авто с лимитами"
+    return "🔴 Выключен"
+
+
+def _autopilot_dashboard_text(aid: str) -> str:
+    ap = _autopilot_get(aid)
+    mode = str(ap.get("mode") or "OFF").upper()
+    goals = ap.get("goals") or {}
+    limits = ap.get("limits") or {}
+
+    leads = goals.get("leads")
+    period = str(goals.get("period") or "day")
+    until = goals.get("until")
+    target_cpl = goals.get("target_cpl")
+    planned_budget = goals.get("planned_budget")
+
+    max_step = limits.get("max_budget_step_pct")
+    max_risk = limits.get("max_daily_risk_pct")
+    allow_pause_ads = bool(limits.get("allow_pause_ads", True))
+    allow_redist = bool(limits.get("allow_redistribute", True))
+    allow_reenable = bool(limits.get("allow_reenable_ads", False))
+
+    period_map = {
+        "day": "день",
+        "week": "неделя",
+        "month": "месяц",
+        "until": "до даты",
+    }
+    period_h = period_map.get(period, period)
+
+    def _fmt_money(v):
+        try:
+            vv = float(v)
+        except Exception:
+            return "—"
+        return f"{vv:.2f} $"
+
+    def _fmt_int(v):
+        try:
+            return str(int(float(v)))
+        except Exception:
+            return "—"
+
+    extra = ""
+    if period == "month" and planned_budget not in (None, ""):
+        try:
+            today = datetime.now(ALMATY_TZ).date()
+            days_in_month = calendar.monthrange(today.year, today.month)[1]
+            daily = float(planned_budget) / float(days_in_month)
+            extra = f"\n• Дневной лимит (месяц): {daily:.2f} $"
+        except Exception:
+            extra = ""
+
+    lines = [
+        f"🤖 Автопилат — {get_account_name(aid)}",
+        "",
+        f"Статус: {_autopilot_human_mode(mode)}",
+        "",
+        "🎯 Цели:",
+        f"• Лиды: {_fmt_int(leads)}",
+        f"• Период: {period_h}" + (f" ({until})" if (period == "until" and until) else ""),
+        f"• Целевой CPL: {_fmt_money(target_cpl)}",
+        f"• Плановый бюджет: {_fmt_money(planned_budget)}" + extra,
+        "",
+        "🧩 Лимиты:",
+        f"• Шаг бюджета: ±{_fmt_int(max_step)}%",
+        f"• Допустимый риск/день: +{_fmt_int(max_risk)}%",
+        f"• Pause ads: {'✅' if allow_pause_ads else '❌'}",
+        f"• Перераспределение: {'✅' if allow_redist else '❌'}",
+        f"• Re-enable ads: {'✅' if allow_reenable else '❌'}",
+    ]
+    return "\n".join(lines)
+
+
+def _autopilot_kb(aid: str) -> InlineKeyboardMarkup:
+    ap = _autopilot_get(aid)
+    mode = str(ap.get("mode") or "OFF").upper()
+    limits = ap.get("limits") or {}
+    allow_reenable = bool(limits.get("allow_reenable_ads", False))
+
+    rows = [
+        [
+            InlineKeyboardButton(
+                ("✅ Советник" if mode == "ADVISOR" else "🧠 Советник"),
+                callback_data=f"ap_mode|{aid}|ADVISOR",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                ("✅ Полуавто" if mode == "SEMI" else "🟡 Полуавто"),
+                callback_data=f"ap_mode|{aid}|SEMI",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                ("✅ Авто с лимитами" if mode == "AUTO_LIMITS" else "🤖 Авто с лимитами"),
+                callback_data=f"ap_mode|{aid}|AUTO_LIMITS",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                ("✅ Выключен" if mode == "OFF" else "🔴 Выключить"),
+                callback_data=f"ap_mode|{aid}|OFF",
+            ),
+        ],
+        [
+            InlineKeyboardButton("🎯 Лиды (цель)", callback_data=f"ap_set_leads|{aid}"),
+            InlineKeyboardButton("💰 CPL (цель)", callback_data=f"ap_set_cpl|{aid}"),
+        ],
+        [
+            InlineKeyboardButton("💵 Бюджет (план)", callback_data=f"ap_set_budget|{aid}"),
+            InlineKeyboardButton("🗓 Период", callback_data=f"ap_period|{aid}"),
+        ],
+        [
+            InlineKeyboardButton(
+                ("🔁 Re-enable ads: ON" if allow_reenable else "🔁 Re-enable ads: OFF"),
+                callback_data=f"ap_toggle_reenable|{aid}",
+            ),
+        ],
+        [InlineKeyboardButton("🧾 История", callback_data=f"ap_history|{aid}")],
+        [InlineKeyboardButton("⬅️ К аккаунтам", callback_data="autopilot_menu")],
+        [InlineKeyboardButton("⬅️ В меню", callback_data="menu")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def _autopilot_period_kb(aid: str) -> InlineKeyboardMarkup:
+    ap = _autopilot_get(aid)
+    goals = ap.get("goals") or {}
+    cur = str(goals.get("period") or "day")
+
+    def b(code: str, label: str) -> InlineKeyboardButton:
+        prefix = "✅ " if cur == code else ""
+        return InlineKeyboardButton(prefix + label, callback_data=f"ap_period_set|{aid}|{code}")
+
+    return InlineKeyboardMarkup(
+        [
+            [b("day", "День"), b("week", "Неделя")],
+            [b("month", "Месяц"), b("until", "До даты")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data=f"autopilot_acc|{aid}")],
+        ]
+    )
 
 
 def _discover_actions_for_account(aid: str) -> list[dict]:
@@ -1566,6 +1740,175 @@ async def _on_cb_internal(
 
     if data == "menu":
         await safe_edit_message(q, "🤖 Выберите действие:", reply_markup=main_menu())
+        return
+
+    if data == "autopilot_menu":
+        await safe_edit_message(
+            q,
+            "Выберите кабинет для Автопилата:",
+            reply_markup=accounts_kb("autopilot_acc"),
+        )
+        return
+
+    if data.startswith("autopilot_acc|"):
+        aid = data.split("|", 1)[1]
+        text = _autopilot_dashboard_text(aid)
+        await safe_edit_message(q, text, reply_markup=_autopilot_kb(aid))
+        return
+
+    if data.startswith("ap_mode|"):
+        try:
+            _p, aid, mode = data.split("|", 2)
+        except ValueError:
+            await q.answer("Некорректные данные режима.", show_alert=True)
+            return
+
+        ap = _autopilot_get(aid)
+        old = str(ap.get("mode") or "OFF").upper()
+        new = str(mode or "OFF").upper()
+
+        _autopilot_set(aid, {"mode": new})
+        append_autopilot_event(
+            aid,
+            {
+                "type": "mode_change",
+                "from": old,
+                "to": new,
+                "chat_id": str(chat_id),
+            },
+        )
+
+        await q.answer(f"Режим: {_autopilot_human_mode(new)}")
+        text = _autopilot_dashboard_text(aid)
+        await safe_edit_message(q, text, reply_markup=_autopilot_kb(aid))
+        return
+
+    if data.startswith("ap_set_leads|"):
+        aid = data.split("|", 1)[1]
+        await safe_edit_message(
+            q,
+            "🎯 Цель по лидам\n\n"
+            "Напиши в чат число лидов (например 20).\n"
+            "0 — сбросить цель.",
+            reply_markup=_autopilot_kb(aid),
+        )
+        context.user_data["await_ap_leads_for"] = {"aid": aid}
+        return
+
+    if data.startswith("ap_set_cpl|"):
+        aid = data.split("|", 1)[1]
+        await safe_edit_message(
+            q,
+            "💰 Целевой CPL\n\n"
+            "Напиши в чат число в $ (например 1.2).\n"
+            "0 — сбросить цель.",
+            reply_markup=_autopilot_kb(aid),
+        )
+        context.user_data["await_ap_cpl_for"] = {"aid": aid}
+        return
+
+    if data.startswith("ap_set_budget|"):
+        aid = data.split("|", 1)[1]
+        await safe_edit_message(
+            q,
+            "💵 Плановый бюджет\n\n"
+            "Напиши в чат число в $ (например 30).\n"
+            "0 — сбросить план.",
+            reply_markup=_autopilot_kb(aid),
+        )
+        context.user_data["await_ap_budget_for"] = {"aid": aid}
+        return
+
+    if data.startswith("ap_period|"):
+        aid = data.split("|", 1)[1]
+        await safe_edit_message(q, "Выберите период цели:", reply_markup=_autopilot_period_kb(aid))
+        return
+
+    if data.startswith("ap_period_set|"):
+        try:
+            _p, aid, code = data.split("|", 2)
+        except ValueError:
+            await q.answer("Некорректные данные периода.", show_alert=True)
+            return
+
+        ap = _autopilot_get(aid)
+        goals = ap.get("goals") or {}
+        if not isinstance(goals, dict):
+            goals = {}
+
+        code = str(code or "day")
+        goals["period"] = code
+        if code != "until":
+            goals["until"] = None
+
+        _autopilot_set(aid, {"goals": goals})
+        append_autopilot_event(
+            aid,
+            {
+                "type": "period_set",
+                "period": code,
+                "chat_id": str(chat_id),
+            },
+        )
+
+        if code == "until":
+            await q.answer("Период: до даты")
+            await context.bot.send_message(
+                chat_id,
+                "Введите дату в формате ДД.ММ.ГГГГ (например 25.01.2026)",
+            )
+            context.user_data["await_ap_until_for"] = {"aid": aid}
+            return
+
+        await q.answer("Период обновлён")
+        text = _autopilot_dashboard_text(aid)
+        await safe_edit_message(q, text, reply_markup=_autopilot_kb(aid))
+        return
+
+    if data.startswith("ap_toggle_reenable|"):
+        aid = data.split("|", 1)[1]
+        ap = _autopilot_get(aid)
+        limits = ap.get("limits") or {}
+        if not isinstance(limits, dict):
+            limits = {}
+        cur = bool(limits.get("allow_reenable_ads", False))
+        limits["allow_reenable_ads"] = not cur
+        _autopilot_set(aid, {"limits": limits})
+        append_autopilot_event(
+            aid,
+            {
+                "type": "toggle",
+                "key": "allow_reenable_ads",
+                "value": bool(limits.get("allow_reenable_ads")),
+                "chat_id": str(chat_id),
+            },
+        )
+        text = _autopilot_dashboard_text(aid)
+        await safe_edit_message(q, text, reply_markup=_autopilot_kb(aid))
+        return
+
+    if data.startswith("ap_history|"):
+        aid = data.split("|", 1)[1]
+        events = read_autopilot_events(aid, limit=20) or []
+        lines = [f"🧾 История Автопилата — {get_account_name(aid)}", ""]
+        if not events:
+            lines.append("(пока пусто)")
+        else:
+            for ev in events:
+                ts = (ev or {}).get("ts")
+                t = (ev or {}).get("type")
+                if t == "mode_change":
+                    lines.append(f"{ts}: mode {ev.get('from')} → {ev.get('to')}")
+                elif t == "goal_set":
+                    lines.append(f"{ts}: goal {ev.get('key')} = {ev.get('value')}")
+                elif t == "period_set":
+                    lines.append(f"{ts}: period = {ev.get('period')}")
+                elif t == "toggle":
+                    lines.append(f"{ts}: {ev.get('key')} = {ev.get('value')}")
+                else:
+                    lines.append(f"{ts}: {t}")
+
+        await safe_edit_message(q, "\n".join(lines), reply_markup=_autopilot_kb(aid))
         return
 
     if data.startswith("mr_menu|"):
@@ -4480,6 +4823,100 @@ async def on_text_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = update.message.text.strip()
+
+    if "await_ap_leads_for" in context.user_data:
+        payload = context.user_data.pop("await_ap_leads_for") or {}
+        aid = payload.get("aid")
+        try:
+            val = int(float(text.replace(",", ".")))
+        except Exception:
+            await update.message.reply_text("Введите число, например 20 (или 0 чтобы сбросить)")
+            context.user_data["await_ap_leads_for"] = payload
+            return
+
+        ap = _autopilot_get(aid)
+        goals = ap.get("goals") or {}
+        if not isinstance(goals, dict):
+            goals = {}
+        goals["leads"] = None if val <= 0 else int(val)
+        _autopilot_set(aid, {"goals": goals})
+        append_autopilot_event(
+            aid,
+            {"type": "goal_set", "key": "leads", "value": goals.get("leads")},
+        )
+        await update.message.reply_text("✅ Цель по лидам обновлена")
+        return
+
+    if "await_ap_cpl_for" in context.user_data:
+        payload = context.user_data.pop("await_ap_cpl_for") or {}
+        aid = payload.get("aid")
+        try:
+            val = float(text.replace(",", "."))
+        except Exception:
+            await update.message.reply_text("Введите число в $ (например 1.2) или 0 чтобы сбросить")
+            context.user_data["await_ap_cpl_for"] = payload
+            return
+
+        ap = _autopilot_get(aid)
+        goals = ap.get("goals") or {}
+        if not isinstance(goals, dict):
+            goals = {}
+        goals["target_cpl"] = None if val <= 0 else float(val)
+        _autopilot_set(aid, {"goals": goals})
+        append_autopilot_event(
+            aid,
+            {"type": "goal_set", "key": "target_cpl", "value": goals.get("target_cpl")},
+        )
+        await update.message.reply_text("✅ Целевой CPL обновлён")
+        return
+
+    if "await_ap_budget_for" in context.user_data:
+        payload = context.user_data.pop("await_ap_budget_for") or {}
+        aid = payload.get("aid")
+        try:
+            val = float(text.replace(",", "."))
+        except Exception:
+            await update.message.reply_text("Введите число в $ (например 30) или 0 чтобы сбросить")
+            context.user_data["await_ap_budget_for"] = payload
+            return
+
+        ap = _autopilot_get(aid)
+        goals = ap.get("goals") or {}
+        if not isinstance(goals, dict):
+            goals = {}
+        goals["planned_budget"] = None if val <= 0 else float(val)
+        _autopilot_set(aid, {"goals": goals})
+        append_autopilot_event(
+            aid,
+            {"type": "goal_set", "key": "planned_budget", "value": goals.get("planned_budget")},
+        )
+        await update.message.reply_text("✅ Плановый бюджет обновлён")
+        return
+
+    if "await_ap_until_for" in context.user_data:
+        payload = context.user_data.pop("await_ap_until_for") or {}
+        aid = payload.get("aid")
+
+        try:
+            dt = datetime.strptime(text.strip(), "%d.%m.%Y").date()
+        except Exception:
+            await update.message.reply_text("Формат даты: ДД.ММ.ГГГГ (например 25.01.2026). Попробуй ещё раз.")
+            context.user_data["await_ap_until_for"] = payload
+            return
+
+        ap = _autopilot_get(aid)
+        goals = ap.get("goals") or {}
+        if not isinstance(goals, dict):
+            goals = {}
+        goals["period"] = "until"
+        goals["until"] = dt.strftime("%d.%m.%Y")
+        _autopilot_set(aid, {"goals": goals})
+        append_autopilot_event(
+            aid,
+            {"type": "goal_set", "key": "until", "value": goals.get("until")},
+        )
+        await update.message.reply_text("✅ Период 'до даты' сохранён")
+        return
 
     if "await_ai_budget_for" in context.user_data:
         payload = context.user_data.pop("await_ai_budget_for")

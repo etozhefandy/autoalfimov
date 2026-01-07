@@ -107,6 +107,43 @@ def _migrate_alerts_schema(store: dict) -> dict:
     return store
 
 
+def _migrate_autopilot_schema(store: dict) -> dict:
+    for aid, row in (store or {}).items():
+        if not isinstance(row, dict):
+            continue
+
+        ap = row.get("autopilot") or {}
+        if not isinstance(ap, dict):
+            ap = {}
+
+        ap.setdefault("mode", "OFF")
+
+        goals = ap.get("goals") or {}
+        if not isinstance(goals, dict):
+            goals = {}
+        goals.setdefault("leads", None)
+        goals.setdefault("period", "day")
+        goals.setdefault("until", None)
+        goals.setdefault("target_cpl", None)
+        goals.setdefault("planned_budget", None)
+        ap["goals"] = goals
+
+        limits = ap.get("limits") or {}
+        if not isinstance(limits, dict):
+            limits = {}
+        limits.setdefault("max_budget_step_pct", 20)
+        limits.setdefault("max_daily_risk_pct", 30)
+        limits.setdefault("allow_pause_ads", True)
+        limits.setdefault("allow_redistribute", True)
+        limits.setdefault("allow_reenable_ads", False)
+        ap["limits"] = limits
+
+        row["autopilot"] = ap
+        store[aid] = row
+
+    return store
+
+
 def _migrate_morning_report_schema(store: dict) -> dict:
     """Мягкая миграция блока morning_report к новой схеме с полем level.
 
@@ -177,7 +214,7 @@ def load_accounts() -> dict:
 
     # Мягкая миграция схемы morning_report к полю level
     store = _migrate_morning_report_schema(store)
-
+    store = _migrate_autopilot_schema(store)
     return store
 
 
