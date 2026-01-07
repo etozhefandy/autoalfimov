@@ -132,11 +132,64 @@ def _autopilot_analysis_kb(aid: str) -> InlineKeyboardMarkup:
         [
             [InlineKeyboardButton("🔄 Обновить", callback_data=f"ap_analyze|{aid}")],
             [InlineKeyboardButton("🛠 Предложить действия", callback_data=f"ap_suggest|{aid}")],
+            [InlineKeyboardButton("🕒 Часы (heatmap)", callback_data=f"ap_hm|{aid}")],
             [InlineKeyboardButton("⬅️ Назад", callback_data=f"autopilot_acc|{aid}")],
             [InlineKeyboardButton("⬅️ К аккаунтам", callback_data="autopilot_menu")],
             [InlineKeyboardButton("⬅️ В меню", callback_data="menu")],
         ]
     )
+
+
+def _autopilot_hm_kb(aid: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Сегодня", callback_data=f"ap_hm_p|{aid}|today"),
+                InlineKeyboardButton("Вчера", callback_data=f"ap_hm_p|{aid}|yday"),
+            ],
+            [InlineKeyboardButton("7 дней", callback_data=f"ap_hm_p|{aid}|7d")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data=f"ap_analyze|{aid}")],
+            [InlineKeyboardButton("⬅️ К аккаунтам", callback_data="autopilot_menu")],
+            [InlineKeyboardButton("⬅️ В меню", callback_data="menu")],
+        ]
+    )
+
+
+def _autopilot_hm_summary(summary: dict) -> str:
+    # summary comes from build_hourly_heatmap_for_account()
+    days = (summary or {}).get("days") or []
+    if not days:
+        return "🕒 Рекомендации по часам: нет данных (нужно накопить hourly_stats)."
+
+    totals = [0 for _ in range(24)]
+    for d in days:
+        vals = (d or {}).get("totals_per_hour") or []
+        for i in range(min(24, len(vals))):
+            try:
+                totals[i] += int(vals[i] or 0)
+            except Exception:
+                continue
+
+    total_all = sum(totals)
+    if total_all <= 0:
+        return "🕒 Рекомендации по часам: за период нет заявок (💬+📩)."
+
+    ranked = sorted([(i, totals[i]) for i in range(24)], key=lambda x: x[1], reverse=True)
+    best = [x for x in ranked if x[1] > 0][:4]
+    worst = sorted([(i, totals[i]) for i in range(24)], key=lambda x: x[1])[:4]
+
+    def _fmt(xs):
+        return ", ".join([f"{h:02d}:00 ({v})" for h, v in xs]) if xs else "—"
+
+    lines = [
+        "🕒 Рекомендации по часам (по заявкам 💬+📩)",
+        f"Лучшие часы: {_fmt(best)}",
+        f"Слабые часы: {_fmt(worst)}",
+        "",
+        "Идея v1: усиливать показы/бюджет в лучшие часы и аккуратно снижать в слабые.",
+        "(Автоприменения нет — только рекомендация.)",
+    ]
+    return "\n".join(lines)
 
 
 def _ap_action_kb(*, allow_apply: bool, token: str, allow_edit: bool) -> InlineKeyboardMarkup:
@@ -906,6 +959,7 @@ def _autopilot_kb(aid: str) -> InlineKeyboardMarkup:
             )
         ],
         [InlineKeyboardButton("📊 Анализ (today vs 3d)", callback_data=f"ap_analyze|{aid}")],
+        [InlineKeyboardButton("🕒 Часы (heatmap)", callback_data=f"ap_hm|{aid}")],
         [InlineKeyboardButton("🧾 История", callback_data=f"ap_history|{aid}")],
         [InlineKeyboardButton("⬅️ К аккаунтам", callback_data="autopilot_menu")],
         [InlineKeyboardButton("⬅️ В меню", callback_data="menu")],
@@ -2502,6 +2556,43 @@ async def _on_cb_internal(
 
         text = _autopilot_analysis_text(aid)
         await safe_edit_message(q, text, reply_markup=_autopilot_analysis_kb(aid))
+        return
+
+    if data.startswith("ap_hm|"):
+        aid = data.split("|", 1)[1]
+        await safe_edit_message(
+            q,
+            "Выберите период для рекомендаций по часам:",
+            reply_markup=_autopilot_hm_kb(aid),
+        )
+        return
+
+    if data.startswith("ap_hm_p|"):
+        try:
+            _p, aid, mode = data.split("|", 2)
+        except ValueError:
+            await q.answer("Некорректный период.", show_alert=True)
+            return
+
+        await safe_edit_message(q, f"Строю heatmap для {get_account_name(aid)}…")
+
+        append_autopilot_event(
+            aid,
+            {
+                "type": "heatmap_view",
+                "mode": str(mode),
+                "chat_id": str(chat_id),
+            },
+        )
+
+        try:
+            heat_txt, summary = build_hourly_heatmap_for_account(aid, get_account_name_fn=get_account_name, mode=str(mode))
+        except Exception:
+            heat_txt, summary = ("Не удалось построить тепловую карту.", {})
+
+        extra = _autopilot_hm_summary(summary or {})
+        text = str(heat_txt or "") + "\n\n" + str(extra or "")
+        await safe_edit_message(q, text, reply_markup=_autopilot_hm_kb(aid))
         return
 
     if data.startswith("ap_suggest|"):
