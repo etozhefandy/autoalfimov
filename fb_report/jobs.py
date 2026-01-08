@@ -101,6 +101,28 @@ def _heatmap_force_kb(aid: str) -> InlineKeyboardMarkup:
     )
 
 
+def _ap_force_prompt_due(ap: dict, now: datetime, *, minutes: int = 60) -> bool:
+    state = (ap or {}).get("heatmap_state") or {}
+    if not isinstance(state, dict):
+        return True
+    last_iso = state.get("last_force_prompt")
+    if not last_iso:
+        return True
+    try:
+        dt = datetime.fromisoformat(str(last_iso))
+        if not dt.tzinfo:
+            dt = ALMATY_TZ.localize(dt)
+        dt = dt.astimezone(ALMATY_TZ)
+    except Exception:
+        return True
+    return (now - dt) >= timedelta(minutes=int(minutes))
+
+
+def _ap_force_button_allowed(now: datetime) -> bool:
+    h = int(now.strftime("%H"))
+    return 10 <= h <= 22
+
+
 def _yesterday_period():
     now = datetime.now(ALMATY_TZ)
     until = now - timedelta(days=1)
@@ -352,6 +374,11 @@ def _ap_heatmap_force_active(ap: dict, now: datetime) -> bool:
     return now <= dt
 
 
+def _ap_heatmap_force_until(ap: dict) -> str:
+    state = (ap or {}).get("heatmap_state") or {}
+    return str((state or {}).get("force_until") or "")
+
+
 def _ap_hourly_bucket(stats: dict, *, section: str, aid: str, entity_id: str, date_key: str, hour_key: str) -> dict:
     try:
         root = (stats or {}).get(section) or {}
@@ -433,12 +460,14 @@ def _ap_find_worst_ad_in_hour(stats: dict, *, aid: str, adset_id: str, now: date
         )
         cpl_7d = agg_7d.get("cpl")
 
-        if isinstance(cpl_7d, (int, float)) and float(cpl_7d) > 0:
-            ratio = float(cpl_today) / float(cpl_7d)
-            key = (ratio, cpl_today, spend)
-        else:
-            ratio = None
-            key = (0.0, cpl_today, spend)
+        if not (isinstance(cpl_7d, (int, float)) and float(cpl_7d) > 0):
+            continue
+        ratio = float(cpl_today) / float(cpl_7d)
+        if ratio < 2.0:
+            continue
+        if float(cpl_today) < float(cpl_7d) + 4.0:
+            continue
+        key = (ratio, cpl_today, spend)
 
         if worst is None or key > worst_key:
             worst = {
@@ -545,6 +574,8 @@ async def _autopilot_heatmap_job(context: ContextTypes.DEFAULT_TYPE):
 
         is_top = hour in set(top_hours)
         is_low = hour in set(low_hours)
+
+        hour_tag = "TOP" if is_top else ("LOW" if is_low else "NEUTRAL")
 
         # Anti-panic:
         # если сегодня плохо, но 3d ок — не делаем агрессивных увеличений.
@@ -653,6 +684,9 @@ async def _autopilot_heatmap_job(context: ContextTypes.DEFAULT_TYPE):
         if (not allow_increase) and (not soft_mode) and blocked_by_planned and _ap_heatmap_force_active(ap, now):
             allow_increase = True
 
+        force_active = _ap_heatmap_force_active(ap, now)
+        force_until = _ap_heatmap_force_until(ap)
+
         # Определяем кандидатов good/bad по сегодняшнему CPL vs 3d (через analyze_adsets).
         # NB: analyze_adsets может быть тяжёлым, но это hourly job и список ограничен.
         good_ids: set[str] = set()
@@ -697,25 +731,37 @@ async def _autopilot_heatmap_job(context: ContextTypes.DEFAULT_TYPE):
             # если нельзя увеличивать — в топ-час просто не трогаем
             if not allow_increase:
                 if blocked_by_planned:
-                    try:
-                        await context.bot.send_message(
-                            chat_id,
-                            f"⚠️ Heatmap: упёрся в planned_budget/лимит периода для {get_account_name(aid)}. "
-                            "Нужно одобрение, чтобы продолжать увеличения.",
-                            reply_markup=_heatmap_force_kb(aid),
-                        )
-                        await asyncio.sleep(0.3)
-                    except Exception:
-                        pass
+                    if _ap_force_prompt_due(ap, now, minutes=60):
+                        ap_state = ap.get("heatmap_state") or {}
+                        if not isinstance(ap_state, dict):
+                            ap_state = {}
+                        ap_state["last_force_prompt"] = now.isoformat()
+                        ap["heatmap_state"] = ap_state
+                        row["autopilot"] = ap
+                        accounts[aid] = row
 
-                    append_autopilot_event(
-                        aid,
-                        {
-                            "type": "heatmap_force_needed",
-                            "hour": hour,
-                            "chat_id": chat_id,
-                        },
-                    )
+                        msg = (
+                            f"⚠️ Heatmap: упёрся в planned_budget/лимит периода для {get_account_name(aid)}. "
+                            "Нужно одобрение, чтобы продолжать увеличения."
+                        )
+                        try:
+                            if _ap_force_button_allowed(now):
+                                await context.bot.send_message(chat_id, msg, reply_markup=_heatmap_force_kb(aid))
+                            else:
+                                await context.bot.send_message(chat_id, msg)
+                            await asyncio.sleep(0.3)
+                        except Exception:
+                            pass
+
+                        append_autopilot_event(
+                            aid,
+                            {
+                                "type": "heatmap_force_needed",
+                                "hour": hour,
+                                "chat_id": chat_id,
+                                "button_allowed": bool(_ap_force_button_allowed(now)),
+                            },
+                        )
                 continue
 
             if not good_ids:
@@ -739,14 +785,18 @@ async def _autopilot_heatmap_job(context: ContextTypes.DEFAULT_TYPE):
         else:
             continue
 
-        new_total = sum(c["new"] for c in changes)
+        new_total_before_scale = sum(c["new"] for c in changes)
+        new_total = float(new_total_before_scale)
         if new_total <= 0:
             continue
 
+        scale = 1.0
         if new_total > float(total_cap):
             scale = float(total_cap) / float(new_total)
             for c in changes:
                 c["new"] = max(1.0, float(c["new"]) * scale)
+
+        new_total_after_scale = sum(c["new"] for c in changes)
 
         applied = []
         stats_cache = load_hourly_stats() or {}
@@ -818,21 +868,63 @@ async def _autopilot_heatmap_job(context: ContextTypes.DEFAULT_TYPE):
             {
                 "type": "heatmap_auto_apply",
                 "hour": hour,
+                "hour_tag": hour_tag,
                 "top_hours": top_hours,
                 "low_hours": low_hours,
                 "soft_mode": bool(soft_mode),
                 "aggressive": bool(aggressive),
+                "blocked": {
+                    "risk": bool(blocked_by_risk),
+                    "planned": bool(blocked_by_planned),
+                    "soft_mode": bool(soft_mode),
+                    "force_active": bool(force_active),
+                    "force_until": force_until,
+                },
+                "caps": {
+                    "current_total": float(current_total),
+                    "baseline_total": float(base_total_f),
+                    "daily_limit": float(daily_limit) if daily_limit is not None else None,
+                    "planned_total": float(planned_total) if planned_total is not None else None,
+                    "total_cap": float(total_cap),
+                    "new_total_before_scale": float(new_total_before_scale),
+                    "scale": float(scale),
+                    "new_total_after_scale": float(new_total_after_scale),
+                },
                 "applied": applied,
                 "chat_id": chat_id,
             },
         )
 
         title = f"🤖 Heatmap AUTO_LIMITS: {get_account_name(aid)}"
-        reason = f"Час {hour:02d}:00. Top={','.join([f'{h:02d}' for h in top_hours]) or '-'}; Low={','.join([f'{h:02d}' for h in low_hours]) or '-'}"
+        reason = f"Час {hour:02d}:00 ({hour_tag}). Top={','.join([f'{h:02d}' for h in top_hours]) or '-'}; Low={','.join([f'{h:02d}' for h in low_hours]) or '-'}"
         mode_line = "Режим: AUTO_LIMITS"
         anti = "Anti-panic: мягкий режим (без увеличений)" if soft_mode else ("Anti-panic: агрессивнее (CPL > 4× target)" if aggressive else "Anti-panic: стандарт")
 
-        lines = [title, mode_line, anti, reason, "", "Изменения бюджетов:"]
+        blocked = []
+        if blocked_by_risk:
+            blocked.append("risk")
+        if blocked_by_planned:
+            blocked.append("planned")
+        if soft_mode:
+            blocked.append("soft_mode")
+        if (not blocked) and force_active:
+            blocked.append("force_active")
+
+        cap_lines = [
+            f"Caps: current={float(current_total):.2f}$ baseline={float(base_total_f):.2f}$ cap={float(total_cap):.2f}$",
+            f"Plan: daily_limit={(float(daily_limit) if daily_limit is not None else None)} planned_total={(float(planned_total) if planned_total is not None else None)}",
+            f"Scale: before={float(new_total_before_scale):.2f}$ scale={float(scale):.3f} after={float(new_total_after_scale):.2f}$",
+        ]
+
+        if force_active and force_until:
+            cap_lines.append(f"Force: active_until={force_until}")
+        if blocked:
+            cap_lines.append(f"Blocked: {', '.join(blocked)}")
+
+        lines = [title, mode_line, anti, reason]
+        lines.extend(cap_lines)
+        lines.append("")
+        lines.append("Изменения бюджетов:")
         for a in applied[:25]:
             nm = str(a.get("adset_name") or "").strip()
             head = f"- {a['adset_id']}" + (f" ({nm})" if nm else "")
