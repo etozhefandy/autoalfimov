@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, time
 import asyncio
 import re
 import json
+import logging
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes, Application
@@ -74,7 +75,7 @@ except Exception:  # noqa: BLE001
     def analyze_ads(_aid: str, days: int = 7, period=None):  # type: ignore[override]
         return []
 
-    async def ask_deepseek(_messages, json_mode: bool = False):  # type: ignore[override]
+    async def ask_deepseek(_messages, json_mode: bool = False, *, andrey_tone: bool = False):  # type: ignore[override]
         raise RuntimeError("DeepSeek is not available in this environment")
 
     def fetch_adsets(_aid: str):  # type: ignore[override]
@@ -194,6 +195,7 @@ async def daily_report_job(context: ContextTypes.DEFAULT_TYPE):
 
     try:
         await send_period_report(context, chat_id, period, label)
+        logging.getLogger(__name__).info("🟢 Daily report job executed successfully")
     except Exception as e:
         await context.bot.send_message(
             chat_id,
@@ -1358,6 +1360,8 @@ async def _autopilot_heatmap_job(context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
+    logging.getLogger(__name__).info("🟢 Autopilot heatmap job executed successfully")
+
 
 def _is_day_enabled(alerts: dict, now: datetime) -> bool:
     days = alerts.get("days") or []
@@ -1991,6 +1995,8 @@ async def _cpa_alerts_job(context: ContextTypes.DEFAULT_TYPE):
         # NB: ИИ-комментарии добавляются на уровне конкретных алёртов (кампания/адсет/объявление)
         # и не должны ломать мониторинг.
 
+    logging.getLogger(__name__).info("🟢 CPA alerts job executed successfully")
+
 
 async def _hourly_snapshot_job(context: ContextTypes.DEFAULT_TYPE):
     """Раз в час снимаем инсайты за today и сохраняем дельту в hour buckets.
@@ -2218,6 +2224,8 @@ async def _hourly_snapshot_job(context: ContextTypes.DEFAULT_TYPE):
             del stats["_ad"][aid]
 
     save_hourly_stats(stats)
+
+    logging.getLogger(__name__).info("🟢 Hourly snapshot job executed successfully")
 
 
 def schedule_cpa_alerts(app: Application):

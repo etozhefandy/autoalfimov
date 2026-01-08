@@ -107,6 +107,36 @@ DEEPSEEK_RETRIES = int(os.getenv("DEEPSEEK_RETRIES", "2"))
 DEEPSEEK_BACKOFF_S = float(os.getenv("DEEPSEEK_BACKOFF_S", "2.0"))
 
 
+ANDREY_TONE_SYSTEM_PROMPT = (
+    "Ты — аналитический модуль бота Андрея.\n"
+    "Ты не ассистент, не чат и не собеседник.\n"
+    "Ты пишешь только аналитические комментарии, выводы и рекомендации к рекламным данным.\n\n"
+    "Ты используешься только для:\n"
+    "1. Интерпретации рекламных отчётов\n"
+    "2. Аналитики тепловых карт (adsets / CPA / динамика)\n"
+    "3. Рекомендаций по оптимизации\n\n"
+    "Пиши в тональности Андрея:\n"
+    "— разговорный русский\n"
+    "— короткие фразы\n"
+    "— стиль Telegram\n"
+    "— спокойно, уверенно\n"
+    "— допускается лёгкая ирония и умеренный мат, если по делу\n"
+    "— без официоза и канцелярита\n\n"
+    "Сначала вывод, потом короткое объяснение.\n"
+    "Если есть косяк — называй его прямо.\n"
+    "Если всё нормально — так и пиши.\n"
+    "Не выдумывай данные.\n\n"
+    "Запрещено:\n"
+    "— «как ИИ»\n"
+    "— «рекомендуется», «следует», «целесообразно»\n"
+    "— вода и философия"
+)
+
+
+def _prepend_andrey_tone(messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    return [{"role": "system", "content": ANDREY_TONE_SYSTEM_PROMPT}] + list(messages or [])
+
+
 def _get_api_key() -> str | None:
     # новый приоритетный ключ
     k = os.getenv("DEEPSEEK_API_KEY")
@@ -233,10 +263,12 @@ def get_focus_comment(context: Dict[str, Any]) -> str:
         )
 
         data = deepseek_chat(
-            [
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": user_msg},
-            ],
+            _prepend_andrey_tone(
+                [
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": user_msg},
+                ]
+            ),
             temperature=0.4,
             max_tokens=256,
         )
@@ -262,7 +294,12 @@ def get_focus_comment(context: Dict[str, Any]) -> str:
         )
 
 
-async def ask_deepseek(messages: List[Dict[str, str]], json_mode: bool = False) -> Dict[str, Any]:
+async def ask_deepseek(
+    messages: List[Dict[str, str]],
+    json_mode: bool = False,
+    *,
+    andrey_tone: bool = False,
+) -> Dict[str, Any]:
     """Асинхронная обёртка вокруг DeepSeek Chat Completions (thinking-mode).
 
     Принимает список messages в формате OpenAI (role/content) и, опционально,
@@ -280,9 +317,11 @@ async def ask_deepseek(messages: List[Dict[str, str]], json_mode: bool = False) 
         "Content-Type": "application/json",
     }
 
+    msg_out = _prepend_andrey_tone(messages) if andrey_tone else (messages or [])
+
     payload: Dict[str, Any] = {
         "model": DEEPSEEK_MODEL_JSON if json_mode else DEEPSEEK_MODEL_FAST,
-        "messages": messages,
+        "messages": msg_out,
     }
 
     if json_mode:

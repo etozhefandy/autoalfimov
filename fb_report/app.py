@@ -3701,6 +3701,7 @@ async def _on_cb_internal(
                         {"role": "user", "content": user_msg},
                     ],
                     json_mode=True,
+                    andrey_tone=True,
                 ),
                 timeout=FOCUS_AI_DEEPSEEK_TIMEOUT_S,
             )
@@ -4756,6 +4757,7 @@ async def _on_cb_internal(
                     {"role": "user", "content": user_msg},
                 ],
                 json_mode=False,
+                andrey_tone=True,
             )
             choice = (ds_resp.get("choices") or [{}])[0]
             focus_comment = (choice.get("message") or {}).get("content")
@@ -4813,6 +4815,7 @@ async def _on_cb_internal(
                     {"role": "user", "content": user_msg},
                 ],
                 json_mode=False,
+                andrey_tone=True,
             )
             choice = (ds_resp.get("choices") or [{}])[0]
             focus_comment = (choice.get("message") or {}).get("content")
@@ -4902,6 +4905,7 @@ async def _on_cb_internal(
                     {"role": "user", "content": user_msg},
                 ],
                 json_mode=False,
+                andrey_tone=True,
             )
 
             choice = (ds_resp.get("choices") or [{}])[0]
@@ -6430,5 +6434,7 @@ def build_app() -> Application:
         owner_id=253181449,
         group_chat_id=str(DEFAULT_REPORT_CHAT),
     )
+
+    logging.getLogger(__name__).info("🟢 Scheduler started, jobs registered")
 
     return app

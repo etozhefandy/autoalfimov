@@ -17,6 +17,8 @@ if __name__ == "__main__":
     # Если build_app() упадёт — это должно быть фатально (while-restart не поможет).
     app = build_app()
 
+    log.info("🟢 Bot started successfully")
+
     while True:
         try:
             try:
