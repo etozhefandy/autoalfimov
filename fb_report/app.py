@@ -141,6 +141,31 @@ def _autopilot_analysis_kb(aid: str) -> InlineKeyboardMarkup:
     )
 
 
+def monitoring_compare_accounts_kb(prefix: str) -> InlineKeyboardMarkup:
+    store = load_accounts()
+    if store:
+        enabled_ids = [aid for aid, row in store.items() if row.get("enabled", True)]
+        disabled_ids = [aid for aid, row in store.items() if not row.get("enabled", True)]
+        ids = enabled_ids + disabled_ids
+    else:
+        from .constants import AD_ACCOUNTS_FALLBACK
+
+        ids = AD_ACCOUNTS_FALLBACK
+
+    rows = []
+    for aid in ids:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"{get_account_name(aid)}",
+                    callback_data=f"{prefix}|{aid}",
+                )
+            ]
+        )
+    rows.append([InlineKeyboardButton("⬅️ Мониторинг", callback_data="monitoring_menu")])
+    return InlineKeyboardMarkup(rows)
+
+
 def monitoring_accounts_kb() -> InlineKeyboardMarkup:
     store = load_accounts()
     if store:
@@ -4618,6 +4643,31 @@ async def _on_cb_internal(
     # ====== Мониторинг: заглушки режимов сравнения и настроек ======
 
     if data == "mon_yday_vs_byday":
+        await safe_edit_message(
+            q,
+            "Выберите аккаунт для сравнения: вчера vs позавчера",
+            reply_markup=monitoring_compare_accounts_kb("moncmp_yday"),
+        )
+        return
+
+    if data == "mon_lastweek_vs_prevweek":
+        await safe_edit_message(
+            q,
+            "Выберите аккаунт для сравнения: прошлая неделя vs позапрошлая",
+            reply_markup=monitoring_compare_accounts_kb("moncmp_lastweek"),
+        )
+        return
+
+    if data == "mon_curweek_vs_lastweek":
+        await safe_edit_message(
+            q,
+            "Выберите аккаунт для сравнения: текущая неделя vs прошлая (по вчера)",
+            reply_markup=monitoring_compare_accounts_kb("moncmp_curweek"),
+        )
+        return
+
+    if data.startswith("moncmp_yday|"):
+        aid = data.split("|", 1)[1]
         now = datetime.now(ALMATY_TZ)
         yday = (now - timedelta(days=1)).date()
         byday = (now - timedelta(days=2)).date()
@@ -4627,11 +4677,22 @@ async def _on_cb_internal(
         label_old = byday.strftime("%d.%m.%Y")
         label_new = yday.strftime("%d.%m.%Y")
 
-        await safe_edit_message(q, f"Сравниваю: {label_new} vs {label_old}…", reply_markup=monitoring_menu_kb())
-        await _send_comparison_for_all(context, chat_id, period_old, label_old, period_new, label_new)
+        await safe_edit_message(
+            q,
+            f"Сравниваю {get_account_name(aid)}: {label_new} vs {label_old}…",
+            reply_markup=monitoring_menu_kb(),
+        )
+
+        txt = build_comparison_report(aid, period_old, label_old, period_new, label_new)
+        if not txt:
+            await context.bot.send_message(chat_id=chat_id, text="Нет данных/нет доступа.")
+            return
+        await context.bot.send_message(chat_id=chat_id, text=txt, parse_mode="HTML")
         return
 
-    if data == "mon_lastweek_vs_prevweek":
+    if data.startswith("moncmp_lastweek|"):
+        aid = data.split("|", 1)[1]
+
         # Полные недели (пн–вс): прошлая vs позапрошлая.
         now = datetime.now(ALMATY_TZ)
         start_this_week = (now - timedelta(days=now.weekday())).date()
@@ -4645,11 +4706,22 @@ async def _on_cb_internal(
         label_old = f"{start_prev_week.strftime('%d.%m')}-{end_prev_week.strftime('%d.%m')}"
         label_new = f"{start_last_week.strftime('%d.%m')}-{end_last_week.strftime('%d.%m')}"
 
-        await safe_edit_message(q, f"Сравниваю недели: {label_new} vs {label_old}…", reply_markup=monitoring_menu_kb())
-        await _send_comparison_for_all(context, chat_id, period_old, label_old, period_new, label_new)
+        await safe_edit_message(
+            q,
+            f"Сравниваю недели {get_account_name(aid)}: {label_new} vs {label_old}…",
+            reply_markup=monitoring_menu_kb(),
+        )
+
+        txt = build_comparison_report(aid, period_old, label_old, period_new, label_new)
+        if not txt:
+            await context.bot.send_message(chat_id=chat_id, text="Нет данных/нет доступа.")
+            return
+        await context.bot.send_message(chat_id=chat_id, text=txt, parse_mode="HTML")
         return
 
-    if data == "mon_curweek_vs_lastweek":
+    if data.startswith("moncmp_curweek|"):
+        aid = data.split("|", 1)[1]
+
         now = datetime.now(ALMATY_TZ)
         yday = (now - timedelta(days=1)).date()
         start_this_week = (now - timedelta(days=now.weekday())).date()
@@ -4667,8 +4739,17 @@ async def _on_cb_internal(
         label_old = f"{start_last_week.strftime('%d.%m')}-{end_last_week.strftime('%d.%m')}"
         label_new = f"{start_this_week.strftime('%d.%m')}-{yday.strftime('%d.%m')}"
 
-        await safe_edit_message(q, f"Сравниваю накопление: {label_new} vs {label_old}…", reply_markup=monitoring_menu_kb())
-        await _send_comparison_for_all(context, chat_id, period_old, label_old, period_new, label_new)
+        await safe_edit_message(
+            q,
+            f"Сравниваю накопление {get_account_name(aid)}: {label_new} vs {label_old}…",
+            reply_markup=monitoring_menu_kb(),
+        )
+
+        txt = build_comparison_report(aid, period_old, label_old, period_new, label_new)
+        if not txt:
+            await context.bot.send_message(chat_id=chat_id, text="Нет данных/нет доступа.")
+            return
+        await context.bot.send_message(chat_id=chat_id, text=txt, parse_mode="HTML")
         return
 
     if data == "mon_custom_period":
