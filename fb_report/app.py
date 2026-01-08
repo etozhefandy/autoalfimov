@@ -69,7 +69,7 @@ from .billing import send_billing, send_billing_forecast, billing_digest_job
 from .jobs import full_daily_scan_job, daily_report_job, schedule_cpa_alerts, _resolve_account_cpa
 
 from services.analytics import analyze_campaigns, analyze_adsets, analyze_account, analyze_ads
-from services.facebook_api import pause_ad, fetch_adsets, fetch_ads, fetch_insights, fetch_campaigns
+from services.facebook_api import pause_ad, fetch_adsets, fetch_ads, fetch_insights, fetch_campaigns, get_last_api_error
 from services.ai_focus import get_focus_comment, ask_deepseek, sanitize_ai_text
 from fb_report.cpa_monitoring import build_anomaly_messages_for_account
 import json
@@ -682,7 +682,10 @@ async def _autopilot_hourly_job(context: ContextTypes.DEFAULT_TYPE):
 
         for gid in gids:
             eff = _autopilot_effective_config_for_group(aid, gid)
-            actions = _ap_generate_actions(aid, eff=eff) or []
+            try:
+                actions = _ap_generate_actions(aid, eff=eff) or []
+            except Exception:
+                actions = []
             if not actions:
                 continue
 
@@ -772,6 +775,7 @@ async def _autopilot_warmup_job(context: ContextTypes.DEFAULT_TYPE):
 
     store = load_accounts() or {}
     any_lines = []
+    diag_lines = []
     total_groups = 0
     total_actions = 0
 
@@ -798,10 +802,29 @@ async def _autopilot_warmup_job(context: ContextTypes.DEFAULT_TYPE):
             eff = _autopilot_effective_config_for_group(aid, gid)
             gname = eff.get("group_name") or str(gid)
 
+            before_err = (get_last_api_error() or {}).get("error")
+
             try:
                 actions = _ap_generate_actions(aid, eff=eff) or []
             except Exception:
                 actions = []
+
+            after_err = (get_last_api_error() or {}).get("error")
+            new_err = after_err if after_err and after_err != before_err else None
+            if new_err:
+                low = str(new_err).lower()
+                if (
+                    "request limit" in low
+                    or "too many calls" in low
+                    or "user request limit reached" in low
+                    or "code\": 17" in low
+                    or " code 17" in low
+                ):
+                    diag_lines.append(f"⚠️ FB API лимит запросов: {new_err}")
+                elif "oauth" in low or "access" in low or "token" in low:
+                    diag_lines.append(f"⚠️ FB API ошибка авторизации: {new_err}")
+                else:
+                    diag_lines.append(f"⚠️ FB API ошибка: {new_err}")
 
             shown = []
             for act in (actions or [])[:5]:
@@ -812,13 +835,23 @@ async def _autopilot_warmup_job(context: ContextTypes.DEFAULT_TYPE):
                 any_lines.append(f"\n🤖 Группа: {gname} — идеи: {len(actions)}")
                 any_lines.append("\n\n---\n\n".join(shown))
             else:
-                any_lines.append(f"\n🤖 Группа: {gname} — действий нет")
+                goals = eff.get("goals") or {}
+                if isinstance(goals, dict) and (goals.get("target_cpl") in (None, "")):
+                    any_lines.append(f"\n🤖 Группа: {gname} — действий нет (цель CPL не задана)")
+                else:
+                    any_lines.append(f"\n🤖 Группа: {gname} — действий нет")
 
     header = (
         "🤖 Автопилот — первичный прогон после старта\n"
         "Это не часовой срез. Ничего не применяю, только подсказываю идеи.\n"
         f"Активных групп: {total_groups} | Рекомендаций: {total_actions}\n"
     )
+
+    if diag_lines:
+        diag = "\n" + "\n".join(diag_lines[:3])
+        if len(diag_lines) > 3:
+            diag += f"\n(+{len(diag_lines) - 3})"
+        header = header + diag + "\n"
 
     if total_groups == 0:
         text = header + "\nСейчас нет активных групп (или автопилот выключен)."
@@ -830,6 +863,17 @@ async def _autopilot_warmup_job(context: ContextTypes.DEFAULT_TYPE):
         text=text,
         disable_notification=bool(quiet),
     )
+
+    if diag_lines and any(("лимит" in str(x).lower() or "request limit" in str(x).lower()) for x in diag_lines):
+        try:
+            token = uuid.uuid4().hex[:8]
+            context.job_queue.run_once(
+                _autopilot_warmup_job,
+                when=timedelta(minutes=25),
+                name=f"autopilot_warmup_retry_{token}",
+            )
+        except Exception:
+            pass
 
 
 def _ap_force_kb(token: str) -> InlineKeyboardMarkup:
@@ -7679,7 +7723,7 @@ def build_app() -> Application:
     app.job_queue.run_repeating(
         _autopilot_hourly_job,
         interval=timedelta(hours=1),
-        first=timedelta(minutes=10),
+        first=timedelta(minutes=13),
     )
 
     app.job_queue.run_once(

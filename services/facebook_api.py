@@ -13,6 +13,14 @@ from config import FB_ACCESS_TOKEN
 from services.storage import load_local_insights, save_local_insights, period_key
 
 
+_LAST_API_ERROR: Optional[str] = None
+_LAST_API_ERROR_AT: Optional[str] = None
+
+
+def get_last_api_error() -> Dict[str, Optional[str]]:
+    return {"error": _LAST_API_ERROR, "at": _LAST_API_ERROR_AT}
+
+
 # ИНИЦИАЛИЗАЦИЯ FACEBOOK API (один раз для всего проекта)
 if FB_ACCESS_TOKEN:
     # Используем токен без app_id/app_secret, как в config.py.
@@ -29,6 +37,15 @@ def safe_api_call(fn, *args, **kwargs):
     try:
         return fn(*args, **kwargs)
     except Exception as e:
+        global _LAST_API_ERROR, _LAST_API_ERROR_AT
+        try:
+            _LAST_API_ERROR = str(e)
+        except Exception:
+            _LAST_API_ERROR = "<unprintable error>"
+        try:
+            _LAST_API_ERROR_AT = datetime.utcnow().isoformat()
+        except Exception:
+            _LAST_API_ERROR_AT = None
         print(f"[facebook_api] Error: {e}")
         return None
 
