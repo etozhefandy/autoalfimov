@@ -160,6 +160,16 @@ def _migrate_autopilot_schema(store: dict) -> dict:
 
         ap.setdefault("campaign_groups", {})
         ap.setdefault("active_group_id", None)
+        ap.setdefault("active_group_ids", [])
+
+        active_ids = ap.get("active_group_ids")
+        if not isinstance(active_ids, list):
+            active_ids = []
+        active_ids = [str(x) for x in active_ids if str(x).strip()]
+        gid = ap.get("active_group_id")
+        if gid and str(gid).strip() and str(gid) not in set(active_ids):
+            active_ids.append(str(gid))
+        ap["active_group_ids"] = active_ids
 
         row["autopilot"] = ap
         store[aid] = row

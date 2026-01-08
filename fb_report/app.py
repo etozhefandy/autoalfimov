@@ -312,10 +312,10 @@ def _ap_action_text(action: dict) -> str:
     return "\n".join(lines)
 
 
-def _ap_generate_actions(aid: str) -> list[dict]:
+def _ap_generate_actions(aid: str, *, eff: dict | None = None) -> list[dict]:
     ap = _autopilot_get(aid)
     mode = str(ap.get("mode") or "OFF").upper()
-    eff = _autopilot_effective_config(aid)
+    eff = eff or _autopilot_effective_config(aid)
     lead_action_type = eff.get("lead_action_type")
     kpi_mode = str(eff.get("kpi") or "total")
     group_campaign_ids = eff.get("campaign_ids")
@@ -659,6 +659,111 @@ def _ap_within_limits_for_auto(aid: str, act: dict) -> tuple[bool, str]:
     return False, "unknown_kind"
 
 
+async def _autopilot_hourly_job(context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(DEFAULT_REPORT_CHAT)
+    now = datetime.now(ALMATY_TZ)
+    hour = int(now.strftime("%H"))
+    quiet = (hour >= 22) or (hour < 10)
+
+    store = load_accounts() or {}
+    for aid, row in store.items():
+        if not (row or {}).get("enabled", True):
+            continue
+        ap = (row or {}).get("autopilot") or {}
+        if not isinstance(ap, dict):
+            continue
+        mode = str(ap.get("mode") or "OFF").upper()
+        if mode != "AUTO_LIMITS":
+            continue
+
+        gids = _autopilot_active_group_ids(aid)
+        if not gids:
+            continue
+
+        for gid in gids:
+            eff = _autopilot_effective_config_for_group(aid, gid)
+            actions = _ap_generate_actions(aid, eff=eff) or []
+            if not actions:
+                continue
+
+            applied_msgs = []
+            for act in actions:
+                ok, _why = _ap_within_limits_for_auto(aid, act)
+                if not ok:
+                    continue
+                kind = str(act.get("kind") or "")
+
+                if kind == "budget_pct":
+                    try:
+                        pct_f = float(act.get("percent") or 0.0)
+                    except Exception:
+                        pct_f = 0.0
+                    res = apply_budget_change(str(act.get("adset_id") or ""), pct_f)
+                    if str(res.get("status") or "").lower() in {"ok", "success"}:
+                        applied_msgs.append(str(res.get("message") or "") + "\n\n" + _ap_action_text(act))
+                        append_autopilot_event(
+                            aid,
+                            {
+                                "type": "hourly_auto_apply",
+                                "group_id": str(gid),
+                                "kind": kind,
+                                "adset_id": str(act.get("adset_id") or ""),
+                                "percent": pct_f,
+                                "status": res.get("status"),
+                                "message": res.get("message"),
+                                "chat_id": str(chat_id),
+                            },
+                        )
+                    continue
+
+                if kind == "pause_ad":
+                    ad_id = str(act.get("ad_id") or "")
+                    res = pause_ad(ad_id)
+                    if str(res.get("status") or "").lower() in {"ok", "success"}:
+                        applied_msgs.append(str(res.get("message") or res.get("exception") or "") + "\n\n" + _ap_action_text(act))
+                        append_autopilot_event(
+                            aid,
+                            {
+                                "type": "hourly_auto_apply",
+                                "group_id": str(gid),
+                                "kind": kind,
+                                "adset_id": str(act.get("adset_id") or ""),
+                                "ad_id": ad_id,
+                                "status": res.get("status"),
+                                "message": res.get("message") or res.get("exception"),
+                                "chat_id": str(chat_id),
+                            },
+                        )
+                    continue
+
+                if kind == "pause_adset":
+                    res = disable_entity(str(act.get("adset_id") or ""))
+                    if str(res.get("status") or "").lower() in {"ok", "success"}:
+                        applied_msgs.append(str(res.get("message") or "") + "\n\n" + _ap_action_text(act))
+                        append_autopilot_event(
+                            aid,
+                            {
+                                "type": "hourly_auto_apply",
+                                "group_id": str(gid),
+                                "kind": kind,
+                                "adset_id": str(act.get("adset_id") or ""),
+                                "status": res.get("status"),
+                                "message": res.get("message"),
+                                "chat_id": str(chat_id),
+                            },
+                        )
+                    continue
+
+            if applied_msgs:
+                gname = eff.get("group_name") or str(gid)
+                header = f"🤖 Автопилот (группа: {gname}) — применено: {len(applied_msgs)}\n\n"
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=header + "\n\n---\n\n".join(applied_msgs),
+                    disable_notification=bool(quiet),
+                )
+
+
 def _ap_force_kb(token: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
@@ -911,6 +1016,31 @@ def _autopilot_active_group(aid: str) -> tuple[str | None, dict | None]:
     return (str(gid), grp) if isinstance(grp, dict) else (None, None)
 
 
+def _autopilot_active_group_ids(aid: str) -> list[str]:
+    ap = _autopilot_get(aid)
+    ids = ap.get("active_group_ids")
+    if not isinstance(ids, list):
+        ids = []
+    out = [str(x) for x in ids if str(x).strip()]
+
+    gid = ap.get("active_group_id")
+    if gid and str(gid).strip() and str(gid) not in set(out):
+        out.append(str(gid))
+    return out
+
+
+def _autopilot_set_active_group_ids(aid: str, ids: list[str]) -> None:
+    uniq = []
+    seen = set()
+    for x in (ids or []):
+        s = str(x).strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        uniq.append(s)
+    _autopilot_set(aid, {"active_group_ids": uniq})
+
+
 def _autopilot_effective_config(aid: str) -> dict:
     ap = _autopilot_get(aid)
     gid, grp = _autopilot_active_group(aid)
@@ -939,6 +1069,42 @@ def _autopilot_effective_config(aid: str) -> dict:
             out["lead_action_type"] = lm.get("action_type")
         elif isinstance(lm, str):
             out["lead_action_type"] = lm
+
+    if not out.get("kpi"):
+        out["kpi"] = "total"
+
+    goals = out.get("goals")
+    out["goals"] = goals if isinstance(goals, dict) else {}
+    out["lead_action_type"] = (str(out.get("lead_action_type") or "").strip() or None)
+    return out
+
+
+def _autopilot_effective_config_for_group(aid: str, gid: str) -> dict:
+    ap = _autopilot_get(aid)
+    groups = ap.get("campaign_groups") or {}
+    if not isinstance(groups, dict):
+        groups = {}
+    grp = groups.get(str(gid))
+    grp = grp if isinstance(grp, dict) else {}
+
+    out = {
+        "group_id": str(gid),
+        "group_name": grp.get("name"),
+        "campaign_ids": [str(x) for x in ((grp.get("campaign_ids") or []) or []) if x],
+        "kpi": str(grp.get("kpi") or "total"),
+        "lead_action_type": None,
+        "goals": ap.get("goals") or {},
+    }
+
+    g_goals = grp.get("goals")
+    if isinstance(g_goals, dict):
+        out["goals"] = g_goals
+
+    lm = grp.get("lead_metric")
+    if isinstance(lm, dict):
+        out["lead_action_type"] = lm.get("action_type")
+    elif isinstance(lm, str):
+        out["lead_action_type"] = lm
 
     if not out.get("kpi"):
         out["kpi"] = "total"
@@ -1000,19 +1166,20 @@ def _autopilot_groups_kb(aid: str) -> InlineKeyboardMarkup:
     if not isinstance(groups, dict):
         groups = {}
     active = str(ap.get("active_group_id") or "").strip()
+    tracked = set(_autopilot_active_group_ids(aid))
 
     rows = []
     for gid, grp in groups.items():
         name = (grp or {}).get("name") if isinstance(grp, dict) else None
         label = str(name or gid)
-        prefix = "✅ " if active and str(gid) == str(active) else ""
+        prefix = "✅ " if str(gid) in tracked else ""
         rows.append(
             [InlineKeyboardButton(prefix + label, callback_data=f"ap_group_open|{aid}|{gid}")]
         )
 
     rows.append([InlineKeyboardButton("➕ Создать группу", callback_data=f"ap_group_create|{aid}")])
-    if active:
-        rows.append([InlineKeyboardButton("🚫 Отключить группу", callback_data=f"ap_group_off|{aid}")])
+    if tracked:
+        rows.append([InlineKeyboardButton("🚫 Отключить все группы", callback_data=f"ap_group_off|{aid}")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"autopilot_acc|{aid}")])
     return InlineKeyboardMarkup(rows)
 
@@ -1067,8 +1234,16 @@ def _autopilot_group_menu_text(aid: str, gid: str) -> str:
 
 
 def _autopilot_group_kb(aid: str, gid: str) -> InlineKeyboardMarkup:
+    tracked = set(_autopilot_active_group_ids(aid))
+    is_on = str(gid) in tracked
     rows = [
-        [InlineKeyboardButton("✅ Сделать активной", callback_data=f"ap_group_select|{aid}|{gid}")],
+        [
+            InlineKeyboardButton(
+                ("✅ Следить за группой" if not is_on else "🚫 Не следить за группой"),
+                callback_data=f"ap_group_toggle|{aid}|{gid}",
+            )
+        ],
+        [InlineKeyboardButton("🟦 Открыть в Автопилоте", callback_data=f"ap_group_select|{aid}|{gid}")],
         [InlineKeyboardButton("✏️ Переименовать", callback_data=f"ap_group_rename|{aid}|{gid}")],
         [InlineKeyboardButton("📌 Кампании", callback_data=f"ap_group_campaigns|{aid}|{gid}")],
         [InlineKeyboardButton("📊 KPI группы", callback_data=f"ap_group_kpi|{aid}|{gid}")],
@@ -1269,25 +1444,25 @@ def _autopilot_kb(aid: str) -> InlineKeyboardMarkup:
     rows = [
         [
             InlineKeyboardButton(
-                ("✅ Советник" if mode == "ADVISOR" else "🧠 Советник"),
+                ("🧠 Советник ✅" if mode == "ADVISOR" else "🧠 Советник"),
                 callback_data=f"ap_mode|{aid}|ADVISOR",
             ),
         ],
         [
             InlineKeyboardButton(
-                ("✅ Полуавто" if mode == "SEMI" else "🟡 Полуавто"),
+                ("🟡 Полуавто ✅" if mode == "SEMI" else "🟡 Полуавто"),
                 callback_data=f"ap_mode|{aid}|SEMI",
             ),
         ],
         [
             InlineKeyboardButton(
-                ("✅ Авто с лимитами" if mode == "AUTO_LIMITS" else "🤖 Авто с лимитами"),
+                ("🤖 Авто с лимитами ✅" if mode == "AUTO_LIMITS" else "🤖 Авто с лимитами"),
                 callback_data=f"ap_mode|{aid}|AUTO_LIMITS",
             ),
         ],
         [
             InlineKeyboardButton(
-                ("✅ Выключен" if mode == "OFF" else "🔴 Выключить"),
+                ("🔴 Выключить ✅" if mode == "OFF" else "🔴 Выключить"),
                 callback_data=f"ap_mode|{aid}|OFF",
             ),
         ],
@@ -2839,16 +3014,39 @@ async def _on_cb_internal(
         _p, aid, gid = data.split("|", 2)
         _autopilot_set(aid, {"active_group_id": str(gid)})
         await q.answer("Активная группа выбрана")
-        text = _autopilot_dashboard_text(aid)
-        await safe_edit_message(q, text, reply_markup=_autopilot_kb(aid))
+        await safe_edit_message(
+            q,
+            _autopilot_dashboard_text(aid),
+            reply_markup=_autopilot_kb(aid),
+        )
+        return
+
+    if data.startswith("ap_group_toggle|"):
+        _p, aid, gid = data.split("|", 2)
+        cur = set(_autopilot_active_group_ids(aid))
+        if str(gid) in cur:
+            cur.remove(str(gid))
+            await q.answer("Отключил слежение за группой")
+        else:
+            cur.add(str(gid))
+            await q.answer("Включил слежение за группой")
+        _autopilot_set_active_group_ids(aid, sorted(cur))
+        await safe_edit_message(
+            q,
+            _autopilot_group_menu_text(aid, gid),
+            reply_markup=_autopilot_group_kb(aid, gid),
+        )
         return
 
     if data.startswith("ap_group_off|"):
         aid = data.split("|", 1)[1]
-        _autopilot_set(aid, {"active_group_id": None})
-        await q.answer("Группа отключена")
-        text = _autopilot_dashboard_text(aid)
-        await safe_edit_message(q, text, reply_markup=_autopilot_kb(aid))
+        _autopilot_set(aid, {"active_group_id": None, "active_group_ids": []})
+        await q.answer("Группы отключены")
+        await safe_edit_message(
+            q,
+            _autopilot_dashboard_text(aid),
+            reply_markup=_autopilot_kb(aid),
+        )
         return
 
     if data.startswith("ap_group_delete|"):
@@ -7367,6 +7565,12 @@ def build_app() -> Application:
     )
 
     schedule_cpa_alerts(app)
+
+    app.job_queue.run_repeating(
+        _autopilot_hourly_job,
+        interval=timedelta(hours=1),
+        first=timedelta(minutes=10),
+    )
 
     init_billing_watch(
         app,
