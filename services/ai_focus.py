@@ -322,6 +322,8 @@ async def ask_deepseek(
     payload: Dict[str, Any] = {
         "model": DEEPSEEK_MODEL_JSON if json_mode else DEEPSEEK_MODEL_FAST,
         "messages": msg_out,
+        "temperature": 0.2 if json_mode else 0.4,
+        "max_tokens": 800 if json_mode else 512,
     }
 
     if json_mode:
