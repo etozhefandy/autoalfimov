@@ -411,16 +411,44 @@ def _ap_find_worst_ad_in_hour(stats: dict, *, aid: str, adset_id: str, now: date
         b = day.get(str(hour_key)) or {}
         if not isinstance(b, dict) or not b:
             continue
-        if str((b or {}).get("adset_id") or "") not in ("", str(adset_id)):
+        if str((b or {}).get("adset_id") or "") != str(adset_id):
             continue
 
         spend = float((b or {}).get("spend", 0.0) or 0.0)
         total = int((b or {}).get("total", 0) or 0)
-        cpl = (spend / float(total)) if total > 0 and spend > 0 else None
-        key = (cpl if cpl is not None else -1.0, spend)
+        if total <= 0 or spend <= 0:
+            continue
+        if total < 2 and spend < 3.0:
+            continue
+
+        cpl_today = spend / float(total)
+        agg_7d = _ap_hourly_agg(
+            stats,
+            section="_ad",
+            aid=aid,
+            entity_id=str(ad_id),
+            now=now,
+            hour_key=str(hour_key),
+            days=7,
+        )
+        cpl_7d = agg_7d.get("cpl")
+
+        if isinstance(cpl_7d, (int, float)) and float(cpl_7d) > 0:
+            ratio = float(cpl_today) / float(cpl_7d)
+            key = (ratio, cpl_today, spend)
+        else:
+            ratio = None
+            key = (0.0, cpl_today, spend)
 
         if worst is None or key > worst_key:
-            worst = {"ad_id": str(ad_id), "spend": spend, "total": total, "cpl": cpl}
+            worst = {
+                "ad_id": str(ad_id),
+                "spend": spend,
+                "total": total,
+                "cpl_today": cpl_today,
+                "cpl_7d": cpl_7d,
+                "ratio": ratio,
+            }
             worst_key = key
 
     return worst or {}
@@ -832,10 +860,14 @@ async def _autopilot_heatmap_job(context: ContextTypes.DEFAULT_TYPE):
             if wa.get("ad_id"):
                 wa_sp = float(wa.get("spend", 0.0) or 0.0)
                 wa_t = int(wa.get("total", 0) or 0)
-                wa_cpl = wa.get("cpl")
-                wa_cpl_s = f"{float(wa_cpl):.2f}$" if isinstance(wa_cpl, (int, float)) else "—"
+                wa_ct = wa.get("cpl_today")
+                wa_c7 = wa.get("cpl_7d")
+                wa_r = wa.get("ratio")
+                wa_ct_s = f"{float(wa_ct):.2f}$" if isinstance(wa_ct, (int, float)) else "—"
+                wa_c7_s = f"{float(wa_c7):.2f}$" if isinstance(wa_c7, (int, float)) else "—"
+                wa_r_s = f"{float(wa_r):.2f}×" if isinstance(wa_r, (int, float)) else "—"
                 lines.append(
-                    f"  ad перегрев: {wa['ad_id']} — {wa_t} conv, {wa_sp:.2f}$, CPL {wa_cpl_s}"
+                    f"  ad перегрев: {wa['ad_id']} — {wa_t} conv, {wa_sp:.2f}$, CPL {wa_ct_s} vs 7d(hour) {wa_c7_s} ({wa_r_s})"
                 )
         if len(applied) > 25:
             lines.append(f"… ещё {len(applied) - 25} adset")
