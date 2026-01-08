@@ -19,6 +19,9 @@ from .constants import (
     ALMATY_TZ,
 )
 
+
+AUTOPILOT_CONFIG_FILE = os.path.join(DATA_DIR, "autopilot_config.json")
+
 # ====== низкоуровневые операции с файлами ======
 
 
@@ -35,6 +38,22 @@ def _atomic_write_json(path: str, obj: dict):
     except Exception:
         pass
     os.replace(tmp, path)
+
+
+def get_autopilot_chat_id() -> str | None:
+    try:
+        with open(AUTOPILOT_CONFIG_FILE, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except Exception:
+        return None
+    cid = (cfg or {}).get("chat_id")
+    cid = str(cid) if cid not in (None, "") else ""
+    return cid or None
+
+
+def set_autopilot_chat_id(chat_id: str) -> None:
+    cid = str(chat_id or "").strip()
+    _atomic_write_json(AUTOPILOT_CONFIG_FILE, {"chat_id": cid})
 
 
 def _ensure_accounts_file():

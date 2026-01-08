@@ -29,6 +29,7 @@ def _get_env(*names: str, default: str = "") -> str:
 # ======== Telegram =========
 TELEGRAM_TOKEN = _get_env("TG_BOT_TOKEN", "TELEGRAM_BOT_TOKEN", "TELEGRAM_TOKEN")
 DEFAULT_REPORT_CHAT = os.getenv("TG_CHAT_ID", "-1002679045097")  # строка
+AUTOPILOT_CHAT_ID = os.getenv("AUTOPILOT_CHAT_ID", "")  # строка
 
 if not TELEGRAM_TOKEN or ":" not in TELEGRAM_TOKEN:
     raise RuntimeError(

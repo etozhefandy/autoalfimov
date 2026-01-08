@@ -9,8 +9,8 @@ import logging
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes, Application
 
-from .constants import ALMATY_TZ, DEFAULT_REPORT_CHAT, ALLOWED_USER_IDS
-from .storage import load_accounts, get_account_name
+from .constants import ALMATY_TZ, DEFAULT_REPORT_CHAT, AUTOPILOT_CHAT_ID, ALLOWED_USER_IDS
+from .storage import load_accounts, get_account_name, get_autopilot_chat_id
 from .reporting import send_period_report, get_cached_report, build_account_report
 from .cpa_monitoring import (
     build_monitor_snapshot,
@@ -48,6 +48,7 @@ try:  # pragma: no cover
     )
     from services.ai_focus import ask_deepseek
     from services.facebook_api import fetch_adsets
+    from services.facebook_api import is_rate_limited_now, rate_limit_retry_after_seconds, get_last_api_error_info
 except Exception:  # noqa: BLE001
     fetch_insights = None  # type: ignore[assignment]
 
@@ -61,7 +62,16 @@ except Exception:  # noqa: BLE001
         return {}
 
     def parse_insight(_ins: dict, **_kwargs) -> dict:  # type: ignore[override]
-        return {"msgs": 0, "leads": 0, "total": 0, "spend": 0.0}
+        return {"msgs": 0, "leads": 0, "total": 0, "spend": 0.0, "cpa": None}
+
+    def is_rate_limited_now() -> bool:  # type: ignore[override]
+        return False
+
+    def rate_limit_retry_after_seconds() -> int:  # type: ignore[override]
+        return 0
+
+    def get_last_api_error_info() -> dict:  # type: ignore[override]
+        return {}
 
     def analyze_account(_aid: str, days: int = 7, period=None):  # type: ignore[override]
         return {"aid": _aid, "metrics": None}
@@ -87,6 +97,15 @@ except Exception:  # noqa: BLE001
 
     def fetch_adsets(_aid: str):  # type: ignore[override]
         return []
+
+
+def _autopilot_report_chat_id() -> str:
+    cid = get_autopilot_chat_id()
+    if cid:
+        return str(cid)
+    if str(AUTOPILOT_CHAT_ID or "").strip():
+        return str(AUTOPILOT_CHAT_ID).strip()
+    return str(DEFAULT_REPORT_CHAT)
 
 
 try:  # pragma: no cover
@@ -635,13 +654,76 @@ def _ap_heatmap_profile(summary: dict) -> tuple[list[int], list[int]]:
 
 
 async def _autopilot_heatmap_job(context: ContextTypes.DEFAULT_TYPE):
-    chat_id = str(DEFAULT_REPORT_CHAT)
+    chat_id = _autopilot_report_chat_id()
     now = datetime.now(ALMATY_TZ)
     hour = int(now.strftime("%H"))
+
+    # При rate limit не добиваем FB API и не применяем изменения — только пишем статус.
+    if is_rate_limited_now():
+        after_s = rate_limit_retry_after_seconds()
+        mins = max(1, int(round(float(after_s) / 60.0)))
+        stats_cache = load_hourly_stats() or {}
+
+        lines = [
+            "🤖 Heatmap AUTO_LIMITS — почасовой прогон",
+            "⚠️ FB лимит запросов (code 17). Данных из API нет.",
+            f"Повторю через ~{mins} мин.",
+            "",
+        ]
+
+        accounts = load_accounts() or {}
+        shown_any = False
+        for aid, row in accounts.items():
+            ap = (row or {}).get("autopilot") or {}
+            if not isinstance(ap, dict):
+                continue
+            mode = str(ap.get("mode") or "OFF").upper()
+            if mode != "AUTO_LIMITS":
+                continue
+            due, _due_meta = _ap_heatmap_due_meta(ap, now)
+            if not due:
+                continue
+
+            acc_stats = stats_cache.get(aid) or {}
+            has_cache = False
+            try:
+                has_cache = isinstance(acc_stats, dict) and any(str(k).startswith("20") for k in acc_stats.keys())
+            except Exception:
+                has_cache = False
+
+            if has_cache:
+                lines.append(f"🏢 {get_account_name(aid)}: 📌 данные из кэша (hourly_stats), обновлю позже")
+            else:
+                lines.append(f"🏢 {get_account_name(aid)}: heatmap недоступна из-за лимита API (кэша нет)")
+            shown_any = True
+
+        if not shown_any:
+            lines.append("Нет аккаунтов с включённым Heatmap AUTO_LIMITS.")
+
+        try:
+            await context.bot.send_message(chat_id, "\n".join(lines))
+        except Exception:
+            pass
+
+        try:
+            token = str(uuid.uuid4().hex[:8])
+            jitter = int(uuid.uuid4().int % 6)
+            context.job_queue.run_once(
+                _autopilot_heatmap_job,
+                when=timedelta(minutes=max(5, min(35, mins + jitter))),
+                name=f"autopilot_heatmap_retry_{token}",
+            )
+        except Exception:
+            pass
+        return
 
     accounts = load_accounts() or {}
 
     for aid, row in accounts.items():
+        # Если во время цикла словили rate limit — прекращаем, чтобы не добивать API.
+        if is_rate_limited_now():
+            break
+
         ap = (row or {}).get("autopilot") or {}
         if not isinstance(ap, dict):
             continue
@@ -716,9 +798,14 @@ async def _autopilot_heatmap_job(context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             today_ins = {}
         today_m = parse_insight(today_ins or {}, aid=aid)
+        try:
+            if int((get_last_api_error_info() or {}).get("code") or 0) == 17:
+                cache_mode = True
+        except Exception:
+            pass
         today_cpa = today_m.get("cpa")
         spend_today = float(today_m.get("spend") or 0.0)
-        conv_today = int(today_m.get("total_conversions") or 0)
+        conv_today = int(today_m.get("total") or 0)
 
         spend_min = 20.0
         if planned_daily_for_antipanic is not None and planned_daily_for_antipanic > 0:
@@ -876,6 +963,12 @@ async def _autopilot_heatmap_job(context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             good_ids = set()
             bad_ids = set()
+
+        try:
+            if int((get_last_api_error_info() or {}).get("code") or 0) == 17:
+                cache_mode = True
+        except Exception:
+            pass
 
         stats_cache = load_hourly_stats() or {}
         hour_key = f"{hour:02d}"

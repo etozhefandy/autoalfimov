@@ -349,24 +349,54 @@ def analyze_adsets(
             "until": until.strftime("%Y-%m-%d"),
         }
 
-    for adset in adsets:
-        adset_id = adset["id"]
+    from services.facebook_api import fetch_insights_bulk
 
-        # инсайты по адсету
-        # NB: insights по adset делаются через account.get_insights(level='adset')
-        ins = fetch_insights_by_level(aid, adset_id, period, level="adset")
+    adset_map = {str(a.get("id") or ""): a for a in (adsets or []) if a and a.get("id")}
 
-        parsed = parse_insight(ins or {}, aid=aid, lead_action_type=lead_action_type)
-        # Пропускаем адсеты с нулевым spend, чтобы не засорять отчёты
+    rows = fetch_insights_bulk(
+        aid,
+        period=period,
+        level="adset",
+        fields=[
+            "impressions",
+            "clicks",
+            "spend",
+            "actions",
+            "cost_per_action_type",
+            "cpm",
+            "cpc",
+            "frequency",
+            "adset_id",
+            "campaign_id",
+        ],
+    )
+
+    try:
+        if rows and len(rows) > 150:
+            rows = sorted(
+                rows,
+                key=lambda x: float((x or {}).get("spend", 0.0) or 0.0),
+                reverse=True,
+            )[:150]
+    except Exception:
+        pass
+
+    for rr in (rows or []):
+        adset_id = str((rr or {}).get("adset_id") or "")
+        if not adset_id:
+            continue
+
+        meta = adset_map.get(adset_id) or {}
+        parsed = parse_insight(rr or {}, aid=aid, lead_action_type=lead_action_type)
         if (parsed.get("spend") or 0.0) <= 0:
             continue
-        parsed["adset_id"] = adset_id
-        parsed["name"] = adset["name"]
-        parsed["campaign_id"] = adset.get("campaign_id")
-        parsed["daily_budget"] = adset["daily_budget"]
-        parsed["status"] = adset.get("status")
-        parsed["effective_status"] = adset.get("effective_status")
 
+        parsed["adset_id"] = adset_id
+        parsed["name"] = meta.get("name") or (rr or {}).get("adset_name") or "<без названия>"
+        parsed["campaign_id"] = meta.get("campaign_id") or (rr or {}).get("campaign_id")
+        parsed["daily_budget"] = meta.get("daily_budget")
+        parsed["status"] = meta.get("status")
+        parsed["effective_status"] = meta.get("effective_status")
         results.append(parsed)
 
     # сортируем: лучший CPA → хуже
@@ -400,21 +430,50 @@ def analyze_campaigns(
             "until": until.strftime("%Y-%m-%d"),
         }
 
-    for camp in camps:
-        cid = camp.get("id")
+    from services.facebook_api import fetch_insights_bulk
+
+    camp_map = {str(c.get("id") or ""): c for c in (camps or []) if c and c.get("id")}
+    rows = fetch_insights_bulk(
+        aid,
+        period=period,
+        level="campaign",
+        fields=[
+            "impressions",
+            "clicks",
+            "spend",
+            "actions",
+            "cost_per_action_type",
+            "cpm",
+            "cpc",
+            "frequency",
+            "campaign_id",
+        ],
+    )
+
+    try:
+        if rows and len(rows) > 200:
+            rows = sorted(
+                rows,
+                key=lambda x: float((x or {}).get("spend", 0.0) or 0.0),
+                reverse=True,
+            )[:200]
+    except Exception:
+        pass
+
+    for rr in (rows or []):
+        cid = str((rr or {}).get("campaign_id") or "")
         if not cid:
             continue
 
-        ins = fetch_insights_by_level(aid, cid, period, level="campaign")
-        parsed = parse_insight(ins or {}, aid=aid, lead_action_type=lead_action_type)
-        # Пропускаем кампании с нулевым spend
+        meta = camp_map.get(cid) or {}
+        parsed = parse_insight(rr or {}, aid=aid, lead_action_type=lead_action_type)
         if (parsed.get("spend") or 0.0) <= 0:
             continue
-        parsed["campaign_id"] = cid
-        parsed["name"] = camp.get("name", "<без названия>")
-        parsed["status"] = camp.get("status")
-        parsed["effective_status"] = camp.get("effective_status")
 
+        parsed["campaign_id"] = cid
+        parsed["name"] = meta.get("name") or "<без названия>"
+        parsed["status"] = meta.get("status")
+        parsed["effective_status"] = meta.get("effective_status")
         results.append(parsed)
 
     # сортируем по затратам по убыванию
@@ -445,22 +504,52 @@ def analyze_ads(
             "until": until.strftime("%Y-%m-%d"),
         }
 
-    for ad in ads:
-        ad_id = ad["id"]
+    from services.facebook_api import fetch_insights_bulk
 
-        ins = fetch_insights_by_level(aid, ad_id, period, level="ad")
+    ad_map = {str(a.get("id") or ""): a for a in (ads or []) if a and a.get("id")}
+    rows = fetch_insights_bulk(
+        aid,
+        period=period,
+        level="ad",
+        fields=[
+            "impressions",
+            "clicks",
+            "spend",
+            "actions",
+            "cost_per_action_type",
+            "cpm",
+            "cpc",
+            "frequency",
+            "ad_id",
+            "adset_id",
+            "campaign_id",
+        ],
+    )
 
-        parsed = parse_insight(ins or {}, aid=aid, lead_action_type=lead_action_type)
+    try:
+        if rows and len(rows) > 200:
+            rows = sorted(
+                rows,
+                key=lambda x: float((x or {}).get("spend", 0.0) or 0.0),
+                reverse=True,
+            )[:200]
+    except Exception:
+        pass
+
+    for rr in (rows or []):
+        ad_id = str((rr or {}).get("ad_id") or "")
+        if not ad_id:
+            continue
+        meta = ad_map.get(ad_id) or {}
+        parsed = parse_insight(rr or {}, aid=aid, lead_action_type=lead_action_type)
         parsed["ad_id"] = ad_id
-        parsed["name"] = ad["name"]
-        parsed["status"] = ad.get("status")
-        parsed["effective_status"] = ad.get("effective_status")
-        # Дополнительно пробуем сохранить связи с адсетом и кампанией, если есть
-        parsed["adset_id"] = ad.get("adset_id")
-        parsed["campaign_id"] = ad.get("campaign_id")
-        parsed["adset_name"] = ad.get("adset", {}).get("name") if isinstance(ad.get("adset"), dict) else None
-        parsed["campaign_name"] = ad.get("campaign", {}).get("name") if isinstance(ad.get("campaign"), dict) else None
-
+        parsed["name"] = meta.get("name") or "<без названия>"
+        parsed["status"] = meta.get("status")
+        parsed["effective_status"] = meta.get("effective_status")
+        parsed["adset_id"] = meta.get("adset_id") or (rr or {}).get("adset_id")
+        parsed["campaign_id"] = meta.get("campaign_id") or (rr or {}).get("campaign_id")
+        parsed["adset_name"] = None
+        parsed["campaign_name"] = None
         results.append(parsed)
 
     # сортировка по CPA

@@ -29,6 +29,7 @@ from .constants import (
     ALMATY_TZ,
     TELEGRAM_TOKEN,
     DEFAULT_REPORT_CHAT,
+    AUTOPILOT_CHAT_ID,
     ALLOWED_USER_IDS,
     ALLOWED_CHAT_IDS,
     usd_to_kzt,
@@ -47,6 +48,8 @@ from .storage import (
     get_lead_metric_for_account,
     set_lead_metric_for_account,
     clear_lead_metric_for_account,
+    get_autopilot_chat_id,
+    set_autopilot_chat_id,
 )
 from .reporting import (
     fmt_int,
@@ -69,7 +72,16 @@ from .billing import send_billing, send_billing_forecast, billing_digest_job
 from .jobs import full_daily_scan_job, daily_report_job, schedule_cpa_alerts, _resolve_account_cpa
 
 from services.analytics import analyze_campaigns, analyze_adsets, analyze_account, analyze_ads
-from services.facebook_api import pause_ad, fetch_adsets, fetch_ads, fetch_insights, fetch_campaigns, get_last_api_error
+from services.facebook_api import (
+    pause_ad,
+    fetch_adsets,
+    fetch_ads,
+    fetch_insights,
+    fetch_campaigns,
+    get_last_api_error_info,
+    is_rate_limited_now,
+    rate_limit_retry_after_seconds,
+)
 from services.ai_focus import get_focus_comment, ask_deepseek, sanitize_ai_text
 from fb_report.cpa_monitoring import build_anomaly_messages_for_account
 import json
@@ -86,6 +98,22 @@ def _allowed(update: Update) -> bool:
     if user_id and user_id in ALLOWED_USER_IDS:
         return True
     return False
+
+
+def _autopilot_report_chat_id() -> str:
+    cid = get_autopilot_chat_id()
+    if cid:
+        return str(cid)
+    if str(AUTOPILOT_CHAT_ID or "").strip():
+        return str(AUTOPILOT_CHAT_ID).strip()
+    return str(DEFAULT_REPORT_CHAT)
+
+
+def _autopilot_menu_kb() -> InlineKeyboardMarkup:
+    kb = accounts_kb("autopilot_acc")
+    rows = list(kb.inline_keyboard)
+    rows.insert(0, [InlineKeyboardButton("📌 Сделать этот чат автопилотом", callback_data="ap_set_chat")])
+    return InlineKeyboardMarkup(rows)
 
 
 async def safe_edit_message(q, text: str, **kwargs):
@@ -660,12 +688,37 @@ def _ap_within_limits_for_auto(aid: str, act: dict) -> tuple[bool, str]:
 
 
 async def _autopilot_hourly_job(context: ContextTypes.DEFAULT_TYPE):
-    chat_id = str(DEFAULT_REPORT_CHAT)
+    chat_id = _autopilot_report_chat_id()
     now = datetime.now(ALMATY_TZ)
     hour = int(now.strftime("%H"))
     quiet = (hour >= 22) or (hour < 10)
 
+    if is_rate_limited_now():
+        after_s = rate_limit_retry_after_seconds()
+        mins = max(1, int(round(float(after_s) / 60.0)))
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "🤖 Автопилот — почасовой прогон\n"
+                "⚠️ FB лимит запросов (code 17). Данных нет.\n"
+                f"Повторю через ~{mins} мин."
+            ),
+            disable_notification=bool(quiet),
+        )
+        try:
+            token = uuid.uuid4().hex[:8]
+            jitter = int(uuid.uuid4().int % 6)
+            context.job_queue.run_once(
+                _autopilot_hourly_job,
+                when=timedelta(minutes=max(5, min(35, mins + jitter))),
+                name=f"autopilot_hourly_retry_{token}",
+            )
+        except Exception:
+            pass
+        return
+
     store = load_accounts() or {}
+    hit_rate_limit = False
     for aid, row in store.items():
         if not (row or {}).get("enabled", True):
             continue
@@ -686,6 +739,11 @@ async def _autopilot_hourly_job(context: ContextTypes.DEFAULT_TYPE):
                 actions = _ap_generate_actions(aid, eff=eff) or []
             except Exception:
                 actions = []
+
+            err_info = get_last_api_error_info() or {}
+            if int(err_info.get("code") or 0) == 17:
+                hit_rate_limit = True
+                break
             if not actions:
                 continue
 
@@ -766,18 +824,69 @@ async def _autopilot_hourly_job(context: ContextTypes.DEFAULT_TYPE):
                     disable_notification=bool(quiet),
                 )
 
+        if hit_rate_limit:
+            break
+
+    if hit_rate_limit:
+        after_s = rate_limit_retry_after_seconds()
+        mins = max(1, int(round(float(after_s) / 60.0)))
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "🤖 Автопилот — почасовой прогон\n"
+                "⚠️ FB лимит запросов (code 17). Остановил прогон, чтобы не добивать API.\n"
+                f"Повторю через ~{mins} мин."
+            ),
+            disable_notification=bool(quiet),
+        )
+        try:
+            token = uuid.uuid4().hex[:8]
+            jitter = int(uuid.uuid4().int % 6)
+            context.job_queue.run_once(
+                _autopilot_hourly_job,
+                when=timedelta(minutes=max(5, min(35, mins + jitter))),
+                name=f"autopilot_hourly_retry_{token}",
+            )
+        except Exception:
+            pass
+
 
 async def _autopilot_warmup_job(context: ContextTypes.DEFAULT_TYPE):
-    chat_id = str(DEFAULT_REPORT_CHAT)
+    chat_id = _autopilot_report_chat_id()
     now = datetime.now(ALMATY_TZ)
     hour = int(now.strftime("%H"))
     quiet = (hour >= 22) or (hour < 10)
+
+    if is_rate_limited_now():
+        after_s = rate_limit_retry_after_seconds()
+        mins = max(1, int(round(float(after_s) / 60.0)))
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "🤖 Автопилот — первичный прогон после старта\n"
+                "⚠️ FB лимит запросов (code 17). Данных нет.\n"
+                f"Повторю через ~{mins} мин."
+            ),
+            disable_notification=bool(quiet),
+        )
+        try:
+            token = uuid.uuid4().hex[:8]
+            jitter = int(uuid.uuid4().int % 6)
+            context.job_queue.run_once(
+                _autopilot_warmup_job,
+                when=timedelta(minutes=max(5, min(35, mins + jitter))),
+                name=f"autopilot_warmup_retry_{token}",
+            )
+        except Exception:
+            pass
+        return
 
     store = load_accounts() or {}
     any_lines = []
     diag_lines = []
     total_groups = 0
     total_actions = 0
+    hit_rate_limit = False
 
     for aid, row in store.items():
         if not (row or {}).get("enabled", True):
@@ -802,29 +911,16 @@ async def _autopilot_warmup_job(context: ContextTypes.DEFAULT_TYPE):
             eff = _autopilot_effective_config_for_group(aid, gid)
             gname = eff.get("group_name") or str(gid)
 
-            before_err = (get_last_api_error() or {}).get("error")
-
             try:
                 actions = _ap_generate_actions(aid, eff=eff) or []
             except Exception:
                 actions = []
 
-            after_err = (get_last_api_error() or {}).get("error")
-            new_err = after_err if after_err and after_err != before_err else None
-            if new_err:
-                low = str(new_err).lower()
-                if (
-                    "request limit" in low
-                    or "too many calls" in low
-                    or "user request limit reached" in low
-                    or "code\": 17" in low
-                    or " code 17" in low
-                ):
-                    diag_lines.append(f"⚠️ FB API лимит запросов: {new_err}")
-                elif "oauth" in low or "access" in low or "token" in low:
-                    diag_lines.append(f"⚠️ FB API ошибка авторизации: {new_err}")
-                else:
-                    diag_lines.append(f"⚠️ FB API ошибка: {new_err}")
+            err_info = get_last_api_error_info() or {}
+            code = int(err_info.get("code") or 0)
+            if code == 17:
+                hit_rate_limit = True
+                break
 
             shown = []
             for act in (actions or [])[:5]:
@@ -832,20 +928,30 @@ async def _autopilot_warmup_job(context: ContextTypes.DEFAULT_TYPE):
             total_actions += len(actions or [])
 
             if shown:
-                any_lines.append(f"\n🤖 Группа: {gname} — идеи: {len(actions)}")
+                goals = eff.get("goals") or {}
+                baseline = bool(isinstance(goals, dict) and (goals.get("target_cpl") in (None, "")))
+                suffix = " (база 3 дня)" if baseline else ""
+                any_lines.append(f"\n🤖 Группа: {gname} — идеи: {len(actions)}{suffix}")
                 any_lines.append("\n\n---\n\n".join(shown))
             else:
                 goals = eff.get("goals") or {}
                 if isinstance(goals, dict) and (goals.get("target_cpl") in (None, "")):
-                    any_lines.append(f"\n🤖 Группа: {gname} — действий нет (цель CPL не задана)")
+                    any_lines.append(f"\n🤖 Группа: {gname} — действий нет (цель CPL не задана → работаю от базы 3 дня)")
                 else:
                     any_lines.append(f"\n🤖 Группа: {gname} — действий нет")
 
-    header = (
-        "🤖 Автопилот — первичный прогон после старта\n"
-        "Это не часовой срез. Ничего не применяю, только подсказываю идеи.\n"
-        f"Активных групп: {total_groups} | Рекомендаций: {total_actions}\n"
-    )
+        if hit_rate_limit:
+            break
+
+    header = "🤖 Автопилот — первичный прогон после старта\n"
+    status_line = "✅ Данные: OK"
+    if hit_rate_limit:
+        after_s = rate_limit_retry_after_seconds()
+        mins = max(1, int(round(float(after_s) / 60.0)))
+        status_line = f"⚠️ Данные: FB лимит запросов (code 17). Повторю через ~{mins} мин."
+    header = header + status_line + "\n"
+    header = header + "Это не часовой срез. Ничего не применяю, только подсказываю идеи.\n"
+    header = header + f"Активных групп: {total_groups} | Рекомендаций: {total_actions}\n"
 
     if diag_lines:
         diag = "\n" + "\n".join(diag_lines[:3])
@@ -864,12 +970,13 @@ async def _autopilot_warmup_job(context: ContextTypes.DEFAULT_TYPE):
         disable_notification=bool(quiet),
     )
 
-    if diag_lines and any(("лимит" in str(x).lower() or "request limit" in str(x).lower()) for x in diag_lines):
+    if hit_rate_limit:
         try:
             token = uuid.uuid4().hex[:8]
+            jitter = int(uuid.uuid4().int % 6)
             context.job_queue.run_once(
                 _autopilot_warmup_job,
-                when=timedelta(minutes=25),
+                when=timedelta(minutes=25 + jitter),
                 name=f"autopilot_warmup_retry_{token}",
             )
         except Exception:
@@ -2969,7 +3076,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _allowed(update):
         return
     txt = (
-        "Команды:\n"
+        "🤖 Команды:\n"
         "/start — главное меню\n"
         "/help — список всех команд\n"
         "/billing — биллинги и прогнозы\n"
@@ -2984,7 +3091,17 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Безопасное отключение дорогих адсетов\n"
         "• Подготовка к ИИ-управлению (Пилат)\n"
     )
-    await update.message.reply_text(txt, reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text(txt)
+
+
+async def cmd_ap_here(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _allowed(update):
+        return
+    chat_id = str(update.effective_chat.id) if update.effective_chat else ""
+    if not chat_id:
+        return
+    set_autopilot_chat_id(chat_id)
+    await update.message.reply_text("✅ Этот чат установлен как чат Автопилота")
 
 
 async def cmd_billing(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3094,8 +3211,21 @@ async def _on_cb_internal(
     if data == "autopilot_menu":
         await safe_edit_message(
             q,
-            "Выберите кабинет для Автопилата:",
-            reply_markup=accounts_kb("autopilot_acc"),
+            "Выберите кабинет для Автопилота:",
+            reply_markup=_autopilot_menu_kb(),
+        )
+        return
+
+    if data == "ap_set_chat":
+        try:
+            set_autopilot_chat_id(chat_id)
+        except Exception:
+            pass
+        await q.answer("Чат Автопилота обновлён")
+        await safe_edit_message(
+            q,
+            "✅ Этот чат установлен как чат Автопилота\n\nВыберите кабинет для Автопилота:",
+            reply_markup=_autopilot_menu_kb(),
         )
         return
 
@@ -3774,7 +3904,7 @@ async def _on_cb_internal(
                         )
                         await context.bot.send_message(
                             chat_id,
-                            "🤖 Авто с лимитами: применено автоматически\n\n" + str(res.get("message") or "") + "\n\n" + _ap_action_text(act),
+                            "🤖 Авто с лимитами: применено автоматически\n\n" + (res.get("message") or "") + "\n\n" + _ap_action_text(act),
                         )
                         auto_applied += 1
                         continue
@@ -3805,447 +3935,6 @@ async def _on_cb_internal(
             + (f"Автоприменено: {auto_applied}\n" if auto_applied else "")
             + "Каждое действие отдельным сообщением ниже.",
             reply_markup=_autopilot_analysis_kb(aid),
-        )
-        return
-
-    if data.startswith("apdo|"):
-        parts = data.split("|", 2)
-        if len(parts) < 3:
-            await q.answer("Некорректная кнопка.", show_alert=True)
-            return
-        _p, op, token = parts
-        orig_op = op
-
-        pending = context.bot_data.get("ap_pending_actions") or {}
-        act = pending.get(token)
-        if not act:
-            await q.answer("Действие устарело. Сгенерируй заново.", show_alert=True)
-            return
-
-        aid = str(act.get("aid") or "")
-        kind = str(act.get("kind") or "")
-
-        if op == "force":
-            ap = _autopilot_get(aid)
-            mode = str(ap.get("mode") or "OFF").upper()
-            if mode != "AUTO_LIMITS":
-                await q.answer("Force подтверждение доступно только в режиме 'Авто с лимитами'.", show_alert=True)
-                return
-
-            op = "apply"
-
-        allow_apply = bool(act.get("allow_apply"))
-        if not allow_apply and op in {"apply", "edit"}:
-            await q.answer("Режим Советник: применение отключено.", show_alert=True)
-            return
-
-        if op == "cancel":
-            append_autopilot_event(
-                aid,
-                {"type": "action_cancel", "token": token, "kind": kind, "chat_id": str(chat_id)},
-            )
-            pending.pop(token, None)
-            await safe_edit_message(q, "❌ Отменено\n\n" + _ap_action_text(act))
-            return
-
-        if op == "ack":
-            append_autopilot_event(
-                aid,
-                {"type": "action_ack", "token": token, "kind": kind, "chat_id": str(chat_id)},
-            )
-            pending.pop(token, None)
-            await safe_edit_message(q, "✅ Ок\n\n" + _ap_action_text(act))
-            return
-
-        if op == "edit":
-            if kind != "budget_pct":
-                await q.answer("Для этого действия редактирование не поддерживается.", show_alert=True)
-                return
-
-            context.user_data["await_ap_action_edit"] = {
-                "token": token,
-                "chat_id": str(chat_id),
-                "message_id": int(getattr(q.message, "message_id", 0) or 0),
-            }
-            await safe_edit_message(
-                q,
-                _ap_action_text(act)
-                + "\n\n✍️ Введите новый процент изменения бюджета (например -10 или 15):",
-            )
-            return
-
-        if op == "apply":
-            adset_id = str(act.get("adset_id") or "")
-            if not adset_id:
-                await q.answer("Нет adset_id.", show_alert=True)
-                return
-
-            ap = _autopilot_get(aid)
-            mode = str(ap.get("mode") or "OFF").upper()
-            if mode == "ADVISOR":
-                await q.answer("Режим Советник: применение отключено.", show_alert=True)
-                return
-
-            if kind == "budget_pct":
-                pct = act.get("percent")
-                try:
-                    pct_f = float(pct)
-                except Exception:
-                    pct_f = 0.0
-
-                if mode == "AUTO_LIMITS":
-                    ok, why = _ap_within_limits_for_auto(aid, act)
-                    if not ok and orig_op != "force":
-                        append_autopilot_event(
-                            aid,
-                            {"type": "action_over_limit", "token": token, "kind": kind, "why": why, "chat_id": str(chat_id)},
-                        )
-                        await safe_edit_message(
-                            q,
-                            _ap_action_text(act) + f"\n\n⚠️ Выходит за лимиты режима 'Авто с лимитами': {why}\nПодтвердить сверх лимитов?",
-                            reply_markup=_ap_force_kb(token),
-                        )
-                        return
-
-                res = apply_budget_change(adset_id, pct_f)
-                append_autopilot_event(
-                    aid,
-                    {
-                        "type": "action_apply",
-                        "token": token,
-                        "kind": kind,
-                        "adset_id": adset_id,
-                        "percent": pct_f,
-                        "status": res.get("status"),
-                        "message": res.get("message"),
-                        "chat_id": str(chat_id),
-                    },
-                )
-                pending.pop(token, None)
-                await safe_edit_message(q, "✅ Применено\n\n" + (res.get("message") or "") + "\n\n" + _ap_action_text(act))
-                return
-
-            if kind == "pause_ad":
-                ad_id = str(act.get("ad_id") or "")
-                if not ad_id:
-                    await q.answer("Нет ad_id.", show_alert=True)
-                    return
-
-                try:
-                    active_cnt = _count_active_ads_in_adset(aid, adset_id)
-                except Exception:
-                    active_cnt = 0
-
-                if active_cnt <= 1:
-                    await safe_edit_message(
-                        q,
-                        "❌ Нельзя отключить объявление — оно единственное активное в adset.\n\n" + _ap_action_text(act),
-                    )
-                    return
-
-                res = pause_ad(ad_id)
-                append_autopilot_event(
-                    aid,
-                    {
-                        "type": "action_apply",
-                        "token": token,
-                        "kind": kind,
-                        "adset_id": adset_id,
-                        "ad_id": ad_id,
-                        "status": res.get("status"),
-                        "message": res.get("message") or res.get("exception"),
-                        "chat_id": str(chat_id),
-                    },
-                )
-
-                pending.pop(token, None)
-                if res.get("status") != "ok":
-                    await safe_edit_message(
-                        q,
-                        "⚠️ Не удалось применить\n\n" + str(res.get("message") or res.get("exception") or "") + "\n\n" + _ap_action_text(act),
-                    )
-                    return
-
-                await safe_edit_message(
-                    q,
-                    "✅ Применено\n\n" + str(res.get("message") or "") + "\n\n" + _ap_action_text(act),
-                )
-                return
-
-            if kind == "pause_adset":
-                if not can_disable(aid, adset_id):
-                    await safe_edit_message(
-                        q,
-                        "❌ Нельзя остановить adset — иначе аккаунт останется без активных adset.\n\n" + _ap_action_text(act),
-                    )
-                    return
-
-                res = disable_entity(adset_id)
-                append_autopilot_event(
-                    aid,
-                    {
-                        "type": "action_apply",
-                        "token": token,
-                        "kind": kind,
-                        "adset_id": adset_id,
-                        "status": res.get("status"),
-                        "message": res.get("message"),
-                        "chat_id": str(chat_id),
-                    },
-                )
-                pending.pop(token, None)
-                await safe_edit_message(q, "✅ Применено\n\n" + (res.get("message") or "") + "\n\n" + _ap_action_text(act))
-                return
-
-            await q.answer("Неизвестный тип действия.", show_alert=True)
-            return
-
-    if data.startswith("ap_history|"):
-        aid = data.split("|", 1)[1]
-        events = read_autopilot_events(aid, limit=20) or []
-        lines = [f"🧾 История Автопилата — {get_account_name(aid)}", ""]
-        if not events:
-            lines.append("(пока пусто)")
-        else:
-            for ev in events:
-                ts = (ev or {}).get("ts")
-                t = (ev or {}).get("type")
-                if t == "mode_change":
-                    lines.append(f"{ts}: mode {ev.get('from')} → {ev.get('to')}")
-                elif t == "goal_set":
-                    lines.append(f"{ts}: goal {ev.get('key')} = {ev.get('value')}")
-                elif t == "period_set":
-                    lines.append(f"{ts}: period = {ev.get('period')}")
-                elif t == "toggle":
-                    lines.append(f"{ts}: {ev.get('key')} = {ev.get('value')}")
-                else:
-                    lines.append(f"{ts}: {t}")
-
-        await safe_edit_message(q, "\n".join(lines), reply_markup=_autopilot_kb(aid))
-        return
-
-    if data.startswith("mr_menu|"):
-        aid = data.split("|", 1)[1]
-        st = load_accounts()
-        row = st.get(aid, {})
-        mr = row.get("morning_report") or {}
-        level = str(mr.get("level", "ACCOUNT")).upper()
-
-        kb = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton(
-                        "🏦 Аккаунт",
-                        callback_data=f"mr_level|{aid}|ACCOUNT",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "📣 Кампании",
-                        callback_data=f"mr_level|{aid}|CAMPAIGN",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "🧩 Адсеты",
-                        callback_data=f"mr_level|{aid}|ADSET",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "⬅️ Назад",
-                        callback_data=f"set1|{aid}",
-                    )
-                ],
-            ]
-        )
-
-        await safe_edit_message(
-            q,
-            "Выберите уровень утреннего отчёта:",
-            reply_markup=kb,
-        )
-        return
-
-    if data.startswith("mr_level|"):
-        try:
-            _prefix, aid, lvl = data.split("|", 2)
-        except ValueError:
-            await q.answer("Некорректные данные уровня утреннего отчёта.", show_alert=True)
-            return
-
-        lvl = str(lvl).upper()
-        if lvl == "OFF":
-            await q.answer(
-                "Недоступно. Используй 'Выключить кабинет'.",
-                show_alert=True,
-            )
-            return
-
-        if lvl not in {"ACCOUNT", "CAMPAIGN", "ADSET"}:
-            await q.answer("Неизвестный уровень утреннего отчёта.", show_alert=True)
-            return
-
-        st = load_accounts()
-        row = st.get(aid, {})
-        mr = row.get("morning_report") or {}
-        mr["level"] = lvl
-        row["morning_report"] = mr
-        st[aid] = row
-        save_accounts(st)
-
-        human = {
-            "ACCOUNT": "Аккаунт",
-            "CAMPAIGN": "Кампании",
-            "ADSET": "Адсеты",
-        }.get(lvl, "Аккаунт")
-
-        await q.answer(f"Уровень утреннего отчёта: {human}")
-        await safe_edit_message(
-            q,
-            f"Настройки: {get_account_name(aid)}",
-            reply_markup=settings_kb(aid),
-        )
-        return
-
-    # ==== CPA-алёрты по объявлениям: тихий режим и выключение ====
-
-    if data.startswith("cpa_ad_silent|"):
-        # Формат: cpa_ad_silent|{aid}|{ad_id}
-        try:
-            _p, aid, ad_id = data.split("|", 2)
-        except ValueError:
-            await q.answer("Некорректные данные для тихого режима.", show_alert=True)
-            return
-
-        st = load_accounts()
-        row = st.get(aid) or {}
-        alerts = row.get("alerts") or {}
-        ad_alerts = alerts.get("ad_alerts") or {}
-        cfg = ad_alerts.get(ad_id) or {}
-
-        current = bool(cfg.get("silent", False))
-        cfg["silent"] = not current
-        ad_alerts[ad_id] = cfg
-        alerts["ad_alerts"] = ad_alerts
-        row["alerts"] = alerts
-        st[aid] = row
-        save_accounts(st)
-
-        if cfg["silent"]:
-            await q.answer("Тихий режим включён для объявления.", show_alert=False)
-        else:
-            await q.answer("Тихий режим выключен для объявления.", show_alert=False)
-        return
-
-    if data.startswith("cpa_ad_off|"):
-        # Формат: cpa_ad_off|{aid}|{ad_id}
-        try:
-            _p, aid, ad_id = data.split("|", 2)
-        except ValueError:
-            await q.answer("Некорректные данные для выключения объявления.", show_alert=True)
-            return
-
-        paused = context.application.bot_data.setdefault("cpa_ai_paused", set())
-        key = f"{aid}:{ad_id}"
-        if key in paused:
-            await q.answer("Уже отключено.", show_alert=False)
-            return
-
-        # Пытаемся определить adset_id для safety-check
-        adset_id = None
-        try:
-            ads_map = _get_ads_map(aid)
-            adset_id = (ads_map.get(str(ad_id)) or {}).get("adset_id")
-        except Exception:
-            adset_id = None
-
-        if adset_id:
-            try:
-                active_cnt = _count_active_ads_in_adset(aid, str(adset_id))
-            except Exception:
-                active_cnt = 0
-            if active_cnt <= 1:
-                await q.answer(
-                    "Нельзя отключить: единственное активное объявление в adset.",
-                    show_alert=True,
-                )
-                return
-
-        res = pause_ad(ad_id)
-        status = res.get("status")
-        msg = res.get("message") or ""
-
-        if status != "ok":
-            # При ошибке API просто сообщаем пользователю и, если есть альтернативы,
-            # даём кнопку для ручного открытия объявления в Ads Manager.
-            await q.answer(f"Ошибка при выключении: {msg}", show_alert=True)
-
-            try:
-                # Проверяем наличие альтернатив за последние 7 дней.
-                now = datetime.now(ALMATY_TZ)
-                period_7d = {
-                    "since": (now - timedelta(days=7)).strftime("%Y-%m-%d"),
-                    "until": now.strftime("%Y-%m-%d"),
-                }
-                ads_7d = analyze_ads(aid, period=period_7d) or []
-
-                # Находим adset для этого объявления и проверяем, есть ли другие объявления с spend>0.
-                adset_id = None
-                for ad in ads_7d:
-                    if ad.get("ad_id") == ad_id:
-                        adset_id = ad.get("adset_id")
-                        break
-
-                has_alternative = False
-                if adset_id:
-                    for ad in ads_7d:
-                        if ad.get("ad_id") == ad_id:
-                            continue
-                        if ad.get("adset_id") != adset_id:
-                            continue
-                        if float(ad.get("spend", 0.0) or 0.0) > 0:
-                            has_alternative = True
-                            break
-
-                if has_alternative:
-                    open_url = f"https://www.facebook.com/adsmanager/manage/ad/?ad={ad_id}"
-                    text = (
-                        "Не удалось автоматически выключить объявление через API. "
-                        "Открой его вручную в Ads Manager и отключи там:"
-                    )
-                    kb = InlineKeyboardMarkup(
-                        [
-                            [
-                                InlineKeyboardButton(
-                                    "Открыть объявление",
-                                    url=open_url,
-                                )
-                            ]
-                        ]
-                    )
-                    await context.bot.send_message(chat_id, text, reply_markup=kb)
-            except Exception:
-                # Вспомогательный блок не должен ломать основной обработчик.
-                pass
-
-            return
-
-        st = load_accounts()
-        row = st.get(aid) or {}
-        alerts = row.get("alerts") or {}
-        ad_alerts = alerts.get("ad_alerts") or {}
-        cfg = ad_alerts.get(ad_id) or {}
-        cfg["enabled"] = False
-        ad_alerts[ad_id] = cfg
-        alerts["ad_alerts"] = ad_alerts
-        row["alerts"] = alerts
-        st[aid] = row
-        save_accounts(st)
-
-        await q.answer(
-            "Объявление выключено, алёрты по нему больше не будут приходить.",
-            show_alert=False,
         )
         return
 
@@ -5870,6 +5559,7 @@ async def _on_cb_internal(
         }
         label1 = f"{since1.strftime('%d.%m')}-{until1.strftime('%d.%m')}"
         label2 = f"{since2.strftime('%d.%m')}-{until2.strftime('%d.%m')}"
+
         await safe_edit_message(q, f"Сравниваю {label1} vs {label2}…")
         txt = build_comparison_report(aid, period1, label1, period2, label2)
         await context.bot.send_message(chat_id, txt, parse_mode="HTML")
@@ -5935,6 +5625,7 @@ async def _on_cb_internal(
         _, aid, mode = data.split("|", 2)
 
         text_hm, summary = build_hourly_heatmap_for_account(aid, get_account_name, mode)
+
         await safe_edit_message(q, text_hm)
 
         try:
@@ -6014,7 +5705,9 @@ async def _on_cb_internal(
 
         chat_id = str(q.message.chat.id)
         stop_event = asyncio.Event()
-        typing_task = asyncio.create_task(_typing_loop(context.bot, chat_id, stop_event))
+        typing_task = asyncio.create_task(
+            _typing_loop(context.bot, chat_id, stop_event)
+        )
 
         focus_comment = None
         try:
@@ -6369,14 +6062,9 @@ async def _on_cb_internal(
             and r.get("id")
         }
 
-        try:
-            camps = analyze_campaigns(aid, days=7) or []
-        except Exception:
-            camps = []
-
         kb_rows = []
-        for camp in camps:
-            cid = camp.get("campaign_id")
+        for camp in fb_campaigns:
+            cid = camp.get("id")
             if not cid:
                 continue
             if str(cid) not in allowed_campaign_ids:
@@ -6410,7 +6098,11 @@ async def _on_cb_internal(
         )
 
         text = "Выбери кампанию для настройки CPA-алёртов."
-        await safe_edit_message(q, text, reply_markup=InlineKeyboardMarkup(kb_rows))
+        await safe_edit_message(
+            q,
+            text,
+            reply_markup=InlineKeyboardMarkup(kb_rows),
+        )
         return
 
     if data.startswith("cpa_campaign|"):
@@ -6481,7 +6173,11 @@ async def _on_cb_internal(
             ]
         )
 
-        await safe_edit_message(q, text, reply_markup=kb)
+        await safe_edit_message(
+            q,
+            text,
+            reply_markup=kb,
+        )
         return
 
     if data.startswith("cpa_campaign_toggle|"):
@@ -6676,7 +6372,11 @@ async def _on_cb_internal(
         )
 
         text = "Выбери адсет для настройки CPA-алёртов."
-        await safe_edit_message(q, text, reply_markup=InlineKeyboardMarkup(kb_rows))
+        await safe_edit_message(
+            q,
+            text,
+            reply_markup=InlineKeyboardMarkup(kb_rows),
+        )
         return
 
     if data.startswith("cpa_adset|"):
@@ -6743,7 +6443,11 @@ async def _on_cb_internal(
             ]
         )
 
-        await safe_edit_message(q, text, reply_markup=kb)
+        await safe_edit_message(
+            q,
+            text,
+            reply_markup=kb,
+        )
         return
 
     if data.startswith("cpa_adset_toggle|"):
@@ -6857,7 +6561,11 @@ async def _on_cb_internal(
         )
 
         text = "Выбери объявление для настройки CPA-алёртов."
-        await safe_edit_message(q, text, reply_markup=InlineKeyboardMarkup(kb_rows))
+        await safe_edit_message(
+            q,
+            text,
+            reply_markup=InlineKeyboardMarkup(kb_rows),
+        )
         return
 
     if data.startswith("cpa_ad_cfg|"):
@@ -6943,7 +6651,11 @@ async def _on_cb_internal(
             ]
         )
 
-        await safe_edit_message(q, text, reply_markup=kb)
+        await safe_edit_message(
+            q,
+            text,
+            reply_markup=kb,
+        )
         return
 
     if data.startswith("cpa_ad_cfg_toggle|"):
@@ -6991,26 +6703,6 @@ async def _on_cb_internal(
         )
 
         context.user_data["await_cpa_ad_for"] = {"aid": aid, "ad_id": ad_id}
-        return
-
-    if data.startswith("cpa_ad_cfg_inherit|"):
-        _, aid, ad_id = data.split("|", 2)
-
-        st = load_accounts()
-        row = st.get(aid, {"alerts": {}})
-        alerts = row.get("alerts", {}) or {}
-        ad_alerts = alerts.setdefault("ad_alerts", {})
-        cfg = ad_alerts.get(ad_id) or {}
-
-        cfg["target_cpa"] = 0.0
-        ad_alerts[ad_id] = cfg
-        alerts["ad_alerts"] = ad_alerts
-        row["alerts"] = alerts
-        st[aid] = row
-        save_accounts(st)
-
-        new_data = f"cpa_ad_cfg|{aid}|{ad_id}"
-        await _on_cb_internal(update, context, q, chat_id, new_data)
         return
 
     if data.startswith("cpa_adset_set|"):
@@ -7701,6 +7393,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("ap_here", cmd_ap_here))
     app.add_handler(CommandHandler("billing", cmd_billing))
     app.add_handler(CommandHandler("sync_accounts", cmd_sync))
     app.add_handler(CommandHandler("heatmap", cmd_heatmap))

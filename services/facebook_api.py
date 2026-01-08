@@ -3,11 +3,14 @@
 from typing import Any, Dict, List, Optional
 from datetime import datetime
 import json
+import time
+import random
 
 from facebook_business.api import FacebookAdsApi
 from facebook_business.adobjects.adaccount import AdAccount
 from facebook_business.adobjects.ad import Ad
 from facebook_business.adobjects.adsinsights import AdsInsights
+from facebook_business.exceptions import FacebookRequestError
 
 from config import FB_ACCESS_TOKEN
 from services.storage import load_local_insights, save_local_insights, period_key
@@ -15,10 +18,44 @@ from services.storage import load_local_insights, save_local_insights, period_ke
 
 _LAST_API_ERROR: Optional[str] = None
 _LAST_API_ERROR_AT: Optional[str] = None
+_LAST_API_ERROR_INFO: Dict[str, Any] = {}
+_RATE_LIMIT_UNTIL_TS: float = 0.0
 
 
 def get_last_api_error() -> Dict[str, Optional[str]]:
     return {"error": _LAST_API_ERROR, "at": _LAST_API_ERROR_AT}
+
+
+def get_last_api_error_info() -> Dict[str, Any]:
+    return dict(_LAST_API_ERROR_INFO or {})
+
+
+def is_rate_limited_now() -> bool:
+    return time.time() < float(_RATE_LIMIT_UNTIL_TS or 0.0)
+
+
+def rate_limit_retry_after_seconds() -> int:
+    try:
+        left = float(_RATE_LIMIT_UNTIL_TS or 0.0) - time.time()
+    except Exception:
+        left = 0.0
+    if left < 0:
+        left = 0.0
+    return int(left)
+
+
+def _mark_rate_limited_for(seconds: float) -> None:
+    global _RATE_LIMIT_UNTIL_TS
+    until = time.time() + float(seconds or 0.0)
+    if until > float(_RATE_LIMIT_UNTIL_TS or 0.0):
+        _RATE_LIMIT_UNTIL_TS = until
+
+
+def _set_last_error_info(info: Dict[str, Any]) -> None:
+    global _LAST_API_ERROR_INFO
+    if not isinstance(info, dict):
+        info = {"message": str(info)}
+    _LAST_API_ERROR_INFO = info
 
 
 # ИНИЦИАЛИЗАЦИЯ FACEBOOK API (один раз для всего проекта)
@@ -34,10 +71,30 @@ def safe_api_call(fn, *args, **kwargs):
     Универсальная безопасная упаковка любых вызовов FB SDK.
     Ловит ошибки, возвращает None в случае неудачи.
     """
+    global _LAST_API_ERROR, _LAST_API_ERROR_AT
+    if is_rate_limited_now():
+        _set_last_error_info(
+            {
+                "code": 17,
+                "message": "User request limit reached (rate limited)",
+                "kind": "rate_limit",
+            }
+        )
+        return None
     try:
         return fn(*args, **kwargs)
-    except Exception as e:
-        global _LAST_API_ERROR, _LAST_API_ERROR_AT
+    except FacebookRequestError as e:
+        code = None
+        subcode = None
+        try:
+            code = int(e.api_error_code())
+        except Exception:
+            code = None
+        try:
+            subcode = int(e.api_error_subcode())
+        except Exception:
+            subcode = None
+
         try:
             _LAST_API_ERROR = str(e)
         except Exception:
@@ -46,8 +103,92 @@ def safe_api_call(fn, *args, **kwargs):
             _LAST_API_ERROR_AT = datetime.utcnow().isoformat()
         except Exception:
             _LAST_API_ERROR_AT = None
+
+        info = {
+            "kind": "fb_request_error",
+            "code": code,
+            "subcode": subcode,
+            "message": _LAST_API_ERROR,
+        }
+        _set_last_error_info(info)
+
+        if code == 17:
+            base_min = 20
+            base_max = 30
+            jitter = random.randint(0, 5)
+            minutes = random.randint(base_min, base_max) + jitter
+            _mark_rate_limited_for(float(minutes) * 60.0)
+
         print(f"[facebook_api] Error: {e}")
         return None
+    except Exception as e:
+        try:
+            _LAST_API_ERROR = str(e)
+        except Exception:
+            _LAST_API_ERROR = "<unprintable error>"
+        try:
+            _LAST_API_ERROR_AT = datetime.utcnow().isoformat()
+        except Exception:
+            _LAST_API_ERROR_AT = None
+        _set_last_error_info({"kind": "exception", "message": _LAST_API_ERROR})
+        print(f"[facebook_api] Error: {e}")
+        return None
+
+
+def fetch_insights_bulk(
+    aid: str,
+    *,
+    period: Any,
+    level: str,
+    fields: List[str],
+    params_extra: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    try:
+        pkey = period_key(period)
+    except Exception:
+        pkey = str(period)
+    fields_key = ",".join([str(x) for x in (fields or [])])
+    cache_key = f"insights_bulk:{aid}:{str(level)}:{pkey}:{fields_key}"
+
+    ttl_s = 600.0 if (isinstance(period, str) and period == "today") else 3600.0
+    cached = _cache_get(cache_key, ttl_s=ttl_s)
+    if cached is not None:
+        return list(cached)
+
+    acc = AdAccount(aid)
+    params = _period_to_params(period)
+    params["level"] = str(level)
+    if params_extra:
+        params.update(params_extra)
+    data = safe_api_call(acc.get_insights, fields=fields, params=params)
+    if not data:
+        stale = _cache_get(cache_key, ttl_s=24 * 3600.0)
+        return list(stale) if stale is not None else []
+    out: List[Dict[str, Any]] = []
+    for row in data:
+        out.append(_normalize_insight(row))
+    _cache_set(cache_key, out)
+    return out
+
+
+_CATALOG_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def _cache_get(key: str, ttl_s: float) -> Any:
+    it = _CATALOG_CACHE.get(key) or {}
+    try:
+        ts = float(it.get("ts") or 0.0)
+    except Exception:
+        ts = 0.0
+    if not ts:
+        return None
+    if (time.time() - ts) > float(ttl_s):
+        return None
+    return it.get("value")
+
+
+def _cache_set(key: str, value: Any) -> None:
+    _CATALOG_CACHE[key] = {"ts": time.time(), "value": value}
 
 
 # ========= ВСПОМОГАТЕЛЬНЫЕ =========
@@ -154,14 +295,20 @@ def fetch_campaigns(aid: str) -> List[Dict[str, Any]]:
       ...
     ]
     """
+    cache_key = f"campaigns:{aid}"
+    cached = _cache_get(cache_key, ttl_s=1800.0)
+    if cached is not None:
+        return list(cached)
+
     acc = AdAccount(aid)
     data = safe_api_call(
         acc.get_campaigns,
-        fields=["id", "name", "status", "effective_status"]
+        fields=["id", "name", "status", "effective_status"],
     )
 
     if not data:
-        return []
+        stale = _cache_get(cache_key, ttl_s=24 * 3600.0)
+        return list(stale) if stale is not None else []
 
     out = []
     for row in data:
@@ -175,6 +322,7 @@ def fetch_campaigns(aid: str) -> List[Dict[str, Any]]:
         except Exception:
             continue
 
+    _cache_set(cache_key, out)
     return out
 
 
@@ -257,14 +405,20 @@ def fetch_adsets(aid: str) -> List[Dict[str, Any]]:
       }
     ]
     """
+    cache_key = f"adsets:{aid}"
+    cached = _cache_get(cache_key, ttl_s=1800.0)
+    if cached is not None:
+        return list(cached)
+
     acc = AdAccount(aid)
     data = safe_api_call(
         acc.get_ad_sets,
-        fields=["id", "name", "daily_budget", "status", "effective_status", "campaign_id"]
+        fields=["id", "name", "daily_budget", "status", "effective_status", "campaign_id"],
     )
 
     if not data:
-        return []
+        stale = _cache_get(cache_key, ttl_s=24 * 3600.0)
+        return list(stale) if stale is not None else []
 
     out = []
     for row in data:
@@ -280,6 +434,7 @@ def fetch_adsets(aid: str) -> List[Dict[str, Any]]:
         except Exception:
             continue
 
+    _cache_set(cache_key, out)
     return out
 
 
@@ -298,14 +453,20 @@ def fetch_ads(aid: str) -> List[Dict[str, Any]]:
       }
     ]
     """
+    cache_key = f"ads:{aid}"
+    cached = _cache_get(cache_key, ttl_s=900.0)
+    if cached is not None:
+        return list(cached)
+
     acc = AdAccount(aid)
     data = safe_api_call(
         acc.get_ads,
-        fields=["id", "name", "adset_id", "creative", "status", "effective_status"]
+        fields=["id", "name", "adset_id", "creative", "status", "effective_status"],
     )
 
     if not data:
-        return []
+        stale = _cache_get(cache_key, ttl_s=24 * 3600.0)
+        return list(stale) if stale is not None else []
 
     out = []
     for row in data:
@@ -329,4 +490,5 @@ def fetch_ads(aid: str) -> List[Dict[str, Any]]:
         except Exception:
             continue
 
+    _cache_set(cache_key, out)
     return out
