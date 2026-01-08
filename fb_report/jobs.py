@@ -5,7 +5,7 @@ import asyncio
 import re
 import json
 
-from telegram import InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes, Application
 
 from .constants import ALMATY_TZ, DEFAULT_REPORT_CHAT, ALLOWED_USER_IDS
@@ -352,6 +352,80 @@ def _ap_heatmap_force_active(ap: dict, now: datetime) -> bool:
     return now <= dt
 
 
+def _ap_hourly_bucket(stats: dict, *, section: str, aid: str, entity_id: str, date_key: str, hour_key: str) -> dict:
+    try:
+        root = (stats or {}).get(section) or {}
+        a = (root or {}).get(str(aid)) or {}
+        e = (a or {}).get(str(entity_id)) or {}
+        d = (e or {}).get(str(date_key)) or {}
+        b = (d or {}).get(str(hour_key)) or {}
+        return b if isinstance(b, dict) else {}
+    except Exception:
+        return {}
+
+
+def _ap_hourly_agg(stats: dict, *, section: str, aid: str, entity_id: str, now: datetime, hour_key: str, days: int) -> dict:
+    spend = 0.0
+    total = 0
+    msgs = 0
+    leads = 0
+    for i in range(int(days)):
+        d = (now - timedelta(days=i)).strftime("%Y-%m-%d")
+        b = _ap_hourly_bucket(stats, section=section, aid=aid, entity_id=entity_id, date_key=d, hour_key=hour_key)
+        try:
+            spend += float((b or {}).get("spend", 0.0) or 0.0)
+        except Exception:
+            pass
+        try:
+            total += int((b or {}).get("total", 0) or 0)
+        except Exception:
+            pass
+        try:
+            msgs += int((b or {}).get("messages", 0) or 0)
+        except Exception:
+            pass
+        try:
+            leads += int((b or {}).get("leads", 0) or 0)
+        except Exception:
+            pass
+
+    cpl = (spend / float(total)) if total > 0 and spend > 0 else None
+    return {"spend": spend, "total": total, "messages": msgs, "leads": leads, "cpl": cpl}
+
+
+def _ap_find_worst_ad_in_hour(stats: dict, *, aid: str, adset_id: str, now: datetime, hour_key: str) -> dict:
+    root = (stats or {}).get("_ad") or {}
+    a = (root or {}).get(str(aid)) or {}
+    if not isinstance(a, dict) or not a:
+        return {}
+
+    worst = None
+    worst_key = None
+    date_key = now.strftime("%Y-%m-%d")
+    for ad_id, ad_days in a.items():
+        if not isinstance(ad_days, dict):
+            continue
+        day = ad_days.get(date_key) or {}
+        if not isinstance(day, dict):
+            continue
+        b = day.get(str(hour_key)) or {}
+        if not isinstance(b, dict) or not b:
+            continue
+        if str((b or {}).get("adset_id") or "") not in ("", str(adset_id)):
+            continue
+
+        spend = float((b or {}).get("spend", 0.0) or 0.0)
+        total = int((b or {}).get("total", 0) or 0)
+        cpl = (spend / float(total)) if total > 0 and spend > 0 else None
+        key = (cpl if cpl is not None else -1.0, spend)
+
+        if worst is None or key > worst_key:
+            worst = {"ad_id": str(ad_id), "spend": spend, "total": total, "cpl": cpl}
+            worst_key = key
+
+    return worst or {}
+
+
 def _ap_heatmap_profile(summary: dict) -> tuple[list[int], list[int]]:
     days = (summary or {}).get("days") or []
     totals = [0 for _ in range(24)]
@@ -485,11 +559,13 @@ async def _autopilot_heatmap_job(context: ContextTypes.DEFAULT_TYPE):
 
         # Текущие бюджеты — база.
         adsets = fetch_adsets(aid) or []
+        adset_name = {}
         active = []
         for a in adsets:
             st = str((a or {}).get("effective_status") or (a or {}).get("status") or "").upper()
             if st in {"ACTIVE", "SCHEDULED"}:
                 active.append(a)
+                adset_name[str((a or {}).get("id") or "")] = str((a or {}).get("name") or "")
 
         if not active:
             continue
@@ -645,6 +721,9 @@ async def _autopilot_heatmap_job(context: ContextTypes.DEFAULT_TYPE):
                 c["new"] = max(1.0, float(c["new"]) * scale)
 
         applied = []
+        stats_cache = load_hourly_stats() or {}
+        date_key = now.strftime("%Y-%m-%d")
+        hour_key = f"{hour:02d}"
         for c in changes:
             adset_id = c["adset_id"]
             old_b = float(c["old"])
@@ -653,7 +732,50 @@ async def _autopilot_heatmap_job(context: ContextTypes.DEFAULT_TYPE):
                 continue
 
             res = set_adset_budget(adset_id, new_b)
-            applied.append({"adset_id": adset_id, "old": old_b, "new": new_b, "status": res.get("status"), "msg": res.get("message")})
+
+            hm_today = _ap_hourly_bucket(
+                stats_cache,
+                section="_adset",
+                aid=aid,
+                entity_id=adset_id,
+                date_key=date_key,
+                hour_key=hour_key,
+            )
+            today_spend = float((hm_today or {}).get("spend", 0.0) or 0.0)
+            today_total = int((hm_today or {}).get("total", 0) or 0)
+            today_cpl = (today_spend / float(today_total)) if today_total > 0 and today_spend > 0 else None
+
+            hm_7d = _ap_hourly_agg(
+                stats_cache,
+                section="_adset",
+                aid=aid,
+                entity_id=adset_id,
+                now=now,
+                hour_key=hour_key,
+                days=7,
+            )
+            worst_ad = _ap_find_worst_ad_in_hour(
+                stats_cache,
+                aid=aid,
+                adset_id=adset_id,
+                now=now,
+                hour_key=hour_key,
+            )
+
+            applied.append(
+                {
+                    "adset_id": adset_id,
+                    "adset_name": adset_name.get(str(adset_id), ""),
+                    "old": old_b,
+                    "new": new_b,
+                    "status": res.get("status"),
+                    "msg": res.get("message"),
+                    "hour": hour,
+                    "hm_today": {"spend": today_spend, "total": today_total, "cpl": today_cpl},
+                    "hm_7d": hm_7d,
+                    "worst_ad": worst_ad,
+                }
+            )
 
         if not applied:
             continue
@@ -684,7 +806,37 @@ async def _autopilot_heatmap_job(context: ContextTypes.DEFAULT_TYPE):
 
         lines = [title, mode_line, anti, reason, "", "Изменения бюджетов:"]
         for a in applied[:25]:
-            lines.append(f"- {a['adset_id']}: {a['old']:.2f} → {a['new']:.2f} $")
+            nm = str(a.get("adset_name") or "").strip()
+            head = f"- {a['adset_id']}" + (f" ({nm})" if nm else "")
+            lines.append(f"{head}: {float(a['old']):.2f} → {float(a['new']):.2f} $")
+
+            ht = a.get("hm_today") or {}
+            h7 = a.get("hm_7d") or {}
+
+            t_total = int((ht or {}).get("total", 0) or 0)
+            t_spend = float((ht or {}).get("spend", 0.0) or 0.0)
+            t_cpl = (ht or {}).get("cpl")
+            t_cpl_s = f"{float(t_cpl):.2f}$" if isinstance(t_cpl, (int, float)) else "—"
+
+            s7_total = int((h7 or {}).get("total", 0) or 0)
+            s7_spend = float((h7 or {}).get("spend", 0.0) or 0.0)
+            s7_cpl = (h7 or {}).get("cpl")
+            s7_cpl_s = f"{float(s7_cpl):.2f}$" if isinstance(s7_cpl, (int, float)) else "—"
+
+            lines.append(
+                f"  почему: hour {hour:02d}:00 — today {t_total} conv, {t_spend:.2f}$, CPL {t_cpl_s}; "
+                f"7d(hour) {s7_total} conv, {s7_spend:.2f}$, CPL {s7_cpl_s}"
+            )
+
+            wa = a.get("worst_ad") or {}
+            if wa.get("ad_id"):
+                wa_sp = float(wa.get("spend", 0.0) or 0.0)
+                wa_t = int(wa.get("total", 0) or 0)
+                wa_cpl = wa.get("cpl")
+                wa_cpl_s = f"{float(wa_cpl):.2f}$" if isinstance(wa_cpl, (int, float)) else "—"
+                lines.append(
+                    f"  ad перегрев: {wa['ad_id']} — {wa_t} conv, {wa_sp:.2f}$, CPL {wa_cpl_s}"
+                )
         if len(applied) > 25:
             lines.append(f"… ещё {len(applied) - 25} adset")
 
