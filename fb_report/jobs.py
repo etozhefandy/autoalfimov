@@ -353,7 +353,6 @@ def _ap_heatmap_force_active(ap: dict, now: datetime) -> bool:
 
 
 def _ap_heatmap_profile(summary: dict) -> tuple[list[int], list[int]]:
-    # returns (top_hours, low_hours)
     days = (summary or {}).get("days") or []
     totals = [0 for _ in range(24)]
     spends = [0.0 for _ in range(24)]
@@ -363,10 +362,14 @@ def _ap_heatmap_profile(summary: dict) -> tuple[list[int], list[int]]:
 
     for d in days:
         vals = (d or {}).get("totals_per_hour") or []
-        # spend per hour is not provided in summary; fall back to totals only
+        sp_h = (d or {}).get("spend_per_hour") or []
         for i in range(min(24, len(vals))):
             try:
                 totals[i] += int(vals[i] or 0)
+            except Exception:
+                continue
+            try:
+                spends[i] += float(sp_h[i] or 0.0) if i < len(sp_h) else 0.0
             except Exception:
                 continue
 
@@ -374,7 +377,7 @@ def _ap_heatmap_profile(summary: dict) -> tuple[list[int], list[int]]:
     for h in range(24):
         t = totals[h]
         sp = spends[h]
-        if sp > 0 and t > 0:
+        if t >= 2 and sp > 0:
             score = float(t) / float(sp)
         else:
             score = float(t)
@@ -1343,6 +1346,7 @@ async def _hourly_snapshot_job(context: ContextTypes.DEFAULT_TYPE):
     now = datetime.now(ALMATY_TZ)
     date_str = now.strftime("%Y-%m-%d")
     hour_str = now.strftime("%H")
+    hour_int = int(now.strftime("%H"))
 
     accounts = load_accounts() or {}
     stats = load_hourly_stats() or {}
@@ -1416,7 +1420,7 @@ async def _hourly_snapshot_job(context: ContextTypes.DEFAULT_TYPE):
                 return data or []
 
             adset_rows = _fetch_level_rows("adset")
-            ad_rows = _fetch_level_rows("ad")
+            ad_rows = _fetch_level_rows("ad") if (hour_int % 3 == 0) else []
 
             acc_adset_section.setdefault(aid, {})
             acc_ad_section.setdefault(aid, {})

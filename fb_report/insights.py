@@ -314,6 +314,7 @@ def build_hourly_heatmap_for_account(
             day_stats = {}
 
         row_totals: List[int] = []
+        row_spends: List[float] = []
         day_total = 0
         day_spend = 0.0
 
@@ -322,6 +323,7 @@ def build_hourly_heatmap_for_account(
             val = int(bucket.get("total", 0) or 0)
             sp = float(bucket.get("spend", 0.0) or 0.0)
             row_totals.append(val)
+            row_spends.append(sp)
             day_total += val
             day_spend += sp
             if val > max_convs:
@@ -335,6 +337,7 @@ def build_hourly_heatmap_for_account(
                 "date": day,
                 "date_key": day_key,
                 "totals_per_hour": row_totals,
+                "spend_per_hour": row_spends,
                 "total_conversions": day_total,
                 "spend": day_spend,
             }
@@ -415,6 +418,7 @@ def build_hourly_heatmap_for_account(
             {
                 "date": row["date_key"],
                 "totals_per_hour": row["totals_per_hour"],
+                "spend_per_hour": row.get("spend_per_hour") or [],
                 "total_conversions": row["total_conversions"],
                 "spend": row["spend"],
             }
