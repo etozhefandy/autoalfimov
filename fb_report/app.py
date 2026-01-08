@@ -1094,48 +1094,36 @@ def _autopilot_group_kpi_kb(aid: str, gid: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def _autopilot_group_campaigns_kb(aid: str, gid: str) -> InlineKeyboardMarkup:
-    grp = _autopilot_group_get(aid, gid)
-    selected = set(str(x) for x in (grp.get("campaign_ids") or []) if x)
-    try:
-        fb_campaigns = fetch_campaigns(aid) or []
-    except Exception:
-        fb_campaigns = []
-
-    active_first = []
-    inactive = []
-    for c in fb_campaigns:
-        cid = str((c or {}).get("id") or "")
-        if not cid:
-            continue
-        st = str((c or {}).get("effective_status") or (c or {}).get("status") or "").upper()
-        item = (cid, (c or {}).get("name") or cid, st)
-        if st in {"ACTIVE", "SCHEDULED"}:
-            active_first.append(item)
-        else:
-            inactive.append(item)
-
-    ids = active_first + inactive
-
-    rows = []
-    for cid, name, _st in ids:
-        prefix = "✅ " if cid in selected else ""
-        rows.append(
-            [InlineKeyboardButton(prefix + str(name), callback_data=f"ap_group_camp_toggle|{aid}|{gid}|{cid}")]
-        )
-
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"ap_group_open|{aid}|{gid}")])
-    return InlineKeyboardMarkup(rows)
+def _b36_encode_int(n: int) -> str:
+    if n < 0:
+        raise ValueError("negative")
+    if n == 0:
+        return "0"
+    chars = "0123456789abcdefghijklmnopqrstuvwxyz"
+    out = []
+    x = n
+    while x:
+        x, r = divmod(x, 36)
+        out.append(chars[r])
+    return "".join(reversed(out))
 
 
-def _autopilot_group_campaigns_kb_with_map(
+def _b36_decode_int(s: str) -> int:
+    return int(str(s).strip().lower(), 36)
+
+
+def _campaign_id_to_token(cid: str) -> str:
+    return _b36_encode_int(int(str(cid).strip()))
+
+
+def _campaign_token_to_id(tok: str) -> str:
+    return str(_b36_decode_int(tok))
+
+
+def _autopilot_group_campaigns_kb_active_only(
     aid: str,
     gid: str,
-) -> tuple[InlineKeyboardMarkup, dict[str, str]]:
-    """Возвращает клавиатуру выбора кампаний + mapping (idx -> campaign_id).
-
-    В callback_data используем короткий индекс, чтобы не превышать лимит Telegram (64 bytes).
-    """
+) -> tuple[InlineKeyboardMarkup, set[str]]:
     grp = _autopilot_group_get(aid, gid)
     selected = set(str(x) for x in (grp.get("campaign_ids") or []) if x)
     try:
@@ -1143,37 +1131,31 @@ def _autopilot_group_campaigns_kb_with_map(
     except Exception:
         fb_campaigns = []
 
-    active_first = []
-    inactive = []
+    active = []
+    active_ids: set[str] = set()
     for c in fb_campaigns:
         cid = str((c or {}).get("id") or "")
         if not cid:
             continue
         st = str((c or {}).get("effective_status") or (c or {}).get("status") or "").upper()
-        item = (cid, (c or {}).get("name") or cid, st)
-        if st in {"ACTIVE", "SCHEDULED"}:
-            active_first.append(item)
-        else:
-            inactive.append(item)
+        if st != "ACTIVE":
+            continue
+        active_ids.add(cid)
+        active.append((cid, (c or {}).get("name") or cid))
 
-    ids = active_first + inactive
-    mapping: dict[str, str] = {}
     rows = []
-    for i, (cid, name, _st) in enumerate(ids):
-        idx = str(i)
-        mapping[idx] = str(cid)
-        prefix = "✅ " if str(cid) in selected else ""
+    for cid, name in active:
+        prefix = "✅ " if cid in selected else ""
+        try:
+            tok = _campaign_id_to_token(cid)
+        except Exception:
+            continue
         rows.append(
-            [
-                InlineKeyboardButton(
-                    prefix + str(name),
-                    callback_data=f"ap_group_camp_toggle|{aid}|{gid}|{idx}",
-                )
-            ]
+            [InlineKeyboardButton(prefix + str(name), callback_data=f"ap_group_camp_toggle|{aid}|{gid}|{tok}")]
         )
 
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"ap_group_open|{aid}|{gid}")])
-    return InlineKeyboardMarkup(rows), mapping
+    return InlineKeyboardMarkup(rows), active_ids
 
 
 def _autopilot_human_mode(mode: str) -> str:
@@ -2904,8 +2886,14 @@ async def _on_cb_internal(
 
     if data.startswith("ap_group_campaigns|"):
         _p, aid, gid = data.split("|", 2)
-        kb, mapping = _autopilot_group_campaigns_kb_with_map(aid, gid)
-        context.user_data["ap_group_campaign_map"] = {"aid": aid, "gid": gid, "map": mapping}
+        kb, active_ids = _autopilot_group_campaigns_kb_active_only(aid, gid)
+        grp = _autopilot_group_get(aid, gid)
+        cur = set(str(x) for x in (grp.get("campaign_ids") or []) if x)
+        cleaned = set(x for x in cur if x in active_ids)
+        if cleaned != cur:
+            grp["campaign_ids"] = sorted(cleaned)
+            _autopilot_group_set(aid, gid, grp)
+            kb, _active_ids = _autopilot_group_campaigns_kb_active_only(aid, gid)
         await safe_edit_message(
             q,
             f"📌 Кампании группы — {get_account_name(aid)}\n\nОтметьте 2–10 кампаний:",
@@ -2914,15 +2902,10 @@ async def _on_cb_internal(
         return
 
     if data.startswith("ap_group_camp_toggle|"):
-        _p, aid, gid, idx = data.split("|", 3)
-
-        stash = context.user_data.get("ap_group_campaign_map") or {}
-        if stash.get("aid") != aid or stash.get("gid") != gid:
-            await q.answer("Список кампаний устарел. Открой 'Кампании' ещё раз.", show_alert=True)
-            return
-        mapping = stash.get("map") or {}
-        cid = mapping.get(str(idx))
-        if not cid:
+        _p, aid, gid, tok = data.split("|", 3)
+        try:
+            cid = _campaign_token_to_id(tok)
+        except Exception:
             await q.answer("Кампания не найдена. Открой 'Кампании' ещё раз.", show_alert=True)
             return
 
@@ -2931,11 +2914,24 @@ async def _on_cb_internal(
         if str(cid) in cur:
             cur.remove(str(cid))
         else:
+            try:
+                fb_campaigns = fetch_campaigns(aid) or []
+            except Exception:
+                fb_campaigns = []
+            is_active = False
+            for c in fb_campaigns:
+                if str((c or {}).get("id") or "") == str(cid):
+                    st = str((c or {}).get("effective_status") or (c or {}).get("status") or "").upper()
+                    if st == "ACTIVE":
+                        is_active = True
+                    break
+            if not is_active:
+                await q.answer("Можно выбрать только активные кампании.", show_alert=True)
+                return
             cur.add(str(cid))
         grp["campaign_ids"] = sorted(cur)
         _autopilot_group_set(aid, gid, grp)
-        kb, mapping = _autopilot_group_campaigns_kb_with_map(aid, gid)
-        context.user_data["ap_group_campaign_map"] = {"aid": aid, "gid": gid, "map": mapping}
+        kb, _active_ids = _autopilot_group_campaigns_kb_active_only(aid, gid)
         await safe_edit_message(
             q,
             f"📌 Кампании группы — {get_account_name(aid)}\n\nОтметьте 2–10 кампаний:",
