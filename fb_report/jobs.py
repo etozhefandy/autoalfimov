@@ -1567,7 +1567,15 @@ async def _hourly_snapshot_job(context: ContextTypes.DEFAULT_TYPE):
                 acc = AdAccount(aid)
                 params = _period_to_params("today")
                 params["level"] = level
-                fields = ["spend", "actions", "cost_per_action_type", "impressions", "clicks"]
+                fields = [
+                    "spend",
+                    "actions",
+                    "cost_per_action_type",
+                    "impressions",
+                    "clicks",
+                    "adset_id",
+                    "campaign_id",
+                ]
                 data = safe_api_call(acc.get_insights, fields=fields, params=params)
                 return data or []
 
@@ -1624,6 +1632,8 @@ async def _hourly_snapshot_job(context: ContextTypes.DEFAULT_TYPE):
                 ad_id = str(row_d.get("ad_id") or "")
                 if not ad_id:
                     continue
+                adset_id = str(row_d.get("adset_id") or "")
+                campaign_id = str(row_d.get("campaign_id") or "")
                 parsed = parse_insight(row_d, aid=aid)
                 cur_m = int(parsed.get("msgs", 0) or 0)
                 cur_l = int(parsed.get("leads", 0) or 0)
@@ -1650,6 +1660,10 @@ async def _hourly_snapshot_job(context: ContextTypes.DEFAULT_TYPE):
                     b["leads"] += d_l
                     b["total"] += d_t
                     b["spend"] += d_s
+                    if adset_id:
+                        b["adset_id"] = adset_id
+                    if campaign_id:
+                        b["campaign_id"] = campaign_id
 
                 acc_ad_section[aid][ad_id] = {
                     "date": date_str,
