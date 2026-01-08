@@ -1069,6 +1069,7 @@ def _autopilot_group_menu_text(aid: str, gid: str) -> str:
 def _autopilot_group_kb(aid: str, gid: str) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("✅ Сделать активной", callback_data=f"ap_group_select|{aid}|{gid}")],
+        [InlineKeyboardButton("✏️ Переименовать", callback_data=f"ap_group_rename|{aid}|{gid}")],
         [InlineKeyboardButton("📌 Кампании", callback_data=f"ap_group_campaigns|{aid}|{gid}")],
         [InlineKeyboardButton("📊 KPI группы", callback_data=f"ap_group_kpi|{aid}|{gid}")],
         [InlineKeyboardButton("📊 Метрика заявок", callback_data=f"ap_group_leadmetric|{aid}|{gid}")],
@@ -1125,6 +1126,54 @@ def _autopilot_group_campaigns_kb(aid: str, gid: str) -> InlineKeyboardMarkup:
 
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"ap_group_open|{aid}|{gid}")])
     return InlineKeyboardMarkup(rows)
+
+
+def _autopilot_group_campaigns_kb_with_map(
+    aid: str,
+    gid: str,
+) -> tuple[InlineKeyboardMarkup, dict[str, str]]:
+    """Возвращает клавиатуру выбора кампаний + mapping (idx -> campaign_id).
+
+    В callback_data используем короткий индекс, чтобы не превышать лимит Telegram (64 bytes).
+    """
+    grp = _autopilot_group_get(aid, gid)
+    selected = set(str(x) for x in (grp.get("campaign_ids") or []) if x)
+    try:
+        fb_campaigns = fetch_campaigns(aid) or []
+    except Exception:
+        fb_campaigns = []
+
+    active_first = []
+    inactive = []
+    for c in fb_campaigns:
+        cid = str((c or {}).get("id") or "")
+        if not cid:
+            continue
+        st = str((c or {}).get("effective_status") or (c or {}).get("status") or "").upper()
+        item = (cid, (c or {}).get("name") or cid, st)
+        if st in {"ACTIVE", "SCHEDULED"}:
+            active_first.append(item)
+        else:
+            inactive.append(item)
+
+    ids = active_first + inactive
+    mapping: dict[str, str] = {}
+    rows = []
+    for i, (cid, name, _st) in enumerate(ids):
+        idx = str(i)
+        mapping[idx] = str(cid)
+        prefix = "✅ " if str(cid) in selected else ""
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    prefix + str(name),
+                    callback_data=f"ap_group_camp_toggle|{aid}|{gid}|{idx}",
+                )
+            ]
+        )
+
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"ap_group_open|{aid}|{gid}")])
+    return InlineKeyboardMarkup(rows), mapping
 
 
 def _autopilot_human_mode(mode: str) -> str:
@@ -2773,8 +2822,14 @@ async def _on_cb_internal(
         ap["active_group_id"] = gid
         _autopilot_set(aid, ap)
         await q.answer("Группа создана")
-        text = _autopilot_dashboard_text(aid)
-        await safe_edit_message(q, text, reply_markup=_autopilot_kb(aid))
+        await safe_edit_message(
+            q,
+            _autopilot_group_menu_text(aid, gid)
+            + "\n\nПодсказка: нажми '📌 Кампании', чтобы добавить рекламные кампании в группу."
+            + "\nЕсли хочешь — напиши название группы в чат.",
+            reply_markup=_autopilot_group_kb(aid, gid),
+        )
+        context.user_data["await_ap_group_rename"] = {"aid": aid, "gid": gid}
         return
 
     if data.startswith("ap_group_open|"):
@@ -2784,6 +2839,18 @@ async def _on_cb_internal(
             _autopilot_group_menu_text(aid, gid),
             reply_markup=_autopilot_group_kb(aid, gid),
         )
+        return
+
+    if data.startswith("ap_group_rename|"):
+        _p, aid, gid = data.split("|", 2)
+        grp = _autopilot_group_get(aid, gid)
+        cur_name = grp.get("name") or gid
+        await safe_edit_message(
+            q,
+            f"✏️ Переименовать группу\n\nТекущее название: {cur_name}\n\nНапиши новое название в чат.",
+            reply_markup=_autopilot_group_kb(aid, gid),
+        )
+        context.user_data["await_ap_group_rename"] = {"aid": aid, "gid": gid}
         return
 
     if data.startswith("ap_group_select|"):
@@ -2837,15 +2904,28 @@ async def _on_cb_internal(
 
     if data.startswith("ap_group_campaigns|"):
         _p, aid, gid = data.split("|", 2)
+        kb, mapping = _autopilot_group_campaigns_kb_with_map(aid, gid)
+        context.user_data["ap_group_campaign_map"] = {"aid": aid, "gid": gid, "map": mapping}
         await safe_edit_message(
             q,
             f"📌 Кампании группы — {get_account_name(aid)}\n\nОтметьте 2–10 кампаний:",
-            reply_markup=_autopilot_group_campaigns_kb(aid, gid),
+            reply_markup=kb,
         )
         return
 
     if data.startswith("ap_group_camp_toggle|"):
-        _p, aid, gid, cid = data.split("|", 3)
+        _p, aid, gid, idx = data.split("|", 3)
+
+        stash = context.user_data.get("ap_group_campaign_map") or {}
+        if stash.get("aid") != aid or stash.get("gid") != gid:
+            await q.answer("Список кампаний устарел. Открой 'Кампании' ещё раз.", show_alert=True)
+            return
+        mapping = stash.get("map") or {}
+        cid = mapping.get(str(idx))
+        if not cid:
+            await q.answer("Кампания не найдена. Открой 'Кампании' ещё раз.", show_alert=True)
+            return
+
         grp = _autopilot_group_get(aid, gid)
         cur = set(str(x) for x in (grp.get("campaign_ids") or []) if x)
         if str(cid) in cur:
@@ -2854,10 +2934,12 @@ async def _on_cb_internal(
             cur.add(str(cid))
         grp["campaign_ids"] = sorted(cur)
         _autopilot_group_set(aid, gid, grp)
+        kb, mapping = _autopilot_group_campaigns_kb_with_map(aid, gid)
+        context.user_data["ap_group_campaign_map"] = {"aid": aid, "gid": gid, "map": mapping}
         await safe_edit_message(
             q,
             f"📌 Кампании группы — {get_account_name(aid)}\n\nОтметьте 2–10 кампаний:",
-            reply_markup=_autopilot_group_campaigns_kb(aid, gid),
+            reply_markup=kb,
         )
         return
 
@@ -6712,6 +6794,40 @@ async def on_text_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = update.message.text.strip()
+
+    if "await_ap_group_rename" in context.user_data:
+        payload = context.user_data.pop("await_ap_group_rename") or {}
+        aid = payload.get("aid")
+        gid = payload.get("gid")
+
+        name = str(text or "").strip()
+        if not name:
+            await update.message.reply_text("Введите название текстом.")
+            context.user_data["await_ap_group_rename"] = payload
+            return
+
+        if len(name) > 48:
+            await update.message.reply_text("Слишком длинное название (до 48 символов).")
+            context.user_data["await_ap_group_rename"] = payload
+            return
+
+        if not aid or not gid:
+            await update.message.reply_text("Не удалось сохранить: контекст группы потерян.")
+            return
+
+        grp = _autopilot_group_get(aid, gid)
+        if not grp:
+            await update.message.reply_text("Группа не найдена. Открой 'Группы кампаний' ещё раз.")
+            return
+
+        grp["name"] = name
+        _autopilot_group_set(aid, gid, grp)
+        await update.message.reply_text("✅ Название группы сохранено")
+        await update.message.reply_text(
+            _autopilot_group_menu_text(aid, gid),
+            reply_markup=_autopilot_group_kb(aid, gid),
+        )
+        return
 
     if "await_ap_action_edit" in context.user_data:
         payload = context.user_data.pop("await_ap_action_edit") or {}
