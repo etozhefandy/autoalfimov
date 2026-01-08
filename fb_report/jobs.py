@@ -359,6 +359,33 @@ def _ap_is_heatmap_due(ap: dict, now: datetime) -> bool:
     return (now - dt) >= timedelta(minutes=min_minutes)
 
 
+def _ap_heatmap_due_meta(ap: dict, now: datetime) -> tuple[bool, dict]:
+    limits = (ap or {}).get("limits") or {}
+    try:
+        min_minutes = int(float((limits or {}).get("heatmap_min_interval_minutes") or 60))
+    except Exception:
+        min_minutes = 60
+    if min_minutes < 1:
+        min_minutes = 1
+
+    state = (ap or {}).get("heatmap_state") or {}
+    last_iso = (state or {}).get("last_apply")
+    if not last_iso:
+        return True, {"min_minutes": int(min_minutes), "last_apply": None}
+
+    try:
+        dt = datetime.fromisoformat(str(last_iso))
+        if not dt.tzinfo:
+            dt = ALMATY_TZ.localize(dt)
+        dt = dt.astimezone(ALMATY_TZ)
+    except Exception:
+        return True, {"min_minutes": int(min_minutes), "last_apply": str(last_iso)}
+
+    due = (now - dt) >= timedelta(minutes=min_minutes)
+    next_at = (dt + timedelta(minutes=min_minutes)).isoformat()
+    return bool(due), {"min_minutes": int(min_minutes), "last_apply": dt.isoformat(), "next_apply": next_at}
+
+
 def _ap_heatmap_force_active(ap: dict, now: datetime) -> bool:
     state = (ap or {}).get("heatmap_state") or {}
     until_iso = (state or {}).get("force_until")
@@ -614,7 +641,18 @@ async def _autopilot_heatmap_job(context: ContextTypes.DEFAULT_TYPE):
         if mode != "AUTO_LIMITS":
             continue
 
-        if not _ap_is_heatmap_due(ap, now):
+        due, due_meta = _ap_heatmap_due_meta(ap, now)
+        if not due:
+            append_autopilot_event(
+                aid,
+                {
+                    "type": "heatmap_auto_skipped",
+                    "hour": hour,
+                    "reason": "frequency_limit",
+                    "frequency": due_meta,
+                    "chat_id": chat_id,
+                },
+            )
             continue
 
         goals = ap.get("goals") or {}
@@ -768,7 +806,6 @@ async def _autopilot_heatmap_job(context: ContextTypes.DEFAULT_TYPE):
         blocked_by_risk = False
         blocked_by_planned = False
         if daily_limit is not None and daily_limit > 0:
-            spend_today = float(today_m.get("spend") or 0.0)
             if spend_today > float(daily_limit) * (1.0 + float(max_risk) / 100.0):
                 allow_increase = False
                 blocked_by_risk = True
@@ -793,7 +830,7 @@ async def _autopilot_heatmap_job(context: ContextTypes.DEFAULT_TYPE):
             (not allow_increase)
             and (not soft_mode)
             and (not aggressive)
-            and blocked_by_planned
+            and (blocked_by_planned or blocked_by_risk)
             and _ap_heatmap_force_active(ap, now)
         ):
             allow_increase = True
@@ -878,7 +915,31 @@ async def _autopilot_heatmap_job(context: ContextTypes.DEFAULT_TYPE):
         elif is_top:
             # если нельзя увеличивать — в топ-час просто не трогаем
             if not allow_increase:
-                if blocked_by_planned:
+                if soft_mode or aggressive:
+                    append_autopilot_event(
+                        aid,
+                        {
+                            "type": "heatmap_auto_skipped",
+                            "hour": hour,
+                            "hour_tag": hour_tag,
+                            "reason": "antipanic_no_increase",
+                            "antipanic": {
+                                "mode": antipanic_mode,
+                                "data_ok": bool(antipanic_data_ok),
+                                "spend_today": float(spend_today),
+                                "spend_min": float(spend_min),
+                                "conversions_today": int(conv_today),
+                                "today_cpa": float(today_cpa) if isinstance(today_cpa, (int, float)) else None,
+                                "cpa_3d": float(cpa_3d) if isinstance(cpa_3d, (int, float)) else None,
+                                "target_cpl": float(target_f) if target_f is not None else None,
+                                "step_eff": float(step_eff),
+                            },
+                            "chat_id": chat_id,
+                        },
+                    )
+                    continue
+
+                if blocked_by_planned or blocked_by_risk:
                     if _ap_force_prompt_due(ap, now, minutes=60):
                         ap_state = ap.get("heatmap_state") or {}
                         if not isinstance(ap_state, dict):
@@ -888,10 +949,15 @@ async def _autopilot_heatmap_job(context: ContextTypes.DEFAULT_TYPE):
                         row["autopilot"] = ap
                         accounts[aid] = row
 
-                        msg = (
-                            f"⚠️ Heatmap: упёрся в planned_budget/лимит периода для {get_account_name(aid)}. "
-                            "Нужно одобрение, чтобы продолжать увеличения."
-                        )
+                        reason_label = ""
+                        if blocked_by_planned and blocked_by_risk:
+                            reason_label = "planned_budget + daily_limit"
+                        elif blocked_by_planned:
+                            reason_label = "planned_budget"
+                        elif blocked_by_risk:
+                            reason_label = "daily_limit"
+
+                        msg = f"⚠️ Heatmap: упёрся в {reason_label} для {get_account_name(aid)}. Нужно одобрение, чтобы продолжать увеличения."
                         try:
                             if _ap_force_button_allowed(now):
                                 await context.bot.send_message(chat_id, msg, reply_markup=_heatmap_force_kb(aid))
@@ -906,8 +972,52 @@ async def _autopilot_heatmap_job(context: ContextTypes.DEFAULT_TYPE):
                             {
                                 "type": "heatmap_force_needed",
                                 "hour": hour,
+                                "hour_tag": hour_tag,
+                                "top_hours": top_hours,
+                                "low_hours": low_hours,
                                 "chat_id": chat_id,
                                 "button_allowed": bool(_ap_force_button_allowed(now)),
+                                "blocked": {
+                                    "risk": bool(blocked_by_risk),
+                                    "planned": bool(blocked_by_planned),
+                                    "soft_mode": bool(soft_mode),
+                                    "hard_mode": bool(aggressive),
+                                    "force_active": bool(force_active),
+                                    "force_until": force_until,
+                                },
+                                "caps": {
+                                    "current_total": float(current_total),
+                                    "baseline_total": float(base_total_f),
+                                    "daily_limit": float(daily_limit) if daily_limit is not None else None,
+                                    "planned_total": float(planned_total) if planned_total is not None else None,
+                                    "total_cap": float(total_cap),
+                                },
+                                "antipanic": {
+                                    "mode": antipanic_mode,
+                                    "data_ok": bool(antipanic_data_ok),
+                                    "spend_today": float(spend_today),
+                                    "spend_min": float(spend_min),
+                                    "conversions_today": int(conv_today),
+                                    "today_cpa": float(today_cpa) if isinstance(today_cpa, (int, float)) else None,
+                                    "cpa_3d": float(cpa_3d) if isinstance(cpa_3d, (int, float)) else None,
+                                    "target_cpl": float(target_f) if target_f is not None else None,
+                                    "step_eff": float(step_eff),
+                                },
+                            },
+                        )
+                    else:
+                        append_autopilot_event(
+                            aid,
+                            {
+                                "type": "heatmap_auto_skipped",
+                                "hour": hour,
+                                "hour_tag": hour_tag,
+                                "reason": "force_prompt_cooldown",
+                                "blocked": {
+                                    "risk": bool(blocked_by_risk),
+                                    "planned": bool(blocked_by_planned),
+                                },
+                                "chat_id": chat_id,
                             },
                         )
                 continue
@@ -1131,6 +1241,7 @@ async def _autopilot_heatmap_job(context: ContextTypes.DEFAULT_TYPE):
                     "risk": bool(blocked_by_risk),
                     "planned": bool(blocked_by_planned),
                     "soft_mode": bool(soft_mode),
+                    "hard_mode": bool(aggressive),
                     "force_active": bool(force_active),
                     "force_until": force_until,
                 },
