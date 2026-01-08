@@ -133,6 +133,7 @@ def _migrate_autopilot_schema(store: dict) -> dict:
             limits = {}
         limits.setdefault("max_budget_step_pct", 20)
         limits.setdefault("max_daily_risk_pct", 30)
+        limits.setdefault("heatmap_min_interval_minutes", 60)
         limits.setdefault("allow_pause_ads", True)
         limits.setdefault("allow_pause_adsets", False)
         limits.setdefault("allow_redistribute", True)

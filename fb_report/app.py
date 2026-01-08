@@ -156,7 +156,6 @@ def _autopilot_hm_kb(aid: str) -> InlineKeyboardMarkup:
 
 
 def _autopilot_hm_summary(summary: dict) -> str:
-    # summary comes from build_hourly_heatmap_for_account()
     days = (summary or {}).get("days") or []
     if not days:
         return "🕒 Рекомендации по часам: нет данных (нужно накопить hourly_stats)."
@@ -2593,6 +2592,46 @@ async def _on_cb_internal(
         extra = _autopilot_hm_summary(summary or {})
         text = str(heat_txt or "") + "\n\n" + str(extra or "")
         await safe_edit_message(q, text, reply_markup=_autopilot_hm_kb(aid))
+        return
+
+    if data.startswith("aphmforce|"):
+        aid = data.split("|", 1)[1]
+        st = load_accounts()
+        row = st.get(str(aid), {})
+        ap = (row or {}).get("autopilot") or {}
+        if not isinstance(ap, dict):
+            ap = {}
+
+        mode = str(ap.get("mode") or "OFF").upper()
+        if mode != "AUTO_LIMITS":
+            await q.answer("Force доступен только в AUTO_LIMITS.", show_alert=True)
+            return
+
+        hs = ap.get("heatmap_state") or {}
+        if not isinstance(hs, dict):
+            hs = {}
+
+        until = (datetime.now(ALMATY_TZ) + timedelta(hours=1)).isoformat()
+        hs["force_until"] = until
+        ap["heatmap_state"] = hs
+        row["autopilot"] = ap
+        st[str(aid)] = row
+        save_accounts(st)
+
+        append_autopilot_event(
+            aid,
+            {
+                "type": "heatmap_force_granted",
+                "until": until,
+                "chat_id": str(chat_id),
+            },
+        )
+
+        await safe_edit_message(
+            q,
+            f"✅ Разрешил heatmap-применения сверх лимитов до {datetime.now(ALMATY_TZ).strftime('%H:%M')}+1ч.",
+            reply_markup=_autopilot_kb(aid),
+        )
         return
 
     if data.startswith("ap_suggest|"):

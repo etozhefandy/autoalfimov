@@ -17,6 +17,7 @@ from .cpa_monitoring import (
     format_cpa_anomaly_message,
 )
 from .adsets import fetch_adset_insights_7d
+from .insights import build_hourly_heatmap_for_account
 
 # Для Railway могут быть разные пути импорта services.*.
 # Пытаемся взять реальные функции, а при ошибке делаем мягкие заглушки,
@@ -31,7 +32,7 @@ except Exception:  # noqa: BLE001 - нам важен ЛЮБОЙ ImportError/Run
         return None
 
 try:  # pragma: no cover
-    from services.facebook_api import fetch_insights
+    from services.facebook_api import fetch_insights, safe_api_call
     from services.analytics import (
         parse_insight,
         analyze_account,
@@ -40,8 +41,12 @@ try:  # pragma: no cover
         analyze_ads,
     )
     from services.ai_focus import ask_deepseek
+    from services.facebook_api import fetch_adsets
 except Exception:  # noqa: BLE001
     fetch_insights = None  # type: ignore[assignment]
+
+    def safe_api_call(_fn, *args, **kwargs):  # type: ignore[override]
+        return None
 
     def parse_insight(_ins: dict) -> dict:  # type: ignore[override]
         return {"msgs": 0, "leads": 0, "total": 0, "spend": 0.0}
@@ -60,6 +65,29 @@ except Exception:  # noqa: BLE001
 
     async def ask_deepseek(_messages, json_mode: bool = False):  # type: ignore[override]
         raise RuntimeError("DeepSeek is not available in this environment")
+
+    def fetch_adsets(_aid: str):  # type: ignore[override]
+        return []
+
+
+try:  # pragma: no cover
+    from history_store import append_autopilot_event
+except Exception:  # noqa: BLE001
+    def append_autopilot_event(_aid: str, _event: dict) -> None:  # type: ignore[override]
+        return None
+
+
+try:  # pragma: no cover
+    from autopilat.actions import set_adset_budget
+except Exception:  # noqa: BLE001
+    def set_adset_budget(_adset_id: str, _new_budget: float) -> dict:  # type: ignore[override]
+        return {"status": "error", "message": "set_adset_budget unavailable"}
+
+
+def _heatmap_force_kb(aid: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("✅ Разрешить на 1 час", callback_data=f"aphmforce|{aid}")]]
+    )
 
 
 def _yesterday_period():
@@ -216,6 +244,449 @@ CPA_HOURLY_START = 10
 CPA_HOURLY_END = 22
 
 WEEKDAY_KEYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
+
+def _ap_daily_budget_limit_usd(goals: dict, now: datetime) -> float | None:
+    planned = (goals or {}).get("planned_budget")
+    try:
+        planned_f = float(planned) if planned not in (None, "") else None
+    except Exception:
+        planned_f = None
+    if planned_f is None or planned_f <= 0:
+        return None
+
+    period = str((goals or {}).get("period") or "day")
+    today = now.date()
+
+    if period == "day":
+        return float(planned_f)
+    if period == "week":
+        return float(planned_f) / 7.0
+    if period == "month":
+        # 28–31 days safe approximation, enough for limiting
+        days_in_month = (today.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+        return float(planned_f) / float(days_in_month.day)
+    if period == "until":
+        until_raw = (goals or {}).get("until")
+        try:
+            until_dt = datetime.strptime(str(until_raw or ""), "%d.%m.%Y").date()
+        except Exception:
+            return None
+        days_left = (until_dt - today).days + 1
+        if days_left < 1:
+            days_left = 1
+        return float(planned_f) / float(days_left)
+    return None
+
+
+def _ap_period_spend_limit(goals: dict, now: datetime) -> tuple[float | None, dict | None]:
+    planned = (goals or {}).get("planned_budget")
+    try:
+        planned_f = float(planned) if planned not in (None, "") else None
+    except Exception:
+        planned_f = None
+    if planned_f is None or planned_f <= 0:
+        return None, None
+
+    period = str((goals or {}).get("period") or "day")
+    today = now.date()
+    if period == "week":
+        since = today - timedelta(days=today.weekday())
+        until = today
+        return float(planned_f), {"since": since.strftime("%Y-%m-%d"), "until": until.strftime("%Y-%m-%d")}
+    if period == "month":
+        since = today.replace(day=1)
+        until = today
+        return float(planned_f), {"since": since.strftime("%Y-%m-%d"), "until": until.strftime("%Y-%m-%d")}
+    # day/until: period limit == daily or unknown window; do not enforce cumulative here.
+    return float(planned_f), None
+
+
+def _ap_is_heatmap_due(ap: dict, now: datetime) -> bool:
+    limits = (ap or {}).get("limits") or {}
+    try:
+        min_minutes = int(float((limits or {}).get("heatmap_min_interval_minutes") or 60))
+    except Exception:
+        min_minutes = 60
+    if min_minutes < 1:
+        min_minutes = 1
+
+    state = (ap or {}).get("heatmap_state") or {}
+    last_iso = (state or {}).get("last_apply")
+    if not last_iso:
+        return True
+    try:
+        dt = datetime.fromisoformat(str(last_iso))
+        if not dt.tzinfo:
+            dt = ALMATY_TZ.localize(dt)
+        dt = dt.astimezone(ALMATY_TZ)
+    except Exception:
+        return True
+
+    return (now - dt) >= timedelta(minutes=min_minutes)
+
+
+def _ap_heatmap_force_active(ap: dict, now: datetime) -> bool:
+    state = (ap or {}).get("heatmap_state") or {}
+    until_iso = (state or {}).get("force_until")
+    if not until_iso:
+        return False
+    try:
+        dt = datetime.fromisoformat(str(until_iso))
+        if not dt.tzinfo:
+            dt = ALMATY_TZ.localize(dt)
+        dt = dt.astimezone(ALMATY_TZ)
+    except Exception:
+        return False
+    return now <= dt
+
+
+def _ap_heatmap_profile(summary: dict) -> tuple[list[int], list[int]]:
+    # returns (top_hours, low_hours)
+    days = (summary or {}).get("days") or []
+    totals = [0 for _ in range(24)]
+    spends = [0.0 for _ in range(24)]
+
+    if not days:
+        return [], []
+
+    for d in days:
+        vals = (d or {}).get("totals_per_hour") or []
+        # spend per hour is not provided in summary; fall back to totals only
+        for i in range(min(24, len(vals))):
+            try:
+                totals[i] += int(vals[i] or 0)
+            except Exception:
+                continue
+
+    scored = []
+    for h in range(24):
+        t = totals[h]
+        sp = spends[h]
+        if sp > 0 and t > 0:
+            score = float(t) / float(sp)
+        else:
+            score = float(t)
+        scored.append((h, score, t))
+
+    scored.sort(key=lambda x: (x[1], x[2]), reverse=True)
+    top = [h for h, _s, t in scored if t > 0][:4]
+
+    scored_low = sorted(scored, key=lambda x: (x[2], x[1]))
+    low = [h for h, _s, _t in scored_low][:4]
+    return top, low
+
+
+async def _autopilot_heatmap_job(context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(DEFAULT_REPORT_CHAT)
+    now = datetime.now(ALMATY_TZ)
+    hour = int(now.strftime("%H"))
+
+    accounts = load_accounts() or {}
+
+    for aid, row in accounts.items():
+        ap = (row or {}).get("autopilot") or {}
+        if not isinstance(ap, dict):
+            continue
+
+        mode = str(ap.get("mode") or "OFF").upper()
+        if mode != "AUTO_LIMITS":
+            continue
+
+        if not _ap_is_heatmap_due(ap, now):
+            continue
+
+        goals = ap.get("goals") or {}
+        limits = ap.get("limits") or {}
+
+        allow_redist = bool((limits or {}).get("allow_redistribute", True))
+        if not allow_redist:
+            continue
+
+        try:
+            max_step = float((limits or {}).get("max_budget_step_pct") or 20)
+        except Exception:
+            max_step = 20.0
+        if max_step <= 0:
+            max_step = 20.0
+
+        try:
+            max_risk = float((limits or {}).get("max_daily_risk_pct") or 0)
+        except Exception:
+            max_risk = 0.0
+        if max_risk < 0:
+            max_risk = 0.0
+
+        # Строим профиль лучших/слабых часов на основе 7 дней.
+        try:
+            _txt, summary = build_hourly_heatmap_for_account(aid, get_account_name_fn=get_account_name, mode="7d")
+        except Exception:
+            summary = {}
+
+        top_hours, low_hours = _ap_heatmap_profile(summary or {})
+        if not top_hours and not low_hours:
+            continue
+
+        is_top = hour in set(top_hours)
+        is_low = hour in set(low_hours)
+
+        # Anti-panic:
+        # если сегодня плохо, но 3d ок — не делаем агрессивных увеличений.
+        target = (goals or {}).get("target_cpl")
+        try:
+            target_f = float(target) if target not in (None, "") else None
+        except Exception:
+            target_f = None
+
+        today_ins = None
+        try:
+            today_ins = fetch_insights(aid, "today") or {}
+        except Exception:
+            today_ins = {}
+        today_m = parse_insight(today_ins or {}, aid=aid)
+        today_cpa = today_m.get("cpa")
+
+        # rolling 3d: yday-2..yday
+        yday = (now - timedelta(days=1)).date()
+        period_3d = {
+            "since": (yday - timedelta(days=2)).strftime("%Y-%m-%d"),
+            "until": yday.strftime("%Y-%m-%d"),
+        }
+        acc_3d = analyze_account(aid, period=period_3d) or {}
+        cpa_3d = ((acc_3d.get("metrics") or {}) if isinstance(acc_3d, dict) else {}).get("cpa")
+
+        aggressive = False
+        if target_f is not None and isinstance(today_cpa, (int, float)) and today_cpa is not None:
+            if today_cpa >= float(target_f) * 4.0:
+                aggressive = True
+
+        soft_mode = False
+        if (not aggressive) and isinstance(today_cpa, (int, float)) and isinstance(cpa_3d, (int, float)):
+            if today_cpa > float(cpa_3d) * 1.25:
+                soft_mode = True
+
+        step_eff = float(max_step)
+        if soft_mode:
+            step_eff = max(5.0, float(max_step) / 2.0)
+
+        # Текущие бюджеты — база.
+        adsets = fetch_adsets(aid) or []
+        active = []
+        for a in adsets:
+            st = str((a or {}).get("effective_status") or (a or {}).get("status") or "").upper()
+            if st in {"ACTIVE", "SCHEDULED"}:
+                active.append(a)
+
+        if not active:
+            continue
+
+        current_total = sum(float((a or {}).get("daily_budget") or 0.0) for a in active)
+        if current_total <= 0:
+            continue
+
+        ap_state = ap.get("heatmap_state") or {}
+        if not isinstance(ap_state, dict):
+            ap_state = {}
+
+        date_key = now.strftime("%Y-%m-%d")
+        base_date = str(ap_state.get("baseline_date") or "")
+        base_total = ap_state.get("baseline_total")
+        try:
+            base_total_f = float(base_total) if base_total not in (None, "") else None
+        except Exception:
+            base_total_f = None
+
+        if base_date != date_key or base_total_f is None or base_total_f <= 0:
+            base_total_f = float(current_total)
+            ap_state["baseline_date"] = date_key
+            ap_state["baseline_total"] = float(base_total_f)
+
+        # planned_budget: потолок total_budget (через daily_limit)
+        daily_limit = _ap_daily_budget_limit_usd(goals, now)
+        total_cap = float(base_total_f)
+        if daily_limit is not None and daily_limit > 0:
+            total_cap = min(float(total_cap), float(daily_limit))
+
+        allow_increase = True
+        blocked_by_risk = False
+        blocked_by_planned = False
+        if daily_limit is not None and daily_limit > 0:
+            spend_today = float(today_m.get("spend") or 0.0)
+            if spend_today > float(daily_limit) * (1.0 + float(max_risk) / 100.0):
+                allow_increase = False
+                blocked_by_risk = True
+
+        # Если weekly/month planned и уже выбрали план — тоже запрещаем увеличение.
+        planned_total, period_range = _ap_period_spend_limit(goals, now)
+        if period_range and planned_total is not None:
+            try:
+                ins_p = fetch_insights(aid, period_range) or {}
+            except Exception:
+                ins_p = {}
+            spend_p = float((ins_p or {}).get("spend", 0) or 0)
+            if spend_p >= float(planned_total):
+                allow_increase = False
+                blocked_by_planned = True
+
+        # В soft_mode вообще не делаем увеличений (только ужимаем слабые часы).
+        if soft_mode:
+            allow_increase = False
+
+        if (not allow_increase) and (not soft_mode) and blocked_by_planned and _ap_heatmap_force_active(ap, now):
+            allow_increase = True
+
+        # Определяем кандидатов good/bad по сегодняшнему CPL vs 3d (через analyze_adsets).
+        # NB: analyze_adsets может быть тяжёлым, но это hourly job и список ограничен.
+        good_ids: set[str] = set()
+        bad_ids: set[str] = set()
+        try:
+            rows_today = analyze_adsets(aid, period="today") or []
+            rows_3d = analyze_adsets(aid, period=period_3d) or []
+            map_3d = {str(r.get("id") or ""): r for r in rows_3d if r}
+            for r in rows_today:
+                adset_id = str((r or {}).get("id") or "")
+                if not adset_id:
+                    continue
+                cpl_t = float((r or {}).get("cpl") or 0.0)
+                cpl_3 = float((map_3d.get(adset_id) or {}).get("cpl") or 0.0)
+                if cpl_t <= 0 or cpl_3 <= 0:
+                    continue
+                if target_f is not None and target_f > 0:
+                    if cpl_t <= float(target_f) * 1.05 and cpl_t <= cpl_3 * 0.95:
+                        good_ids.add(adset_id)
+                    elif cpl_t >= float(target_f) * 1.5 and cpl_t >= cpl_3 * 1.15:
+                        bad_ids.add(adset_id)
+                else:
+                    if cpl_t <= cpl_3 * 0.90:
+                        good_ids.add(adset_id)
+                    elif cpl_t >= cpl_3 * 1.20:
+                        bad_ids.add(adset_id)
+        except Exception:
+            good_ids = set()
+            bad_ids = set()
+
+        changes: list[dict] = []
+
+        if is_low:
+            factor = 1.0 - float(step_eff) / 100.0
+            for a in active:
+                adset_id = str((a or {}).get("id") or "")
+                old_b = float((a or {}).get("daily_budget") or 0.0)
+                new_b = max(1.0, old_b * factor)
+                changes.append({"adset_id": adset_id, "old": old_b, "new": new_b})
+
+        elif is_top:
+            # если нельзя увеличивать — в топ-час просто не трогаем
+            if not allow_increase:
+                if blocked_by_planned:
+                    try:
+                        await context.bot.send_message(
+                            chat_id,
+                            f"⚠️ Heatmap: упёрся в planned_budget/лимит периода для {get_account_name(aid)}. "
+                            "Нужно одобрение, чтобы продолжать увеличения.",
+                            reply_markup=_heatmap_force_kb(aid),
+                        )
+                        await asyncio.sleep(0.3)
+                    except Exception:
+                        pass
+
+                    append_autopilot_event(
+                        aid,
+                        {
+                            "type": "heatmap_force_needed",
+                            "hour": hour,
+                            "chat_id": chat_id,
+                        },
+                    )
+                continue
+
+            if not good_ids:
+                factor = 1.0 + float(step_eff) / 100.0
+                for a in active:
+                    adset_id = str((a or {}).get("id") or "")
+                    old_b = float((a or {}).get("daily_budget") or 0.0)
+                    new_b = max(1.0, old_b * factor)
+                    changes.append({"adset_id": adset_id, "old": old_b, "new": new_b})
+            else:
+                for a in active:
+                    adset_id = str((a or {}).get("id") or "")
+                    old_b = float((a or {}).get("daily_budget") or 0.0)
+                    if adset_id in bad_ids:
+                        new_b = max(1.0, old_b * (1.0 - float(step_eff) / 100.0))
+                    elif adset_id in good_ids:
+                        new_b = max(1.0, old_b * (1.0 + float(step_eff) / 100.0))
+                    else:
+                        new_b = old_b
+                    changes.append({"adset_id": adset_id, "old": old_b, "new": new_b})
+        else:
+            continue
+
+        new_total = sum(c["new"] for c in changes)
+        if new_total <= 0:
+            continue
+
+        if new_total > float(total_cap):
+            scale = float(total_cap) / float(new_total)
+            for c in changes:
+                c["new"] = max(1.0, float(c["new"]) * scale)
+
+        applied = []
+        for c in changes:
+            adset_id = c["adset_id"]
+            old_b = float(c["old"])
+            new_b = float(c["new"])
+            if abs(new_b - old_b) < 0.5:
+                continue
+
+            res = set_adset_budget(adset_id, new_b)
+            applied.append({"adset_id": adset_id, "old": old_b, "new": new_b, "status": res.get("status"), "msg": res.get("message")})
+
+        if not applied:
+            continue
+
+        ap_state["last_apply"] = now.isoformat()
+        ap["heatmap_state"] = ap_state
+        row["autopilot"] = ap
+        accounts[aid] = row
+
+        append_autopilot_event(
+            aid,
+            {
+                "type": "heatmap_auto_apply",
+                "hour": hour,
+                "top_hours": top_hours,
+                "low_hours": low_hours,
+                "soft_mode": bool(soft_mode),
+                "aggressive": bool(aggressive),
+                "applied": applied,
+                "chat_id": chat_id,
+            },
+        )
+
+        title = f"🤖 Heatmap AUTO_LIMITS: {get_account_name(aid)}"
+        reason = f"Час {hour:02d}:00. Top={','.join([f'{h:02d}' for h in top_hours]) or '-'}; Low={','.join([f'{h:02d}' for h in low_hours]) or '-'}"
+        mode_line = "Режим: AUTO_LIMITS"
+        anti = "Anti-panic: мягкий режим (без увеличений)" if soft_mode else ("Anti-panic: агрессивнее (CPL > 4× target)" if aggressive else "Anti-panic: стандарт")
+
+        lines = [title, mode_line, anti, reason, "", "Изменения бюджетов:"]
+        for a in applied[:25]:
+            lines.append(f"- {a['adset_id']}: {a['old']:.2f} → {a['new']:.2f} $")
+        if len(applied) > 25:
+            lines.append(f"… ещё {len(applied) - 25} adset")
+
+        try:
+            await context.bot.send_message(chat_id, "\n".join(lines))
+            await asyncio.sleep(0.3)
+        except Exception:
+            pass
+
+    # Сохраняем обновлённый accounts (last_apply)
+    try:
+        from .storage import save_accounts
+
+        save_accounts(accounts)
+    except Exception:
+        pass
 
 
 def _is_day_enabled(alerts: dict, now: datetime) -> bool:
@@ -865,6 +1336,11 @@ async def _hourly_snapshot_job(context: ContextTypes.DEFAULT_TYPE):
     accounts = load_accounts() or {}
     stats = load_hourly_stats() or {}
     acc_section = stats.setdefault("_acc", {})
+    acc_adset_section = stats.setdefault("_acc_adset", {})
+    acc_ad_section = stats.setdefault("_acc_ad", {})
+
+    adset_section = stats.setdefault("_adset", {})
+    ad_section = stats.setdefault("_ad", {})
 
     # Порог хранения ~2 года
     cutoff_date = (now - timedelta(days=730)).strftime("%Y-%m-%d")
@@ -886,7 +1362,9 @@ async def _hourly_snapshot_job(context: ContextTypes.DEFAULT_TYPE):
         cur_total = int(metrics.get("total", 0) or 0)
         cur_spend = float(metrics.get("spend", 0.0) or 0.0)
 
-        prev = acc_section.get(aid, {"msgs": 0, "leads": 0, "total": 0, "spend": 0.0})
+        prev = acc_section.get(aid, {"date": date_str, "msgs": 0, "leads": 0, "total": 0, "spend": 0.0})
+        if str(prev.get("date") or "") != date_str:
+            prev = {"date": date_str, "msgs": 0, "leads": 0, "total": 0, "spend": 0.0}
 
         d_msgs = max(0, cur_msgs - int(prev.get("msgs", 0) or 0))
         d_leads = max(0, cur_leads - int(prev.get("leads", 0) or 0))
@@ -908,11 +1386,125 @@ async def _hourly_snapshot_job(context: ContextTypes.DEFAULT_TYPE):
 
         # Обновляем аккумулятор для следующего часа
         acc_section[aid] = {
+            "date": date_str,
             "msgs": cur_msgs,
             "leads": cur_leads,
             "total": cur_total,
             "spend": cur_spend,
         }
+
+        try:
+            from facebook_business.adobjects.adaccount import AdAccount
+
+            def _export_row(r):
+                if r is None:
+                    return {}
+                if hasattr(r, "export_all_data"):
+                    try:
+                        return r.export_all_data()
+                    except Exception:
+                        return {}
+                try:
+                    return dict(r)
+                except Exception:
+                    return {}
+
+            def _fetch_level_rows(level: str):
+                acc = AdAccount(aid)
+                params = {"date_preset": "today", "level": level}
+                fields = ["spend", "actions", "cost_per_action_type", "impressions", "clicks"]
+                data = safe_api_call(acc.get_insights, fields=fields, params=params)
+                return data or []
+
+            adset_rows = _fetch_level_rows("adset")
+            ad_rows = _fetch_level_rows("ad")
+
+            acc_adset_section.setdefault(aid, {})
+            acc_ad_section.setdefault(aid, {})
+            adset_section.setdefault(aid, {})
+            ad_section.setdefault(aid, {})
+
+            for rr in adset_rows:
+                row_d = _export_row(rr)
+                adset_id = str(row_d.get("adset_id") or "")
+                if not adset_id:
+                    continue
+                parsed = parse_insight(row_d, aid=aid)
+                cur_m = int(parsed.get("msgs", 0) or 0)
+                cur_l = int(parsed.get("leads", 0) or 0)
+                cur_t = int(parsed.get("total", 0) or 0)
+                cur_s = float(parsed.get("spend", 0.0) or 0.0)
+
+                prev_a = (acc_adset_section.get(aid) or {}).get(
+                    adset_id,
+                    {"date": date_str, "msgs": 0, "leads": 0, "total": 0, "spend": 0.0},
+                )
+                if str((prev_a or {}).get("date") or "") != date_str:
+                    prev_a = {"date": date_str, "msgs": 0, "leads": 0, "total": 0, "spend": 0.0}
+
+                d_m = max(0, cur_m - int((prev_a or {}).get("msgs", 0) or 0))
+                d_l = max(0, cur_l - int((prev_a or {}).get("leads", 0) or 0))
+                d_t = max(0, cur_t - int((prev_a or {}).get("total", 0) or 0))
+                d_s = max(0.0, cur_s - float((prev_a or {}).get("spend", 0.0) or 0.0))
+
+                if any([d_m, d_l, d_t, d_s]):
+                    asec = adset_section[aid].setdefault(adset_id, {})
+                    dsec = asec.setdefault(date_str, {})
+                    b = dsec.setdefault(hour_str, {"messages": 0, "leads": 0, "total": 0, "spend": 0.0})
+                    b["messages"] += d_m
+                    b["leads"] += d_l
+                    b["total"] += d_t
+                    b["spend"] += d_s
+
+                acc_adset_section[aid][adset_id] = {
+                    "date": date_str,
+                    "msgs": cur_m,
+                    "leads": cur_l,
+                    "total": cur_t,
+                    "spend": cur_s,
+                }
+
+            for rr in ad_rows:
+                row_d = _export_row(rr)
+                ad_id = str(row_d.get("ad_id") or "")
+                if not ad_id:
+                    continue
+                parsed = parse_insight(row_d, aid=aid)
+                cur_m = int(parsed.get("msgs", 0) or 0)
+                cur_l = int(parsed.get("leads", 0) or 0)
+                cur_t = int(parsed.get("total", 0) or 0)
+                cur_s = float(parsed.get("spend", 0.0) or 0.0)
+
+                prev_a = (acc_ad_section.get(aid) or {}).get(
+                    ad_id,
+                    {"date": date_str, "msgs": 0, "leads": 0, "total": 0, "spend": 0.0},
+                )
+                if str((prev_a or {}).get("date") or "") != date_str:
+                    prev_a = {"date": date_str, "msgs": 0, "leads": 0, "total": 0, "spend": 0.0}
+
+                d_m = max(0, cur_m - int((prev_a or {}).get("msgs", 0) or 0))
+                d_l = max(0, cur_l - int((prev_a or {}).get("leads", 0) or 0))
+                d_t = max(0, cur_t - int((prev_a or {}).get("total", 0) or 0))
+                d_s = max(0.0, cur_s - float((prev_a or {}).get("spend", 0.0) or 0.0))
+
+                if any([d_m, d_l, d_t, d_s]):
+                    asec = ad_section[aid].setdefault(ad_id, {})
+                    dsec = asec.setdefault(date_str, {})
+                    b = dsec.setdefault(hour_str, {"messages": 0, "leads": 0, "total": 0, "spend": 0.0})
+                    b["messages"] += d_m
+                    b["leads"] += d_l
+                    b["total"] += d_t
+                    b["spend"] += d_s
+
+                acc_ad_section[aid][ad_id] = {
+                    "date": date_str,
+                    "msgs": cur_m,
+                    "leads": cur_l,
+                    "total": cur_t,
+                    "spend": cur_s,
+                }
+        except Exception:
+            pass
 
     # Обрезаем историю старше cutoff_date
     for aid, acc_stats in list(stats.items()):
@@ -942,4 +1534,11 @@ def schedule_cpa_alerts(app: Application):
         _hourly_snapshot_job,
         interval=timedelta(hours=1),
         first=timedelta(minutes=5),
+    )
+
+    # Heatmap Autopilot (AUTO_LIMITS)
+    app.job_queue.run_repeating(
+        _autopilot_heatmap_job,
+        interval=timedelta(hours=1),
+        first=timedelta(minutes=20),
     )
