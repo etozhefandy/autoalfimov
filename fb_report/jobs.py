@@ -661,6 +661,8 @@ async def _autopilot_heatmap_job(context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             target_f = None
 
+        planned_daily_for_antipanic = _ap_daily_budget_limit_usd(goals, now)
+
         today_ins = None
         try:
             today_ins = fetch_insights(aid, "today") or {}
@@ -668,6 +670,14 @@ async def _autopilot_heatmap_job(context: ContextTypes.DEFAULT_TYPE):
             today_ins = {}
         today_m = parse_insight(today_ins or {}, aid=aid)
         today_cpa = today_m.get("cpa")
+        spend_today = float(today_m.get("spend") or 0.0)
+        conv_today = int(today_m.get("total_conversions") or 0)
+
+        spend_min = 20.0
+        if planned_daily_for_antipanic is not None and planned_daily_for_antipanic > 0:
+            spend_min = max(float(spend_min), float(planned_daily_for_antipanic) * 0.5)
+
+        antipanic_data_ok = bool(spend_today >= float(spend_min) and conv_today >= 2)
 
         # rolling 3d: yday-2..yday
         yday = (now - timedelta(days=1)).date()
@@ -679,17 +689,35 @@ async def _autopilot_heatmap_job(context: ContextTypes.DEFAULT_TYPE):
         cpa_3d = ((acc_3d.get("metrics") or {}) if isinstance(acc_3d, dict) else {}).get("cpa")
 
         aggressive = False
-        if target_f is not None and isinstance(today_cpa, (int, float)) and today_cpa is not None:
+        if (
+            antipanic_data_ok
+            and target_f is not None
+            and isinstance(today_cpa, (int, float))
+            and today_cpa is not None
+        ):
             if today_cpa >= float(target_f) * 4.0:
                 aggressive = True
 
         soft_mode = False
-        if (not aggressive) and isinstance(today_cpa, (int, float)) and isinstance(cpa_3d, (int, float)):
+        if (
+            antipanic_data_ok
+            and (not aggressive)
+            and isinstance(today_cpa, (int, float))
+            and isinstance(cpa_3d, (int, float))
+        ):
             if today_cpa > float(cpa_3d) * 1.25:
                 soft_mode = True
 
+        antipanic_mode = "NORMAL"
+        if aggressive:
+            antipanic_mode = "HARD"
+        elif soft_mode:
+            antipanic_mode = "SOFT"
+
         step_eff = float(max_step)
-        if soft_mode:
+        if aggressive:
+            step_eff = min(35.0, float(max_step) * 1.5)
+        elif soft_mode:
             step_eff = max(5.0, float(max_step) / 2.0)
 
         # Текущие бюджеты — база.
@@ -758,10 +786,16 @@ async def _autopilot_heatmap_job(context: ContextTypes.DEFAULT_TYPE):
                 blocked_by_planned = True
 
         # В soft_mode вообще не делаем увеличений (только ужимаем слабые часы).
-        if soft_mode:
+        if soft_mode or aggressive:
             allow_increase = False
 
-        if (not allow_increase) and (not soft_mode) and blocked_by_planned and _ap_heatmap_force_active(ap, now):
+        if (
+            (not allow_increase)
+            and (not soft_mode)
+            and (not aggressive)
+            and blocked_by_planned
+            and _ap_heatmap_force_active(ap, now)
+        ):
             allow_increase = True
 
         force_active = _ap_heatmap_force_active(ap, now)
@@ -900,7 +934,102 @@ async def _autopilot_heatmap_job(context: ContextTypes.DEFAULT_TYPE):
         else:
             continue
 
+        blocked_by_cut_guard = False
+        cut_guard = {
+            "enabled": True,
+            "max_cut_pct": 35.0,
+            "cut_used": 0.0,
+            "cut_max": float(base_total_f) * 0.35,
+            "cut_planned": 0.0,
+            "cut_applied": 0.0,
+            "cut_remaining": 0.0,
+        }
+
+        try:
+            cut_date = str(ap_state.get("cut_date") or "")
+            cut_used = float(ap_state.get("cut_used") or 0.0)
+        except Exception:
+            cut_date = ""
+            cut_used = 0.0
+        if cut_date != date_key:
+            cut_used = 0.0
+            ap_state["cut_date"] = date_key
+            ap_state["cut_used"] = 0.0
+
+        cut_guard["cut_used"] = float(cut_used)
+        cut_guard["cut_remaining"] = max(0.0, float(cut_guard["cut_max"]) - float(cut_used))
+
         new_total_before_scale = sum(c["new"] for c in changes)
+        old_total = sum(c["old"] for c in changes)
+        cut_planned = max(0.0, float(old_total) - float(new_total_before_scale))
+        cut_guard["cut_planned"] = float(cut_planned)
+
+        if cut_planned > 0:
+            remaining = float(cut_guard["cut_remaining"])
+            if remaining <= 0.0:
+                blocked_by_cut_guard = True
+            elif cut_planned > remaining:
+                k = float(remaining) / float(cut_planned)
+                for c in changes:
+                    old_b = float(c["old"])
+                    new_b = float(c["new"])
+                    if new_b < old_b:
+                        c["new"] = max(1.0, old_b - (old_b - new_b) * k)
+
+                new_total_before_scale = sum(c["new"] for c in changes)
+                cut_guard["cut_applied"] = float(max(0.0, float(old_total) - float(new_total_before_scale)))
+                ap_state["cut_used"] = float(cut_used) + float(cut_guard["cut_applied"])
+                cut_guard["cut_used"] = float(ap_state.get("cut_used") or 0.0)
+                cut_guard["cut_remaining"] = max(0.0, float(cut_guard["cut_max"]) - float(cut_guard["cut_used"]))
+            else:
+                cut_guard["cut_applied"] = float(cut_planned)
+                ap_state["cut_used"] = float(cut_used) + float(cut_planned)
+                cut_guard["cut_used"] = float(ap_state.get("cut_used") or 0.0)
+                cut_guard["cut_remaining"] = max(0.0, float(cut_guard["cut_max"]) - float(cut_guard["cut_used"]))
+
+        if blocked_by_cut_guard:
+            ap["heatmap_state"] = ap_state
+            row["autopilot"] = ap
+            accounts[aid] = row
+
+            append_autopilot_event(
+                aid,
+                {
+                    "type": "heatmap_auto_blocked",
+                    "hour": hour,
+                    "hour_tag": hour_tag,
+                    "reason": "daily_cut_guard",
+                    "cut_guard": cut_guard,
+                    "antipanic": {
+                        "mode": antipanic_mode,
+                        "data_ok": bool(antipanic_data_ok),
+                        "spend_today": float(spend_today),
+                        "spend_min": float(spend_min),
+                        "conversions_today": int(conv_today),
+                        "today_cpa": float(today_cpa) if isinstance(today_cpa, (int, float)) else None,
+                        "cpa_3d": float(cpa_3d) if isinstance(cpa_3d, (int, float)) else None,
+                        "target_cpl": float(target_f) if target_f is not None else None,
+                    },
+                    "chat_id": chat_id,
+                },
+            )
+
+            title = f"🤖 Heatmap AUTO_LIMITS: {get_account_name(aid)}"
+            reason = f"Час {hour:02d}:00 ({hour_tag}). Top={','.join([f'{h:02d}' for h in top_hours]) or '-'}; Low={','.join([f'{h:02d}' for h in low_hours]) or '-'}"
+            mode_line = "Режим: AUTO_LIMITS"
+            anti = f"Anti-panic: {antipanic_mode} (data_ok={bool(antipanic_data_ok)} spend_min={float(spend_min):.2f}$ conv_today={int(conv_today)})"
+            cap_lines = [
+                f"Caps: current={float(current_total):.2f}$ baseline={float(base_total_f):.2f}$ cap={float(total_cap):.2f}$",
+                f"CutGuard: used={float(cut_guard['cut_used']):.2f}$ max={float(cut_guard['cut_max']):.2f}$ planned_cut={float(cut_guard['cut_planned']):.2f}$",
+                "Blocked: daily_cut_guard",
+            ]
+            try:
+                await context.bot.send_message(chat_id, "\n".join([title, mode_line, anti, reason] + cap_lines))
+                await asyncio.sleep(0.3)
+            except Exception:
+                pass
+            continue
+
         new_total = float(new_total_before_scale)
         if new_total <= 0:
             continue
@@ -987,6 +1116,17 @@ async def _autopilot_heatmap_job(context: ContextTypes.DEFAULT_TYPE):
                 "low_hours": low_hours,
                 "soft_mode": bool(soft_mode),
                 "aggressive": bool(aggressive),
+                "antipanic": {
+                    "mode": antipanic_mode,
+                    "data_ok": bool(antipanic_data_ok),
+                    "spend_today": float(spend_today),
+                    "spend_min": float(spend_min),
+                    "conversions_today": int(conv_today),
+                    "today_cpa": float(today_cpa) if isinstance(today_cpa, (int, float)) else None,
+                    "cpa_3d": float(cpa_3d) if isinstance(cpa_3d, (int, float)) else None,
+                    "target_cpl": float(target_f) if target_f is not None else None,
+                    "step_eff": float(step_eff),
+                },
                 "blocked": {
                     "risk": bool(blocked_by_risk),
                     "planned": bool(blocked_by_planned),
@@ -1004,6 +1144,7 @@ async def _autopilot_heatmap_job(context: ContextTypes.DEFAULT_TYPE):
                     "scale": float(scale),
                     "new_total_after_scale": float(new_total_after_scale),
                 },
+                "cut_guard": cut_guard,
                 "decision": {"use_hourly": bool(use_hourly), "hourly_meta": hourly_meta},
                 "applied": applied,
                 "chat_id": chat_id,
@@ -1013,7 +1154,7 @@ async def _autopilot_heatmap_job(context: ContextTypes.DEFAULT_TYPE):
         title = f"🤖 Heatmap AUTO_LIMITS: {get_account_name(aid)}"
         reason = f"Час {hour:02d}:00 ({hour_tag}). Top={','.join([f'{h:02d}' for h in top_hours]) or '-'}; Low={','.join([f'{h:02d}' for h in low_hours]) or '-'}"
         mode_line = "Режим: AUTO_LIMITS"
-        anti = "Anti-panic: мягкий режим (без увеличений)" if soft_mode else ("Anti-panic: агрессивнее (CPL > 4× target)" if aggressive else "Anti-panic: стандарт")
+        anti = f"Anti-panic: {antipanic_mode} (data_ok={bool(antipanic_data_ok)} spend_min={float(spend_min):.2f}$ conv_today={int(conv_today)} step={float(step_eff):.1f}%)"
 
         blocked = []
         if blocked_by_risk:
@@ -1022,6 +1163,8 @@ async def _autopilot_heatmap_job(context: ContextTypes.DEFAULT_TYPE):
             blocked.append("planned")
         if soft_mode:
             blocked.append("soft_mode")
+        if aggressive:
+            blocked.append("hard_mode")
         if (not blocked) and force_active:
             blocked.append("force_active")
 
@@ -1030,6 +1173,10 @@ async def _autopilot_heatmap_job(context: ContextTypes.DEFAULT_TYPE):
             f"Plan: daily_limit={(float(daily_limit) if daily_limit is not None else None)} planned_total={(float(planned_total) if planned_total is not None else None)}",
             f"Scale: before={float(new_total_before_scale):.2f}$ scale={float(scale):.3f} after={float(new_total_after_scale):.2f}$",
         ]
+
+        cap_lines.append(
+            f"CutGuard: used={float(cut_guard['cut_used']):.2f}$ max={float(cut_guard['cut_max']):.2f}$ applied={float(cut_guard.get('cut_applied') or 0.0):.2f}$ remaining={float(cut_guard['cut_remaining']):.2f}$"
+        )
 
         if force_active and force_until:
             cap_lines.append(f"Force: active_until={force_until}")
