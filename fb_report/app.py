@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, time
 import calendar
+import re
 
 from telegram import (
     Update,
@@ -3698,8 +3699,10 @@ async def _on_cb_internal(
 
         user_msg = json.dumps(data_for_analysis, ensure_ascii=False)
 
+        content = ""
         try:
             t0 = pytime.monotonic()
+
             ds_resp = await asyncio.wait_for(
                 ask_deepseek(
                     [
@@ -3711,15 +3714,35 @@ async def _on_cb_internal(
                 ),
                 timeout=FOCUS_AI_DEEPSEEK_TIMEOUT_S,
             )
+
+            choice = (ds_resp.get("choices") or [{}])[0]
+            content = (choice.get("message") or {}).get("content") or ""
+            if not content.strip():
+                raise ValueError("empty_deepseek_content")
+
+            try:
+                parsed = json.loads(content)
+            except Exception:
+                cleaned = content.strip()
+                if cleaned.startswith("```"):
+                    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+                    cleaned = re.sub(r"\s*```$", "", cleaned)
+
+                try:
+                    parsed = json.loads(cleaned)
+                except Exception:
+                    lb = cleaned.find("{")
+                    rb = cleaned.rfind("}")
+                    if lb >= 0 and rb > lb:
+                        parsed = json.loads(cleaned[lb : rb + 1])
+                    else:
+                        raise
+
             log.info(
                 "[focus_ai_now] deepseek ok elapsed=%.2fs total=%.2fs",
                 pytime.monotonic() - t0,
                 pytime.monotonic() - t_all,
             )
-
-            choice = (ds_resp.get("choices") or [{}])[0]
-            content = (choice.get("message") or {}).get("content") or ""
-            parsed = json.loads(content)
         except asyncio.TimeoutError:
             log.warning("[focus_ai_now] deepseek timeout total=%.2fs", pytime.monotonic() - t_all)
             parsed = {
@@ -3730,15 +3753,34 @@ async def _on_cb_internal(
                 "suggested_change_percent": 0,
             }
         except Exception as e:
-            log.exception("[focus_ai_now] deepseek error: %s", type(e).__name__)
-            parsed = {
-                "status": "error",
-                "analysis": "Фокус-ИИ временно недоступен. Используй стандартные отчёты по аккаунту.",
-                "reason": f"DeepSeek error: {e}",
-                "recommendation": "keep",
-                "confidence": 0,
-                "suggested_change_percent": 0,
-            }
+            if content.strip():
+                cleaned_txt = sanitize_ai_text(content)
+                parsed = {
+                    "status": "ok",
+                    "report_text": cleaned_txt or content.strip(),
+                    "recommendation": "keep",
+                    "confidence": 0,
+                    "suggested_change_percent": 0,
+                    "objects": [],
+                    "budget_actions": [],
+                    "ads_actions": [],
+                }
+                log.warning(
+                    "[focus_ai_now] deepseek returned non-JSON; used plain text fallback (%s)",
+                    type(e).__name__,
+                )
+            else:
+                log.warning(
+                    "[focus_ai_now] deepseek error: %s", type(e).__name__, exc_info=e
+                )
+                parsed = {
+                    "status": "error",
+                    "analysis": "Фокус-ИИ временно недоступен. Используй стандартные отчёты по аккаунту.",
+                    "reason": f"DeepSeek error: {e}",
+                    "recommendation": "keep",
+                    "confidence": 0,
+                    "suggested_change_percent": 0,
+                }
 
         status = parsed.get("status", "ok")
         report_text = parsed.get("report_text") or ""
