@@ -1160,6 +1160,41 @@ def _autopilot_group_delete(aid: str, gid: str) -> None:
     _autopilot_set(aid, ap)
 
 
+def _autopilot_tracked_group_names(aid: str) -> list[str]:
+    ap = _autopilot_get(aid)
+    groups = ap.get("campaign_groups") or {}
+    if not isinstance(groups, dict):
+        groups = {}
+
+    out = []
+    for gid in _autopilot_active_group_ids(aid):
+        grp = groups.get(str(gid))
+        name = (grp or {}).get("name") if isinstance(grp, dict) else None
+        out.append(str(name or gid))
+    return out
+
+
+def _autopilot_tracked_group_names_human(aid: str) -> str:
+    names = _autopilot_tracked_group_names(aid)
+    if not names:
+        return "—"
+    if len(names) <= 3:
+        return ", ".join(names)
+    return ", ".join(names[:3]) + f" (+{len(names) - 3})"
+
+
+def _autopilot_groups_menu_text(aid: str) -> str:
+    tracked = _autopilot_tracked_group_names_human(aid)
+    extra = (
+        f"\n🤖 Автопилот следит за: {tracked}\n" if tracked != "—" else "\n🤖 Автопилот: слежение выключено\n"
+    )
+    return (
+        f"🏷️ Группы кампаний — {get_account_name(aid)}\n"
+        + extra
+        + "\nВыберите группу или создайте новую:"
+    )
+
+
 def _autopilot_groups_kb(aid: str) -> InlineKeyboardMarkup:
     ap = _autopilot_get(aid)
     groups = ap.get("campaign_groups") or {}
@@ -1400,6 +1435,10 @@ def _autopilot_dashboard_text(aid: str) -> str:
         gname = eff.get("group_name") or eff.get("group_id")
         group_line = f"\nГруппа: {gname}"
 
+    tracked_h = _autopilot_tracked_group_names_human(aid)
+    if tracked_h != "—":
+        group_line += f"\nАвтопилот следит: {tracked_h}"
+
     kpi_map = {
         "total": "Всего (переписки+заявки)",
         "msgs": "Переписки",
@@ -1439,7 +1478,10 @@ def _autopilot_kb(aid: str) -> InlineKeyboardMarkup:
     eff = _autopilot_effective_config(aid)
     gid = eff.get("group_id")
     gname = eff.get("group_name") or gid
+    tracked_cnt = len(_autopilot_active_group_ids(aid))
     grp_label = f"🏷️ Группы кампаний" if not gid else f"🏷️ Группа: {gname}"
+    if tracked_cnt > 0:
+        grp_label += f" (следит: {tracked_cnt})"
 
     rows = [
         [
@@ -2955,7 +2997,7 @@ async def _on_cb_internal(
         aid = data.split("|", 1)[1]
         await safe_edit_message(
             q,
-            f"🏷️ Группы кампаний — {get_account_name(aid)}\n\nВыберите группу или создайте новую:",
+            _autopilot_groups_menu_text(aid),
             reply_markup=_autopilot_groups_kb(aid),
         )
         return
@@ -3055,7 +3097,7 @@ async def _on_cb_internal(
         await q.answer("Группа удалена")
         await safe_edit_message(
             q,
-            f"🏷️ Группы кампаний — {get_account_name(aid)}\n\nВыберите группу или создайте новую:",
+            _autopilot_groups_menu_text(aid),
             reply_markup=_autopilot_groups_kb(aid),
         )
         return
