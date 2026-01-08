@@ -107,6 +107,24 @@ def _migrate_alerts_schema(store: dict) -> dict:
     return store
 
 
+def _migrate_monitoring_schema(store: dict) -> dict:
+    for aid, row in (store or {}).items():
+        if not isinstance(row, dict):
+            continue
+
+        mon = row.get("monitoring") or {}
+        if not isinstance(mon, dict):
+            mon = {}
+
+        if "compare_enabled" not in mon:
+            mon["compare_enabled"] = bool(row.get("enabled", True))
+
+        row["monitoring"] = mon
+        store[aid] = row
+
+    return store
+
+
 def _migrate_autopilot_schema(store: dict) -> dict:
     for aid, row in (store or {}).items():
         if not isinstance(row, dict):
@@ -217,6 +235,7 @@ def load_accounts() -> dict:
     # Мягкая миграция схемы morning_report к полю level
     store = _migrate_morning_report_schema(store)
     store = _migrate_autopilot_schema(store)
+    store = _migrate_monitoring_schema(store)
     return store
 
 

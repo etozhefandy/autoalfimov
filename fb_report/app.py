@@ -141,6 +141,36 @@ def _autopilot_analysis_kb(aid: str) -> InlineKeyboardMarkup:
     )
 
 
+def monitoring_accounts_kb() -> InlineKeyboardMarkup:
+    store = load_accounts()
+    if store:
+        enabled_ids = [aid for aid, row in store.items() if row.get("enabled", True)]
+        disabled_ids = [aid for aid, row in store.items() if not row.get("enabled", True)]
+        ids = enabled_ids + disabled_ids
+    else:
+        from .constants import AD_ACCOUNTS_FALLBACK
+
+        ids = AD_ACCOUNTS_FALLBACK
+
+    rows = []
+    for aid in ids:
+        row = store.get(aid, {}) if store else {}
+        mon = (row.get("monitoring") or {}) if isinstance(row, dict) else {}
+        selected = bool(mon.get("compare_enabled", True)) if isinstance(mon, dict) else True
+        prefix = "✅ " if selected else ""
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"{prefix}{_flag_line(aid)}  {get_account_name(aid)}",
+                    callback_data=f"mon_acc_toggle|{aid}",
+                )
+            ]
+        )
+
+    rows.append([InlineKeyboardButton("⬅️ Мониторинг", callback_data="monitoring_menu")])
+    return InlineKeyboardMarkup(rows)
+
+
 def _autopilot_hm_kb(aid: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
@@ -1216,9 +1246,37 @@ async def _send_comparison_for_all(
 ) -> None:
     store = load_accounts()
     any_sent = False
+    selected = []
     for aid in get_enabled_accounts_in_order():
-        if not store.get(aid, {}).get("enabled", True):
+        row = store.get(aid, {}) or {}
+        if not row.get("enabled", True):
             continue
+        mon = row.get("monitoring") or {}
+        if isinstance(mon, dict) and bool(mon.get("compare_enabled", True)):
+            selected.append(aid)
+
+    logging.getLogger(__name__).info(
+        "[monitoring_compare] selected_accounts=%d chat_id=%s",
+        len(selected),
+        str(chat_id),
+    )
+
+    # Если выбор пустой (все сняты) — ничего не шлём, чтобы не спамить.
+    # Пользователь может включить нужные аккаунты в настройках мониторинга.
+    if not selected:
+        logging.getLogger(__name__).warning(
+            "[monitoring_compare] no accounts selected for comparison"
+        )
+        await ctx.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "⚙️ Мониторинг: не выбраны аккаунты для сравнения. "
+                "Зайди в 'Настройки мониторинга' и включи нужные аккаунты."
+            ),
+        )
+        return
+
+    for aid in selected:
         txt = build_comparison_report(aid, period_old, label_old, period_new, label_new)
         if not txt:
             continue
@@ -4626,9 +4684,33 @@ async def _on_cb_internal(
     if data == "mon_settings":
         await safe_edit_message(
             q,
-            "⚙️ Настройки мониторинга пока в разработке.\n"
-            "Планируется настройка курса USD→KZT и месячных бюджетов по аккаунтам.",
-            reply_markup=monitoring_menu_kb(),
+            "⚙️ Мониторинг — выбери аккаунты для сравнения периодов:\n\n"
+            "✅ — включён\n"
+            "(Если снять со всех — сравнение не будет отправлять отчёты)",
+            reply_markup=monitoring_accounts_kb(),
+        )
+        return
+
+    if data.startswith("mon_acc_toggle|"):
+        aid = data.split("|", 1)[1]
+        st = load_accounts()
+        row = st.get(aid, {}) or {}
+        mon = row.get("monitoring") or {}
+        if not isinstance(mon, dict):
+            mon = {}
+
+        cur = bool(mon.get("compare_enabled", True))
+        mon["compare_enabled"] = not cur
+        row["monitoring"] = mon
+        st[aid] = row
+        save_accounts(st)
+
+        await safe_edit_message(
+            q,
+            "⚙️ Мониторинг — выбери аккаунты для сравнения периодов:\n\n"
+            "✅ — включён\n"
+            "(Если снять со всех — сравнение не будет отправлять отчёты)",
+            reply_markup=monitoring_accounts_kb(),
         )
         return
 
