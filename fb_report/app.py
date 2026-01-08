@@ -764,6 +764,74 @@ async def _autopilot_hourly_job(context: ContextTypes.DEFAULT_TYPE):
                 )
 
 
+async def _autopilot_warmup_job(context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(DEFAULT_REPORT_CHAT)
+    now = datetime.now(ALMATY_TZ)
+    hour = int(now.strftime("%H"))
+    quiet = (hour >= 22) or (hour < 10)
+
+    store = load_accounts() or {}
+    any_lines = []
+    total_groups = 0
+    total_actions = 0
+
+    for aid, row in store.items():
+        if not (row or {}).get("enabled", True):
+            continue
+
+        ap = (row or {}).get("autopilot") or {}
+        if not isinstance(ap, dict):
+            continue
+        mode = str(ap.get("mode") or "OFF").upper()
+        if mode == "OFF":
+            continue
+
+        gids = _autopilot_active_group_ids(aid)
+        if not gids:
+            continue
+
+        acc_name = get_account_name(aid)
+        any_lines.append(f"\n🏢 {acc_name}")
+
+        for gid in gids:
+            total_groups += 1
+            eff = _autopilot_effective_config_for_group(aid, gid)
+            gname = eff.get("group_name") or str(gid)
+
+            try:
+                actions = _ap_generate_actions(aid, eff=eff) or []
+            except Exception:
+                actions = []
+
+            shown = []
+            for act in (actions or [])[:5]:
+                shown.append(_ap_action_text(act))
+            total_actions += len(actions or [])
+
+            if shown:
+                any_lines.append(f"\n🤖 Группа: {gname} — идеи: {len(actions)}")
+                any_lines.append("\n\n---\n\n".join(shown))
+            else:
+                any_lines.append(f"\n🤖 Группа: {gname} — действий нет")
+
+    header = (
+        "🤖 Автопилот — первичный прогон после старта\n"
+        "Это не часовой срез. Ничего не применяю, только подсказываю идеи.\n"
+        f"Активных групп: {total_groups} | Рекомендаций: {total_actions}\n"
+    )
+
+    if total_groups == 0:
+        text = header + "\nСейчас нет активных групп (или автопилот выключен)."
+    else:
+        text = header + "\n" + "\n".join(any_lines).strip()
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        disable_notification=bool(quiet),
+    )
+
+
 def _ap_force_kb(token: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
@@ -7612,6 +7680,12 @@ def build_app() -> Application:
         _autopilot_hourly_job,
         interval=timedelta(hours=1),
         first=timedelta(minutes=10),
+    )
+
+    app.job_queue.run_once(
+        _autopilot_warmup_job,
+        when=timedelta(minutes=10),
+        name="autopilot_warmup",
     )
 
     init_billing_watch(
