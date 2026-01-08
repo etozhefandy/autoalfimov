@@ -420,6 +420,82 @@ def _ap_hourly_agg(stats: dict, *, section: str, aid: str, entity_id: str, now: 
     return {"spend": spend, "total": total, "messages": msgs, "leads": leads, "cpl": cpl}
 
 
+def _ap_select_hourly_good_bad_adsets(
+    stats: dict,
+    *,
+    aid: str,
+    adset_ids: list[str],
+    now: datetime,
+    hour_key: str,
+    target_cpl: float | None,
+    cpa_3d: float | None,
+) -> tuple[set[str], set[str], dict]:
+    rows = []
+    for adset_id in adset_ids:
+        agg = _ap_hourly_agg(
+            stats,
+            section="_adset",
+            aid=aid,
+            entity_id=adset_id,
+            now=now,
+            hour_key=hour_key,
+            days=7,
+        )
+        spend_7d = float((agg or {}).get("spend", 0.0) or 0.0)
+        total_7d = int((agg or {}).get("total", 0) or 0)
+        cpl_7d = (agg or {}).get("cpl")
+
+        if not isinstance(cpl_7d, (int, float)):
+            continue
+        if total_7d < 2 or spend_7d < 5.0:
+            continue
+
+        score = float(cpl_7d)
+        rows.append({"adset_id": adset_id, "cpl_7d": float(cpl_7d), "spend_7d": spend_7d, "total_7d": total_7d, "score": score})
+
+    if len(rows) < 3:
+        return set(), set(), {"used": False, "reason": "insufficient_hourly", "count": len(rows)}
+
+    rows.sort(key=lambda r: r["score"])
+    k = max(1, min(5, int(round(len(rows) * 0.25))))
+
+    good = [r for r in rows[:k]]
+    bad = [r for r in rows[-k:]]
+
+    good_ids = set(r["adset_id"] for r in good)
+    bad_ids = set(r["adset_id"] for r in bad if r["adset_id"] not in good_ids)
+
+    meta = {
+        "used": True,
+        "count": len(rows),
+        "k": k,
+        "good": [{"id": r["adset_id"], "cpl_7d": r["cpl_7d"], "total_7d": r["total_7d"], "spend_7d": r["spend_7d"]} for r in good],
+        "bad": [{"id": r["adset_id"], "cpl_7d": r["cpl_7d"], "total_7d": r["total_7d"], "spend_7d": r["spend_7d"]} for r in bad],
+    }
+
+    if target_cpl is not None and target_cpl > 0:
+        good_ids = set(
+            r["adset_id"]
+            for r in good
+            if float(r["cpl_7d"]) <= float(target_cpl) * 1.20
+        )
+        bad_ids = set(
+            r["adset_id"]
+            for r in bad
+            if float(r["cpl_7d"]) >= float(target_cpl) * 1.50
+        )
+        meta["filtered_by"] = "target"
+    elif cpa_3d is not None and cpa_3d > 0:
+        bad_ids = set(
+            r["adset_id"]
+            for r in bad
+            if float(r["cpl_7d"]) >= float(cpa_3d) * 1.50
+        )
+        meta["filtered_by"] = "cpa_3d"
+
+    return set(good_ids), set(bad_ids), meta
+
+
 def _ap_find_worst_ad_in_hour(stats: dict, *, aid: str, adset_id: str, now: datetime, hour_key: str) -> dict:
     root = (stats or {}).get("_ad") or {}
     a = (root or {}).get(str(aid)) or {}
@@ -620,11 +696,15 @@ async def _autopilot_heatmap_job(context: ContextTypes.DEFAULT_TYPE):
         adsets = fetch_adsets(aid) or []
         adset_name = {}
         active = []
+        active_ids = []
         for a in adsets:
             st = str((a or {}).get("effective_status") or (a or {}).get("status") or "").upper()
             if st in {"ACTIVE", "SCHEDULED"}:
                 active.append(a)
-                adset_name[str((a or {}).get("id") or "")] = str((a or {}).get("name") or "")
+                _id = str((a or {}).get("id") or "")
+                adset_name[_id] = str((a or {}).get("name") or "")
+                if _id:
+                    active_ids.append(_id)
 
         if not active:
             continue
@@ -717,14 +797,48 @@ async def _autopilot_heatmap_job(context: ContextTypes.DEFAULT_TYPE):
             good_ids = set()
             bad_ids = set()
 
+        stats_cache = load_hourly_stats() or {}
+        hour_key = f"{hour:02d}"
+
+        hourly_good: set[str] = set()
+        hourly_bad: set[str] = set()
+        hourly_meta: dict = {"used": False}
+        try:
+            cpa_3d_f = float(cpa_3d) if isinstance(cpa_3d, (int, float)) else None
+        except Exception:
+            cpa_3d_f = None
+
+        if active_ids:
+            hourly_good, hourly_bad, hourly_meta = _ap_select_hourly_good_bad_adsets(
+                stats_cache,
+                aid=str(aid),
+                adset_ids=list(active_ids),
+                now=now,
+                hour_key=hour_key,
+                target_cpl=target_f,
+                cpa_3d=cpa_3d_f,
+            )
+
+        use_hourly = bool(hourly_meta.get("used")) and (is_top or is_low)
+        if use_hourly:
+            good_ids = set(hourly_good)
+            bad_ids = set(hourly_bad)
+
         changes: list[dict] = []
 
         if is_low:
-            factor = 1.0 - float(step_eff) / 100.0
             for a in active:
                 adset_id = str((a or {}).get("id") or "")
                 old_b = float((a or {}).get("daily_budget") or 0.0)
-                new_b = max(1.0, old_b * factor)
+                if use_hourly and adset_id in good_ids:
+                    factor = 1.0 - (float(step_eff) * 0.50) / 100.0
+                elif use_hourly and adset_id in bad_ids:
+                    factor = 1.0 - float(step_eff) / 100.0
+                elif use_hourly:
+                    factor = 1.0 - (float(step_eff) * 0.75) / 100.0
+                else:
+                    factor = 1.0 - float(step_eff) / 100.0
+                new_b = max(1.0, old_b * float(factor))
                 changes.append({"adset_id": adset_id, "old": old_b, "new": new_b})
 
         elif is_top:
@@ -772,6 +886,7 @@ async def _autopilot_heatmap_job(context: ContextTypes.DEFAULT_TYPE):
                     new_b = max(1.0, old_b * factor)
                     changes.append({"adset_id": adset_id, "old": old_b, "new": new_b})
             else:
+                # Ужимаем bad (если есть), увеличиваем good
                 for a in active:
                     adset_id = str((a or {}).get("id") or "")
                     old_b = float((a or {}).get("daily_budget") or 0.0)
@@ -799,9 +914,7 @@ async def _autopilot_heatmap_job(context: ContextTypes.DEFAULT_TYPE):
         new_total_after_scale = sum(c["new"] for c in changes)
 
         applied = []
-        stats_cache = load_hourly_stats() or {}
         date_key = now.strftime("%Y-%m-%d")
-        hour_key = f"{hour:02d}"
         for c in changes:
             adset_id = c["adset_id"]
             old_b = float(c["old"])
@@ -852,6 +965,7 @@ async def _autopilot_heatmap_job(context: ContextTypes.DEFAULT_TYPE):
                     "hm_today": {"spend": today_spend, "total": today_total, "cpl": today_cpl},
                     "hm_7d": hm_7d,
                     "worst_ad": worst_ad,
+                    "decision": {"use_hourly": bool(use_hourly), "hourly_meta": hourly_meta},
                 }
             )
 
@@ -890,6 +1004,7 @@ async def _autopilot_heatmap_job(context: ContextTypes.DEFAULT_TYPE):
                     "scale": float(scale),
                     "new_total_after_scale": float(new_total_after_scale),
                 },
+                "decision": {"use_hourly": bool(use_hourly), "hourly_meta": hourly_meta},
                 "applied": applied,
                 "chat_id": chat_id,
             },
@@ -920,6 +1035,13 @@ async def _autopilot_heatmap_job(context: ContextTypes.DEFAULT_TYPE):
             cap_lines.append(f"Force: active_until={force_until}")
         if blocked:
             cap_lines.append(f"Blocked: {', '.join(blocked)}")
+
+        if use_hourly:
+            cap_lines.append(
+                f"Decision: hourly_adset used (k={hourly_meta.get('k')}, rows={hourly_meta.get('count')})"
+            )
+        else:
+            cap_lines.append("Decision: fallback (today vs 3d)")
 
         lines = [title, mode_line, anti, reason]
         lines.extend(cap_lines)
