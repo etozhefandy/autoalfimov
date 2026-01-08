@@ -3783,6 +3783,35 @@ async def _on_cb_internal(
                                 .replace(r"\\\\", "\\")
                             )
 
+            # Если JSON-режим не дал ничего (часто при сетевом обрыве), пробуем короткий текстовый режим.
+            if not extracted_report_text.strip() and not content.strip():
+                system_msg_text = (
+                    "Ты — продвинутый аналитик по Facebook Ads (Фокус-ИИ). "
+                    "Отвечай ТОЛЬКО на русском языке. "
+                    "Сделай короткий отчёт, который читается сканированием (10–18 строк). "
+                    "Без JSON, без фигурных скобок, без кода. "
+                    "В конце — 3–5 строк итог + 1–2 конкретных действия."
+                )
+                try:
+                    ds_txt = await asyncio.wait_for(
+                        ask_deepseek(
+                            [
+                                {"role": "system", "content": system_msg_text},
+                                {"role": "user", "content": user_msg},
+                            ],
+                            json_mode=False,
+                            andrey_tone=True,
+                            temperature=0.4,
+                            max_tokens=500,
+                        ),
+                        timeout=FOCUS_AI_DEEPSEEK_TIMEOUT_S,
+                    )
+                    ch = (ds_txt.get("choices") or [{}])[0]
+                    txt = (ch.get("message") or {}).get("content") or ""
+                    extracted_report_text = sanitize_ai_text(txt)
+                except Exception:
+                    extracted_report_text = ""
+
             if extracted_report_text.strip():
                 parsed = {
                     "status": "ok",
@@ -3799,9 +3828,12 @@ async def _on_cb_internal(
                     type(e).__name__,
                 )
             else:
-                log.warning(
-                    "[focus_ai_now] deepseek error: %s", type(e).__name__, exc_info=e
-                )
+                if isinstance(e, ValueError) and str(e) == "empty_deepseek_content":
+                    log.warning("[focus_ai_now] deepseek empty content")
+                else:
+                    log.warning(
+                        "[focus_ai_now] deepseek error: %s", type(e).__name__, exc_info=e
+                    )
                 parsed = {
                     "status": "error",
                     "analysis": "Фокус-ИИ временно недоступен. Попробуй ещё раз чуть позже.",

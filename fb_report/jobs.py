@@ -75,7 +75,14 @@ except Exception:  # noqa: BLE001
     def analyze_ads(_aid: str, days: int = 7, period=None):  # type: ignore[override]
         return []
 
-    async def ask_deepseek(_messages, json_mode: bool = False, *, andrey_tone: bool = False):  # type: ignore[override]
+    async def ask_deepseek(
+        _messages,
+        json_mode: bool = False,
+        *,
+        andrey_tone: bool = False,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ):  # type: ignore[override]
         raise RuntimeError("DeepSeek is not available in this environment")
 
     def fetch_adsets(_aid: str):  # type: ignore[override]

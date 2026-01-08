@@ -300,6 +300,8 @@ async def ask_deepseek(
     json_mode: bool = False,
     *,
     andrey_tone: bool = False,
+    temperature: float | None = None,
+    max_tokens: int | None = None,
 ) -> Dict[str, Any]:
     """Асинхронная обёртка вокруг DeepSeek Chat Completions (thinking-mode).
 
@@ -320,11 +322,14 @@ async def ask_deepseek(
 
     msg_out = _prepend_andrey_tone(messages) if andrey_tone else (messages or [])
 
+    payload_temperature = temperature if temperature is not None else (0.2 if json_mode else 0.4)
+    payload_max_tokens = max_tokens if max_tokens is not None else (1100 if json_mode else 512)
+
     payload: Dict[str, Any] = {
         "model": DEEPSEEK_MODEL_JSON if json_mode else DEEPSEEK_MODEL_FAST,
         "messages": msg_out,
-        "temperature": 0.2 if json_mode else 0.4,
-        "max_tokens": 1100 if json_mode else 512,
+        "temperature": payload_temperature,
+        "max_tokens": payload_max_tokens,
     }
 
     if json_mode:
@@ -333,7 +338,8 @@ async def ask_deepseek(
     def _do_request() -> Dict[str, Any]:
         last_err: Exception | None = None
         quick_retry_used = False
-        for attempt in range(DEEPSEEK_RETRIES):
+        attempt = 0
+        while attempt < DEEPSEEK_RETRIES:
             t0 = time.time()
             try:
                 raw = json.dumps(payload, ensure_ascii=False)
@@ -393,8 +399,9 @@ async def ask_deepseek(
                     time.sleep(random.uniform(0.8, 1.5))
                     continue
 
-                if attempt < DEEPSEEK_RETRIES - 1:
-                    time.sleep(DEEPSEEK_BACKOFF_S * (attempt + 1))
+                attempt += 1
+                if attempt < DEEPSEEK_RETRIES:
+                    time.sleep(DEEPSEEK_BACKOFF_S * attempt)
 
         print("[ai_focus] ask_deepseek failed; returning empty result to avoid crashing bot")
         return {"choices": [{"message": {"content": ""}}], "error": str(last_err)}
