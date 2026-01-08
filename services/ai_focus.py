@@ -3,6 +3,7 @@ import asyncio
 import json
 import time
 import re
+import random
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -102,7 +103,7 @@ DEEPSEEK_MODEL_JSON = os.getenv("DEEPSEEK_MODEL_JSON", DEEPSEEK_MODEL_FAST)
 
 # Таймауты и ретраи (чтобы не висеть и не ронять бота)
 DEEPSEEK_CONNECT_TIMEOUT = float(os.getenv("DEEPSEEK_CONNECT_TIMEOUT", "10"))
-DEEPSEEK_READ_TIMEOUT = float(os.getenv("DEEPSEEK_READ_TIMEOUT", "120"))
+DEEPSEEK_READ_TIMEOUT = max(float(os.getenv("DEEPSEEK_READ_TIMEOUT", "60")), 60.0)
 DEEPSEEK_RETRIES = int(os.getenv("DEEPSEEK_RETRIES", "2"))
 DEEPSEEK_BACKOFF_S = float(os.getenv("DEEPSEEK_BACKOFF_S", "2.0"))
 
@@ -323,7 +324,7 @@ async def ask_deepseek(
         "model": DEEPSEEK_MODEL_JSON if json_mode else DEEPSEEK_MODEL_FAST,
         "messages": msg_out,
         "temperature": 0.2 if json_mode else 0.4,
-        "max_tokens": 800 if json_mode else 512,
+        "max_tokens": 1100 if json_mode else 512,
     }
 
     if json_mode:
@@ -331,6 +332,7 @@ async def ask_deepseek(
 
     def _do_request() -> Dict[str, Any]:
         last_err: Exception | None = None
+        quick_retry_used = False
         for attempt in range(DEEPSEEK_RETRIES):
             t0 = time.time()
             try:
@@ -377,6 +379,20 @@ async def ask_deepseek(
                     "attempt=",
                     attempt + 1,
                 )
+
+                is_net_err = isinstance(
+                    e,
+                    (
+                        requests.exceptions.ChunkedEncodingError,
+                        requests.exceptions.ReadTimeout,
+                        requests.exceptions.ConnectionError,
+                    ),
+                )
+                if is_net_err and not quick_retry_used:
+                    quick_retry_used = True
+                    time.sleep(random.uniform(0.8, 1.5))
+                    continue
+
                 if attempt < DEEPSEEK_RETRIES - 1:
                     time.sleep(DEEPSEEK_BACKOFF_S * (attempt + 1))
 

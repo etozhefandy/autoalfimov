@@ -3700,6 +3700,7 @@ async def _on_cb_internal(
         user_msg = json.dumps(data_for_analysis, ensure_ascii=False)
 
         content = ""
+        json_ok = False
         try:
             t0 = pytime.monotonic()
 
@@ -3738,6 +3739,8 @@ async def _on_cb_internal(
                     else:
                         raise
 
+            json_ok = True
+
             log.info(
                 "[focus_ai_now] deepseek ok elapsed=%.2fs total=%.2fs",
                 pytime.monotonic() - t0,
@@ -3753,11 +3756,37 @@ async def _on_cb_internal(
                 "suggested_change_percent": 0,
             }
         except Exception as e:
+            extracted_report_text = ""
             if content.strip():
-                cleaned_txt = sanitize_ai_text(content)
+                cleaned = content.strip()
+                if cleaned.startswith("```"):
+                    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+                    cleaned = re.sub(r"\s*```$", "", cleaned)
+
+                m = re.search(
+                    r"\"report_text\"\s*:\s*\"((?:\\.|[^\"\\])*)\"",
+                    cleaned,
+                    flags=re.DOTALL,
+                )
+                if m:
+                    raw_val = m.group(1)
+                    try:
+                        extracted_report_text = json.loads('"' + raw_val + '"')
+                    except Exception:
+                        try:
+                            extracted_report_text = bytes(raw_val, "utf-8").decode("unicode_escape")
+                        except Exception:
+                            extracted_report_text = (
+                                raw_val.replace(r"\\n", "\n")
+                                .replace(r"\\t", "\t")
+                                .replace(r"\\\"", '"')
+                                .replace(r"\\\\", "\\")
+                            )
+
+            if extracted_report_text.strip():
                 parsed = {
                     "status": "ok",
-                    "report_text": cleaned_txt or content.strip(),
+                    "report_text": extracted_report_text,
                     "recommendation": "keep",
                     "confidence": 0,
                     "suggested_change_percent": 0,
@@ -3766,7 +3795,7 @@ async def _on_cb_internal(
                     "ads_actions": [],
                 }
                 log.warning(
-                    "[focus_ai_now] deepseek returned non-JSON; used plain text fallback (%s)",
+                    "[focus_ai_now] deepseek returned broken JSON; extracted report_text fallback (%s)",
                     type(e).__name__,
                 )
             else:
@@ -3775,7 +3804,7 @@ async def _on_cb_internal(
                 )
                 parsed = {
                     "status": "error",
-                    "analysis": "Фокус-ИИ временно недоступен. Используй стандартные отчёты по аккаунту.",
+                    "analysis": "Фокус-ИИ временно недоступен. Попробуй ещё раз чуть позже.",
                     "reason": f"DeepSeek error: {e}",
                     "recommendation": "keep",
                     "confidence": 0,
@@ -3822,16 +3851,22 @@ async def _on_cb_internal(
             if not report_text:
                 report_text = "Фокус-ИИ вернул пустой отчёт. Попробуй повторить запрос позже."
             cleaned = sanitize_ai_text(report_text)
+            if cleaned.lstrip().startswith("{"):
+                cleaned = "Фокус-ИИ вернул некорректный формат ответа. Попробуй повторить запрос позже."
             if not cleaned:
                 cleaned = "Фокус-ИИ вернул пустой отчёт. Попробуй повторить запрос позже."
             text_out = "\n".join(header_lines) + cleaned.strip()
 
         # Мы находимся внутри callback-хэндлера, поэтому update.message == None.
         # Отправляем ответ через bot.send_message в текущий чат.
+        reply_markup = None
+        if json_ok:
+            reply_markup = focus_ai_recommendation_kb(level, rec, float(delta), objects)
+
         await context.bot.send_message(
             chat_id,
             text_out,
-            reply_markup=focus_ai_recommendation_kb(level, rec, float(delta), objects),
+            reply_markup=reply_markup,
         )
 
         # ====== Управляемые действия (кнопки) ======
