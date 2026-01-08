@@ -158,6 +158,9 @@ def _migrate_autopilot_schema(store: dict) -> dict:
         limits.setdefault("allow_reenable_ads", False)
         ap["limits"] = limits
 
+        ap.setdefault("campaign_groups", {})
+        ap.setdefault("active_group_id", None)
+
         row["autopilot"] = ap
         store[aid] = row
 

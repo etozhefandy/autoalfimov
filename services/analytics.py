@@ -165,7 +165,12 @@ def to_float(v: Any) -> float:
 # 🔥 ПАРСИНГ INSIGHT → нормальные метрики
 # ============================================================
 
-def parse_insight(ins: Dict[str, Any], *, aid: Optional[str] = None) -> Dict[str, Any]:
+def parse_insight(
+    ins: Dict[str, Any],
+    *,
+    aid: Optional[str] = None,
+    lead_action_type: Optional[str] = None,
+) -> Dict[str, Any]:
     """
     Превращает insight-словарь в нормальные метрики в одном месте.
     """
@@ -210,7 +215,11 @@ def parse_insight(ins: Dict[str, Any], *, aid: Optional[str] = None) -> Dict[str
         if t == "onsite_conversion.messaging_conversation_started_7d":
             msgs += int(v)
 
-    leads = count_leads_from_actions(actions_map, aid=aid)
+    leads = count_leads_from_actions(
+        actions_map,
+        aid=aid,
+        lead_action_type=lead_action_type,
+    )
 
     if os.getenv("FB_ACTIONS_DEBUG") == "1":
         log = logging.getLogger(__name__)
@@ -222,7 +231,12 @@ def parse_insight(ins: Dict[str, Any], *, aid: Optional[str] = None) -> Dict[str
     msg_count = int(actions_map.get(msg_action, 0) or 0)
     msg_cpa = costs_map.get(msg_action)
 
-    leads_count_total, leads_cost_total = lead_cost_and_count(actions_map, costs_map, aid=aid)
+    leads_count_total, leads_cost_total = lead_cost_and_count(
+        actions_map,
+        costs_map,
+        aid=aid,
+        lead_action_type=lead_action_type,
+    )
     lead_cpa = (leads_cost_total / float(leads_count_total)) if leads_count_total > 0 and leads_cost_total > 0 else None
 
     total = msgs + leads
@@ -286,6 +300,7 @@ def analyze_account(
     aid: str,
     days: int = 7,
     period: Optional[Dict[str, str]] = None,
+    lead_action_type: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Анализ аккаунта за последние X дней.
@@ -303,7 +318,7 @@ def analyze_account(
     if not ins:
         return {"aid": aid, "metrics": None}
 
-    parsed = parse_insight(ins, aid=aid)
+    parsed = parse_insight(ins, aid=aid, lead_action_type=lead_action_type)
     return {
         "aid": aid,
         "metrics": parsed,
@@ -315,6 +330,7 @@ def analyze_adsets(
     aid: str,
     days: int = 7,
     period: Optional[Dict[str, str]] = None,
+    lead_action_type: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     Аналитика адсетов:
@@ -340,12 +356,13 @@ def analyze_adsets(
         # NB: insights по adset делаются через account.get_insights(level='adset')
         ins = fetch_insights_by_level(aid, adset_id, period, level="adset")
 
-        parsed = parse_insight(ins or {}, aid=aid)
+        parsed = parse_insight(ins or {}, aid=aid, lead_action_type=lead_action_type)
         # Пропускаем адсеты с нулевым spend, чтобы не засорять отчёты
         if (parsed.get("spend") or 0.0) <= 0:
             continue
         parsed["adset_id"] = adset_id
         parsed["name"] = adset["name"]
+        parsed["campaign_id"] = adset.get("campaign_id")
         parsed["daily_budget"] = adset["daily_budget"]
         parsed["status"] = adset.get("status")
         parsed["effective_status"] = adset.get("effective_status")
@@ -365,6 +382,7 @@ def analyze_campaigns(
     aid: str,
     days: int = 7,
     period: Optional[Dict[str, str]] = None,
+    lead_action_type: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Аналитика кампаний за последние days дней.
 
@@ -388,7 +406,7 @@ def analyze_campaigns(
             continue
 
         ins = fetch_insights_by_level(aid, cid, period, level="campaign")
-        parsed = parse_insight(ins or {}, aid=aid)
+        parsed = parse_insight(ins or {}, aid=aid, lead_action_type=lead_action_type)
         # Пропускаем кампании с нулевым spend
         if (parsed.get("spend") or 0.0) <= 0:
             continue
@@ -408,6 +426,7 @@ def analyze_ads(
     aid: str,
     days: int = 7,
     period: Optional[Dict[str, str]] = None,
+    lead_action_type: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     Аналитика объявлений:
@@ -431,7 +450,7 @@ def analyze_ads(
 
         ins = fetch_insights_by_level(aid, ad_id, period, level="ad")
 
-        parsed = parse_insight(ins or {}, aid=aid)
+        parsed = parse_insight(ins or {}, aid=aid, lead_action_type=lead_action_type)
         parsed["ad_id"] = ad_id
         parsed["name"] = ad["name"]
         parsed["status"] = ad.get("status")

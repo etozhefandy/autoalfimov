@@ -133,7 +133,7 @@ def _autopilot_analysis_kb(aid: str) -> InlineKeyboardMarkup:
         [
             [InlineKeyboardButton("🔄 Обновить", callback_data=f"ap_analyze|{aid}")],
             [InlineKeyboardButton("🛠 Предложить действия", callback_data=f"ap_suggest|{aid}")],
-            [InlineKeyboardButton("🕒 Часы (heatmap)", callback_data=f"ap_hm|{aid}")],
+            [InlineKeyboardButton("🕒 Часы (тепловая карта)", callback_data=f"ap_hm|{aid}")],
             [InlineKeyboardButton("⬅️ Назад", callback_data=f"autopilot_acc|{aid}")],
             [InlineKeyboardButton("⬅️ К аккаунтам", callback_data="autopilot_menu")],
             [InlineKeyboardButton("⬅️ В меню", callback_data="menu")],
@@ -285,7 +285,7 @@ def _ap_action_text(action: dict) -> str:
 
     lines = [f"🧭 Автопилат: действие для adset", f"{name}", f"ID: {action.get('adset_id')}", ""]
     lines.append(f"Сегодня: spend {_fmt_money(sp_t)} | leads {_fmt_int(ld_t)} | CPL {_fmt_money(cpl_t)}")
-    lines.append(f"Rolling 3d: CPL {_fmt_money(cpl_3)}")
+    lines.append(f"Последние 3 дня: CPL {_fmt_money(cpl_3)}")
     lines.append("")
 
     if kind == "budget_pct":
@@ -315,6 +315,15 @@ def _ap_action_text(action: dict) -> str:
 def _ap_generate_actions(aid: str) -> list[dict]:
     ap = _autopilot_get(aid)
     mode = str(ap.get("mode") or "OFF").upper()
+    eff = _autopilot_effective_config(aid)
+    lead_action_type = eff.get("lead_action_type")
+    kpi_mode = str(eff.get("kpi") or "total")
+    group_campaign_ids = eff.get("campaign_ids")
+    group_campaign_set = set(str(x) for x in (group_campaign_ids or []) if x)
+
+    if eff.get("group_id") and not group_campaign_set:
+        return []
+
     limits = ap.get("limits") or {}
 
     try:
@@ -337,22 +346,25 @@ def _ap_generate_actions(aid: str) -> list[dict]:
     }
 
     try:
-        today_rows = analyze_adsets(aid, period="today") or []
+        today_rows = analyze_adsets(aid, period="today", lead_action_type=lead_action_type) or []
     except Exception:
         today_rows = []
 
     try:
-        d3_rows = analyze_adsets(aid, period=period_3d) or []
+        d3_rows = analyze_adsets(aid, period=period_3d, lead_action_type=lead_action_type) or []
     except Exception:
         d3_rows = []
 
     try:
-        today_ads = analyze_ads(aid, period="today") or []
+        today_ads = analyze_ads(aid, period="today", lead_action_type=lead_action_type) or []
     except Exception:
         today_ads = []
 
     ads_by_adset: dict[str, list[dict]] = {}
     for a in (today_ads or []):
+        if group_campaign_set:
+            if str((a or {}).get("campaign_id") or "") not in group_campaign_set:
+                continue
         adset_id = str((a or {}).get("adset_id") or "")
         if not adset_id:
             continue
@@ -363,12 +375,13 @@ def _ap_generate_actions(aid: str) -> list[dict]:
             continue
         ads_by_adset.setdefault(adset_id, []).append(a)
 
-    def _allowed_row(r: dict) -> bool:
-        st = str((r or {}).get("effective_status") or (r or {}).get("status") or "").upper()
-        return st in {"ACTIVE", "SCHEDULED"}
+    def _in_group(r: dict) -> bool:
+        if not group_campaign_set:
+            return True
+        return str((r or {}).get("campaign_id") or "") in group_campaign_set
 
-    today_map = {str(r.get("adset_id")): r for r in (today_rows or []) if r.get("adset_id") and _allowed_row(r)}
-    d3_map = {str(r.get("adset_id")): r for r in (d3_rows or []) if r.get("adset_id") and _allowed_row(r)}
+    today_map = {str(r.get("adset_id")): r for r in (today_rows or []) if r.get("adset_id") and _allowed_row(r) and _in_group(r)}
+    d3_map = {str(r.get("adset_id")): r for r in (d3_rows or []) if r.get("adset_id") and _allowed_row(r) and _in_group(r)}
 
     def _to_float(v):
         try:
@@ -389,7 +402,14 @@ def _ap_generate_actions(aid: str) -> list[dict]:
             return 0.0
         return float(spend) / float(leads)
 
-    target_cpl = (ap.get("goals") or {}).get("target_cpl")
+    def _kpi_count(row: dict) -> int:
+        if kpi_mode == "msgs":
+            return _to_int((row or {}).get("msgs"))
+        if kpi_mode == "leads":
+            return _to_int((row or {}).get("leads"))
+        return _to_int((row or {}).get("total"))
+
+    target_cpl = (eff.get("goals") or {}).get("target_cpl")
     try:
         target_cpl_f = float(target_cpl) if target_cpl not in (None, "") else None
     except Exception:
@@ -405,11 +425,11 @@ def _ap_generate_actions(aid: str) -> list[dict]:
         name = t.get("name") or d.get("name") or k
 
         sp_t = _to_float(t.get("spend"))
-        ld_t = _to_int(t.get("leads"))
+        ld_t = _kpi_count(t)
         cpl_t = _cpl(sp_t, ld_t)
 
         sp_3 = _to_float(d.get("spend"))
-        ld_3 = _to_int(d.get("leads"))
+        ld_3 = _kpi_count(d)
         cpl_3 = _cpl(sp_3, ld_3)
 
         if sp_t <= 0:
@@ -658,13 +678,19 @@ def _autopilot_analysis_text(aid: str) -> str:
         "until": yday.strftime("%Y-%m-%d"),
     }
 
+    eff = _autopilot_effective_config(aid)
+    lead_action_type = eff.get("lead_action_type")
+    kpi_mode = str(eff.get("kpi") or "total")
+    group_campaign_ids = eff.get("campaign_ids")
+    group_campaign_set = set(str(x) for x in (group_campaign_ids or []) if x)
+
     try:
-        today_rows = analyze_adsets(aid, period="today") or []
+        today_rows = analyze_adsets(aid, period="today", lead_action_type=lead_action_type) or []
     except Exception:
         today_rows = []
 
     try:
-        d3_rows = analyze_adsets(aid, period=period_3d) or []
+        d3_rows = analyze_adsets(aid, period=period_3d, lead_action_type=lead_action_type) or []
     except Exception:
         d3_rows = []
 
@@ -672,11 +698,15 @@ def _autopilot_analysis_text(aid: str) -> str:
         st = str((r or {}).get("effective_status") or (r or {}).get("status") or "").upper()
         return st in {"ACTIVE", "SCHEDULED"}
 
-    today_map = {str(r.get("adset_id")): r for r in (today_rows or []) if r.get("adset_id") and _allowed_row(r)}
-    d3_map = {str(r.get("adset_id")): r for r in (d3_rows or []) if r.get("adset_id") and _allowed_row(r)}
+    def _in_group(r: dict) -> bool:
+        if not group_campaign_set:
+            return True
+        return str((r or {}).get("campaign_id") or "") in group_campaign_set
 
-    ap = _autopilot_get(aid)
-    goals = ap.get("goals") or {}
+    today_map = {str(r.get("adset_id")): r for r in (today_rows or []) if r.get("adset_id") and _allowed_row(r) and _in_group(r)}
+    d3_map = {str(r.get("adset_id")): r for r in (d3_rows or []) if r.get("adset_id") and _allowed_row(r) and _in_group(r)}
+
+    goals = (eff.get("goals") or {}) if isinstance(eff.get("goals"), dict) else {}
     target_cpl = goals.get("target_cpl")
     try:
         target_cpl_f = float(target_cpl) if target_cpl not in (None, "") else None
@@ -742,11 +772,11 @@ def _autopilot_analysis_text(aid: str) -> str:
         name = t.get("name") or d.get("name") or k
 
         sp_t = _to_float(t.get("spend"))
-        ld_t = _to_int(t.get("leads"))
+        ld_t = _kpi_count(t)
         cpl_t = _cpl(sp_t, ld_t)
 
         sp_3 = _to_float(d.get("spend"))
-        ld_3 = _to_int(d.get("leads"))
+        ld_3 = _kpi_count(d)
         cpl_3 = _cpl(sp_3, ld_3)
 
         emoji = _status(sp_t, ld_t, cpl_t, cpl_3)
@@ -774,11 +804,16 @@ def _autopilot_analysis_text(aid: str) -> str:
     sum_ld_3 = sum(int(x.get("ld_3") or 0) for x in merged)
     sum_cpl_3 = _cpl(sum_sp_3, sum_ld_3)
 
+    scope_line = ""
+    if eff.get("group_id"):
+        gname = eff.get("group_name") or eff.get("group_id")
+        scope_line = f" (группа: {gname})"
+
     lines = [
-        f"📊 Автопилат — анализ adset: {get_account_name(aid)}",
+        f"📊 Автопилат — анализ adset: {get_account_name(aid)}" + scope_line,
         "",
         f"Сегодня: spend {_fmt_money(sum_sp_t)} | leads {sum_ld_t} | CPL {_fmt_money(sum_cpl_t)}",
-        f"Rolling 3d (до вчера): spend {_fmt_money(sum_sp_3)} | leads {sum_ld_3} | CPL {_fmt_money(sum_cpl_3)}",
+        f"Последние 3 дня (до вчера): spend {_fmt_money(sum_sp_3)} | leads {sum_ld_3} | CPL {_fmt_money(sum_cpl_3)}",
     ]
     if target_cpl_f is not None:
         lines.append(f"Целевой CPL: {_fmt_money(target_cpl_f)}")
@@ -864,6 +899,56 @@ def _autopilot_get(aid: str) -> dict:
     return ap if isinstance(ap, dict) else {}
 
 
+def _autopilot_active_group(aid: str) -> tuple[str | None, dict | None]:
+    ap = _autopilot_get(aid)
+    gid = ap.get("active_group_id")
+    if not gid:
+        return None, None
+    groups = ap.get("campaign_groups") or {}
+    if not isinstance(groups, dict):
+        return None, None
+    grp = groups.get(str(gid))
+    return (str(gid), grp) if isinstance(grp, dict) else (None, None)
+
+
+def _autopilot_effective_config(aid: str) -> dict:
+    ap = _autopilot_get(aid)
+    gid, grp = _autopilot_active_group(aid)
+
+    out = {
+        "group_id": gid,
+        "group_name": None,
+        "campaign_ids": None,
+        "kpi": None,
+        "lead_action_type": None,
+        "goals": ap.get("goals") or {},
+    }
+
+    if gid and isinstance(grp, dict):
+        out["group_name"] = grp.get("name")
+        cids = grp.get("campaign_ids")
+        out["campaign_ids"] = [str(x) for x in (cids or []) if x]
+        out["kpi"] = str(grp.get("kpi") or "total")
+
+        g_goals = grp.get("goals")
+        if isinstance(g_goals, dict):
+            out["goals"] = g_goals
+
+        lm = grp.get("lead_metric")
+        if isinstance(lm, dict):
+            out["lead_action_type"] = lm.get("action_type")
+        elif isinstance(lm, str):
+            out["lead_action_type"] = lm
+
+    if not out.get("kpi"):
+        out["kpi"] = "total"
+
+    goals = out.get("goals")
+    out["goals"] = goals if isinstance(goals, dict) else {}
+    out["lead_action_type"] = (str(out.get("lead_action_type") or "").strip() or None)
+    return out
+
+
 def _autopilot_set(aid: str, patch: dict) -> None:
     aid = str(aid)
     st = load_accounts()
@@ -876,6 +961,170 @@ def _autopilot_set(aid: str, patch: dict) -> None:
     row["autopilot"] = ap
     st[aid] = row
     save_accounts(st)
+
+
+def _autopilot_group_get(aid: str, gid: str) -> dict:
+    ap = _autopilot_get(aid)
+    groups = ap.get("campaign_groups") or {}
+    if not isinstance(groups, dict):
+        return {}
+    grp = groups.get(str(gid))
+    return grp if isinstance(grp, dict) else {}
+
+
+def _autopilot_group_set(aid: str, gid: str, grp: dict) -> None:
+    ap = _autopilot_get(aid)
+    groups = ap.get("campaign_groups") or {}
+    if not isinstance(groups, dict):
+        groups = {}
+    groups[str(gid)] = grp
+    ap["campaign_groups"] = groups
+    _autopilot_set(aid, ap)
+
+
+def _autopilot_group_delete(aid: str, gid: str) -> None:
+    ap = _autopilot_get(aid)
+    groups = ap.get("campaign_groups") or {}
+    if not isinstance(groups, dict):
+        groups = {}
+    groups.pop(str(gid), None)
+    ap["campaign_groups"] = groups
+    if str(ap.get("active_group_id") or "") == str(gid):
+        ap["active_group_id"] = None
+    _autopilot_set(aid, ap)
+
+
+def _autopilot_groups_kb(aid: str) -> InlineKeyboardMarkup:
+    ap = _autopilot_get(aid)
+    groups = ap.get("campaign_groups") or {}
+    if not isinstance(groups, dict):
+        groups = {}
+    active = str(ap.get("active_group_id") or "").strip()
+
+    rows = []
+    for gid, grp in groups.items():
+        name = (grp or {}).get("name") if isinstance(grp, dict) else None
+        label = str(name or gid)
+        prefix = "✅ " if active and str(gid) == str(active) else ""
+        rows.append(
+            [InlineKeyboardButton(prefix + label, callback_data=f"ap_group_open|{aid}|{gid}")]
+        )
+
+    rows.append([InlineKeyboardButton("➕ Создать группу", callback_data=f"ap_group_create|{aid}")])
+    if active:
+        rows.append([InlineKeyboardButton("🚫 Отключить группу", callback_data=f"ap_group_off|{aid}")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"autopilot_acc|{aid}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _autopilot_group_menu_text(aid: str, gid: str) -> str:
+    grp = _autopilot_group_get(aid, gid)
+    name = grp.get("name") or gid
+    kpi_map = {"total": "Всего (переписки+заявки)", "msgs": "Переписки", "leads": "Заявки"}
+    kpi = kpi_map.get(str(grp.get("kpi") or "total"), str(grp.get("kpi") or "total"))
+    cids = grp.get("campaign_ids") or []
+    try:
+        cnt = len(list(cids))
+    except Exception:
+        cnt = 0
+
+    lm = grp.get("lead_metric")
+    if isinstance(lm, dict):
+        lm_label = lm.get("label") or lm.get("action_type")
+    else:
+        lm_label = None
+
+    goals = grp.get("goals") or {}
+    if not isinstance(goals, dict):
+        goals = {}
+
+    def _fmt_money(v):
+        try:
+            vv = float(v)
+        except Exception:
+            return "—"
+        return f"{vv:.2f} $"
+
+    def _fmt_int(v):
+        try:
+            return str(int(float(v)))
+        except Exception:
+            return "—"
+
+    lines = [
+        f"🏷️ Группа: {name}",
+        f"KPI: {kpi}",
+        f"Кампаний в группе: {cnt}",
+        f"Метрика заявок: {lm_label or 'стандартная (по аккаунту)'}",
+        "",
+        "🎯 Цели группы:",
+        f"• Лиды: {_fmt_int(goals.get('leads'))}",
+        f"• Целевой CPL: {_fmt_money(goals.get('target_cpl'))}",
+        f"• Плановый бюджет: {_fmt_money(goals.get('planned_budget'))}",
+        f"• Период: {str(goals.get('period') or 'day')}",
+    ]
+    return "\n".join(lines)
+
+
+def _autopilot_group_kb(aid: str, gid: str) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("✅ Сделать активной", callback_data=f"ap_group_select|{aid}|{gid}")],
+        [InlineKeyboardButton("📌 Кампании", callback_data=f"ap_group_campaigns|{aid}|{gid}")],
+        [InlineKeyboardButton("📊 KPI группы", callback_data=f"ap_group_kpi|{aid}|{gid}")],
+        [InlineKeyboardButton("📊 Метрика заявок", callback_data=f"ap_group_leadmetric|{aid}|{gid}")],
+        [InlineKeyboardButton("🗑 Удалить группу", callback_data=f"ap_group_delete|{aid}|{gid}")],
+        [InlineKeyboardButton("⬅️ К группам", callback_data=f"ap_groups|{aid}")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def _autopilot_group_kpi_kb(aid: str, gid: str) -> InlineKeyboardMarkup:
+    grp = _autopilot_group_get(aid, gid)
+    cur = str(grp.get("kpi") or "total")
+    def b(code: str, label: str) -> InlineKeyboardButton:
+        prefix = "✅ " if cur == code else ""
+        return InlineKeyboardButton(prefix + label, callback_data=f"ap_group_kpi_set|{aid}|{gid}|{code}")
+    rows = [
+        [b("total", "Всего (переписки+заявки)")],
+        [b("msgs", "Переписки")],
+        [b("leads", "Заявки")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data=f"ap_group_open|{aid}|{gid}")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def _autopilot_group_campaigns_kb(aid: str, gid: str) -> InlineKeyboardMarkup:
+    grp = _autopilot_group_get(aid, gid)
+    selected = set(str(x) for x in (grp.get("campaign_ids") or []) if x)
+    try:
+        fb_campaigns = fetch_campaigns(aid) or []
+    except Exception:
+        fb_campaigns = []
+
+    active_first = []
+    inactive = []
+    for c in fb_campaigns:
+        cid = str((c or {}).get("id") or "")
+        if not cid:
+            continue
+        st = str((c or {}).get("effective_status") or (c or {}).get("status") or "").upper()
+        item = (cid, (c or {}).get("name") or cid, st)
+        if st in {"ACTIVE", "SCHEDULED"}:
+            active_first.append(item)
+        else:
+            inactive.append(item)
+
+    ids = active_first + inactive
+
+    rows = []
+    for cid, name, _st in ids:
+        prefix = "✅ " if cid in selected else ""
+        rows.append(
+            [InlineKeyboardButton(prefix + str(name), callback_data=f"ap_group_camp_toggle|{aid}|{gid}|{cid}")]
+        )
+
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"ap_group_open|{aid}|{gid}")])
+    return InlineKeyboardMarkup(rows)
 
 
 def _autopilot_human_mode(mode: str) -> str:
@@ -892,7 +1141,8 @@ def _autopilot_human_mode(mode: str) -> str:
 def _autopilot_dashboard_text(aid: str) -> str:
     ap = _autopilot_get(aid)
     mode = str(ap.get("mode") or "OFF").upper()
-    goals = ap.get("goals") or {}
+    eff = _autopilot_effective_config(aid)
+    goals = eff.get("goals") or {}
     limits = ap.get("limits") or {}
 
     leads = goals.get("leads")
@@ -939,8 +1189,20 @@ def _autopilot_dashboard_text(aid: str) -> str:
         except Exception:
             extra = ""
 
+    group_line = ""
+    if eff.get("group_id"):
+        gname = eff.get("group_name") or eff.get("group_id")
+        group_line = f"\nГруппа: {gname}"
+
+    kpi_map = {
+        "total": "Всего (переписки+заявки)",
+        "msgs": "Переписки",
+        "leads": "Заявки",
+    }
+    kpi_line = f"\nKPI: {kpi_map.get(str(eff.get('kpi') or ''), str(eff.get('kpi') or ''))}"
+
     lines = [
-        f"🤖 Автопилат — {get_account_name(aid)}",
+        f"🤖 Автопилат — {get_account_name(aid)}" + group_line + kpi_line,
         "",
         f"Статус: {_autopilot_human_mode(mode)}",
         "",
@@ -953,10 +1215,10 @@ def _autopilot_dashboard_text(aid: str) -> str:
         "🧩 Лимиты:",
         f"• Шаг бюджета: ±{_fmt_int(max_step)}%",
         f"• Допустимый риск/день: +{_fmt_int(max_risk)}%",
-        f"• Pause ads: {'✅' if allow_pause_ads else '❌'}",
-        f"• Pause adsets: {'✅' if allow_pause_adsets else '❌'}",
+        f"• Отключать объявления: {'✅' if allow_pause_ads else '❌'}",
+        f"• Останавливать adset: {'✅' if allow_pause_adsets else '❌'}",
         f"• Перераспределение: {'✅' if allow_redist else '❌'}",
-        f"• Re-enable ads: {'✅' if allow_reenable else '❌'}",
+        f"• Включать обратно объявления: {'✅' if allow_reenable else '❌'}",
     ]
     return "\n".join(lines)
 
@@ -967,6 +1229,11 @@ def _autopilot_kb(aid: str) -> InlineKeyboardMarkup:
     limits = ap.get("limits") or {}
     allow_reenable = bool(limits.get("allow_reenable_ads", False))
     allow_pause_adsets = bool(limits.get("allow_pause_adsets", False))
+
+    eff = _autopilot_effective_config(aid)
+    gid = eff.get("group_id")
+    gname = eff.get("group_name") or gid
+    grp_label = f"🏷️ Группы кампаний" if not gid else f"🏷️ Группа: {gname}"
 
     rows = [
         [
@@ -1001,20 +1268,21 @@ def _autopilot_kb(aid: str) -> InlineKeyboardMarkup:
             InlineKeyboardButton("💵 Бюджет (план)", callback_data=f"ap_set_budget|{aid}"),
             InlineKeyboardButton("🗓 Период", callback_data=f"ap_period|{aid}"),
         ],
+        [InlineKeyboardButton(grp_label, callback_data=f"ap_groups|{aid}")],
         [
             InlineKeyboardButton(
-                ("🔁 Re-enable ads: ON" if allow_reenable else "🔁 Re-enable ads: OFF"),
+                ("🔁 Включать обратно объявления: ВКЛ" if allow_reenable else "🔁 Включать обратно объявления: ВЫКЛ"),
                 callback_data=f"ap_toggle_reenable|{aid}",
             ),
         ],
         [
             InlineKeyboardButton(
-                ("🧩 Pause adsets: ON" if allow_pause_adsets else "🧩 Pause adsets: OFF"),
+                ("🧩 Останавливать adset: ВКЛ" if allow_pause_adsets else "🧩 Останавливать adset: ВЫКЛ"),
                 callback_data=f"ap_toggle_pause_adsets|{aid}",
             )
         ],
-        [InlineKeyboardButton("📊 Анализ (today vs 3d)", callback_data=f"ap_analyze|{aid}")],
-        [InlineKeyboardButton("🕒 Часы (heatmap)", callback_data=f"ap_hm|{aid}")],
+        [InlineKeyboardButton("📊 Анализ (сегодня vs 3 дня)", callback_data=f"ap_analyze|{aid}")],
+        [InlineKeyboardButton("🕒 Часы (тепловая карта)", callback_data=f"ap_hm|{aid}")],
         [InlineKeyboardButton("🧾 История", callback_data=f"ap_history|{aid}")],
         [InlineKeyboardButton("⬅️ К аккаунтам", callback_data="autopilot_menu")],
         [InlineKeyboardButton("⬅️ В меню", callback_data="menu")],
@@ -2477,6 +2745,221 @@ async def _on_cb_internal(
         await safe_edit_message(q, text, reply_markup=_autopilot_kb(aid))
         return
 
+    if data.startswith("ap_groups|"):
+        aid = data.split("|", 1)[1]
+        await safe_edit_message(
+            q,
+            f"🏷️ Группы кампаний — {get_account_name(aid)}\n\nВыберите группу или создайте новую:",
+            reply_markup=_autopilot_groups_kb(aid),
+        )
+        return
+
+    if data.startswith("ap_group_create|"):
+        aid = data.split("|", 1)[1]
+        gid = uuid.uuid4().hex[:8]
+        grp = {
+            "name": f"Группа {gid}",
+            "campaign_ids": [],
+            "kpi": "total",
+            "lead_metric": None,
+            "goals": {"leads": None, "period": "day", "until": None, "target_cpl": None, "planned_budget": None},
+        }
+        ap = _autopilot_get(aid)
+        groups = ap.get("campaign_groups") or {}
+        if not isinstance(groups, dict):
+            groups = {}
+        groups[gid] = grp
+        ap["campaign_groups"] = groups
+        ap["active_group_id"] = gid
+        _autopilot_set(aid, ap)
+        await q.answer("Группа создана")
+        text = _autopilot_dashboard_text(aid)
+        await safe_edit_message(q, text, reply_markup=_autopilot_kb(aid))
+        return
+
+    if data.startswith("ap_group_open|"):
+        _p, aid, gid = data.split("|", 2)
+        await safe_edit_message(
+            q,
+            _autopilot_group_menu_text(aid, gid),
+            reply_markup=_autopilot_group_kb(aid, gid),
+        )
+        return
+
+    if data.startswith("ap_group_select|"):
+        _p, aid, gid = data.split("|", 2)
+        _autopilot_set(aid, {"active_group_id": str(gid)})
+        await q.answer("Активная группа выбрана")
+        text = _autopilot_dashboard_text(aid)
+        await safe_edit_message(q, text, reply_markup=_autopilot_kb(aid))
+        return
+
+    if data.startswith("ap_group_off|"):
+        aid = data.split("|", 1)[1]
+        _autopilot_set(aid, {"active_group_id": None})
+        await q.answer("Группа отключена")
+        text = _autopilot_dashboard_text(aid)
+        await safe_edit_message(q, text, reply_markup=_autopilot_kb(aid))
+        return
+
+    if data.startswith("ap_group_delete|"):
+        _p, aid, gid = data.split("|", 2)
+        _autopilot_group_delete(aid, gid)
+        await q.answer("Группа удалена")
+        await safe_edit_message(
+            q,
+            f"🏷️ Группы кампаний — {get_account_name(aid)}\n\nВыберите группу или создайте новую:",
+            reply_markup=_autopilot_groups_kb(aid),
+        )
+        return
+
+    if data.startswith("ap_group_kpi|"):
+        _p, aid, gid = data.split("|", 2)
+        await safe_edit_message(
+            q,
+            f"📊 KPI группы — {get_account_name(aid)}\n\nВыберите, что считать KPI:",
+            reply_markup=_autopilot_group_kpi_kb(aid, gid),
+        )
+        return
+
+    if data.startswith("ap_group_kpi_set|"):
+        _p, aid, gid, code = data.split("|", 3)
+        grp = _autopilot_group_get(aid, gid)
+        grp["kpi"] = str(code)
+        _autopilot_group_set(aid, gid, grp)
+        await q.answer("KPI обновлён")
+        await safe_edit_message(
+            q,
+            f"📊 KPI группы — {get_account_name(aid)}\n\nВыберите, что считать KPI:",
+            reply_markup=_autopilot_group_kpi_kb(aid, gid),
+        )
+        return
+
+    if data.startswith("ap_group_campaigns|"):
+        _p, aid, gid = data.split("|", 2)
+        await safe_edit_message(
+            q,
+            f"📌 Кампании группы — {get_account_name(aid)}\n\nОтметьте 2–10 кампаний:",
+            reply_markup=_autopilot_group_campaigns_kb(aid, gid),
+        )
+        return
+
+    if data.startswith("ap_group_camp_toggle|"):
+        _p, aid, gid, cid = data.split("|", 3)
+        grp = _autopilot_group_get(aid, gid)
+        cur = set(str(x) for x in (grp.get("campaign_ids") or []) if x)
+        if str(cid) in cur:
+            cur.remove(str(cid))
+        else:
+            cur.add(str(cid))
+        grp["campaign_ids"] = sorted(cur)
+        _autopilot_group_set(aid, gid, grp)
+        await safe_edit_message(
+            q,
+            f"📌 Кампании группы — {get_account_name(aid)}\n\nОтметьте 2–10 кампаний:",
+            reply_markup=_autopilot_group_campaigns_kb(aid, gid),
+        )
+        return
+
+    if data.startswith("ap_group_leadmetric|"):
+        _p, aid, gid = data.split("|", 2)
+        grp = _autopilot_group_get(aid, gid)
+        options = _discover_lead_metrics_for_account(aid)
+
+        current = grp.get("lead_metric")
+        current_at = (current or {}).get("action_type") if isinstance(current, dict) else None
+
+        if not options:
+            kb = InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ Назад", callback_data=f"ap_group_open|{aid}|{gid}")]]
+            )
+            await safe_edit_message(
+                q,
+                "❗️Не найдено метрик заявок с сайта (за вчера).\n"
+                "Проверь события в Ads Manager.",
+                reply_markup=kb,
+            )
+            return
+
+        mapping = {str(i): it for i, it in enumerate(options)}
+        context.user_data["ap_group_lead_metric_options"] = {
+            "aid": aid,
+            "gid": gid,
+            "items": mapping,
+        }
+
+        rows = []
+        for i, it in mapping.items():
+            label = it.get("label") or it.get("action_type")
+            if current_at and it.get("action_type") == current_at:
+                label = f"✅ {label}"
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        str(label),
+                        callback_data=f"ap_group_leadmetric_set|{aid}|{gid}|{i}",
+                    )
+                ]
+            )
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "Сбросить (по аккаунту)",
+                    callback_data=f"ap_group_leadmetric_clear|{aid}|{gid}",
+                )
+            ]
+        )
+        rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"ap_group_open|{aid}|{gid}")])
+        await safe_edit_message(q, "📊 Метрика заявок группы (за вчера):", reply_markup=InlineKeyboardMarkup(rows))
+        return
+
+    if data.startswith("ap_group_leadmetric_clear|"):
+        _p, aid, gid = data.split("|", 2)
+        grp = _autopilot_group_get(aid, gid)
+        grp["lead_metric"] = None
+        _autopilot_group_set(aid, gid, grp)
+        await q.answer("Метрика сброшена")
+        await safe_edit_message(
+            q,
+            _autopilot_group_menu_text(aid, gid),
+            reply_markup=_autopilot_group_kb(aid, gid),
+        )
+        return
+
+    if data.startswith("ap_group_leadmetric_set|"):
+        _p, aid, gid, idx = data.split("|", 3)
+
+        stash = context.user_data.get("ap_group_lead_metric_options") or {}
+        if stash.get("aid") != aid or stash.get("gid") != gid:
+            await q.answer("Список метрик устарел. Открой заново.", show_alert=True)
+            return
+
+        items = stash.get("items") or {}
+        it = items.get(str(idx))
+        if not it:
+            await q.answer("Метрика не найдена. Открой заново.", show_alert=True)
+            return
+
+        action_type = it.get("action_type")
+        label = it.get("label")
+        if not action_type:
+            await q.answer("Пустой action_type.", show_alert=True)
+            return
+
+        grp = _autopilot_group_get(aid, gid)
+        grp["lead_metric"] = {
+            "action_type": str(action_type),
+            "label": str(label or action_type),
+        }
+        _autopilot_group_set(aid, gid, grp)
+        await q.answer("Метрика обновлена")
+        await safe_edit_message(
+            q,
+            _autopilot_group_menu_text(aid, gid),
+            reply_markup=_autopilot_group_kb(aid, gid),
+        )
+        return
+
     if data.startswith("ap_mode|"):
         try:
             _p, aid, mode = data.split("|", 2)
@@ -2513,7 +2996,8 @@ async def _on_cb_internal(
             "0 — сбросить цель.",
             reply_markup=_autopilot_kb(aid),
         )
-        context.user_data["await_ap_leads_for"] = {"aid": aid}
+        gid = str(_autopilot_get(aid).get("active_group_id") or "").strip() or None
+        context.user_data["await_ap_leads_for"] = {"aid": aid, "gid": gid}
         return
 
     if data.startswith("ap_set_cpl|"):
@@ -2525,7 +3009,8 @@ async def _on_cb_internal(
             "0 — сбросить цель.",
             reply_markup=_autopilot_kb(aid),
         )
-        context.user_data["await_ap_cpl_for"] = {"aid": aid}
+        gid = str(_autopilot_get(aid).get("active_group_id") or "").strip() or None
+        context.user_data["await_ap_cpl_for"] = {"aid": aid, "gid": gid}
         return
 
     if data.startswith("ap_set_budget|"):
@@ -2537,7 +3022,8 @@ async def _on_cb_internal(
             "0 — сбросить план.",
             reply_markup=_autopilot_kb(aid),
         )
-        context.user_data["await_ap_budget_for"] = {"aid": aid}
+        gid = str(_autopilot_get(aid).get("active_group_id") or "").strip() or None
+        context.user_data["await_ap_budget_for"] = {"aid": aid, "gid": gid}
         return
 
     if data.startswith("ap_period|"):
@@ -2553,16 +3039,27 @@ async def _on_cb_internal(
             return
 
         ap = _autopilot_get(aid)
-        goals = ap.get("goals") or {}
-        if not isinstance(goals, dict):
-            goals = {}
+        active_gid = str(ap.get("active_group_id") or "").strip() or None
+        if active_gid:
+            grp = _autopilot_group_get(aid, active_gid)
+            goals = grp.get("goals") or {}
+            if not isinstance(goals, dict):
+                goals = {}
+        else:
+            goals = ap.get("goals") or {}
+            if not isinstance(goals, dict):
+                goals = {}
 
         code = str(code or "day")
         goals["period"] = code
         if code != "until":
             goals["until"] = None
 
-        _autopilot_set(aid, {"goals": goals})
+        if active_gid:
+            grp["goals"] = goals
+            _autopilot_group_set(aid, active_gid, grp)
+        else:
+            _autopilot_set(aid, {"goals": goals})
         append_autopilot_event(
             aid,
             {
@@ -2578,7 +3075,7 @@ async def _on_cb_internal(
                 chat_id,
                 "Введите дату в формате ДД.ММ.ГГГГ (например 25.01.2026)",
             )
-            context.user_data["await_ap_until_for"] = {"aid": aid}
+            context.user_data["await_ap_until_for"] = {"aid": aid, "gid": active_gid}
             return
 
         await q.answer("Период обновлён")
@@ -2694,7 +3191,7 @@ async def _on_cb_internal(
 
         mode = str(ap.get("mode") or "OFF").upper()
         if mode != "AUTO_LIMITS":
-            await q.answer("Force доступен только в AUTO_LIMITS.", show_alert=True)
+            await q.answer("Force доступен только в режиме 'Авто с лимитами'.", show_alert=True)
             return
 
         hs = ap.get("heatmap_state") or {}
@@ -2792,7 +3289,7 @@ async def _on_cb_internal(
                         )
                         await context.bot.send_message(
                             chat_id,
-                            "🤖 AUTO_LIMITS: автоприменено\n\n" + str(res.get("message") or "") + "\n\n" + _ap_action_text(act),
+                            "🤖 Авто с лимитами: применено автоматически\n\n" + str(res.get("message") or "") + "\n\n" + _ap_action_text(act),
                         )
                         auto_applied += 1
                         continue
@@ -2825,7 +3322,7 @@ async def _on_cb_internal(
                             )
                             await context.bot.send_message(
                                 chat_id,
-                                "🤖 AUTO_LIMITS: автоприменено\n\n" + str(res.get("message") or res.get("exception") or "") + "\n\n" + _ap_action_text(act),
+                                "🤖 Авто с лимитами: применено автоматически\n\n" + str(res.get("message") or res.get("exception") or "") + "\n\n" + _ap_action_text(act),
                             )
                             auto_applied += 1
                             continue
@@ -2847,7 +3344,7 @@ async def _on_cb_internal(
                         )
                         await context.bot.send_message(
                             chat_id,
-                            "🤖 AUTO_LIMITS: автоприменено\n\n" + str(res.get("message") or "") + "\n\n" + _ap_action_text(act),
+                            "🤖 Авто с лимитами: применено автоматически\n\n" + str(res.get("message") or "") + "\n\n" + _ap_action_text(act),
                         )
                         auto_applied += 1
                         continue
@@ -2859,7 +3356,7 @@ async def _on_cb_internal(
                 kind = str(act.get("kind") or "")
                 allow_edit = kind == "budget_pct"
                 kb = _ap_action_kb(allow_apply=True, token=token, allow_edit=allow_edit)
-                await context.bot.send_message(chat_id, _ap_action_text(act) + f"\n\n⚠️ Вне лимитов AUTO_LIMITS: {why}", reply_markup=kb)
+                await context.bot.send_message(chat_id, _ap_action_text(act) + f"\n\n⚠️ Вне лимитов режима 'Авто с лимитами': {why}", reply_markup=kb)
                 continue
 
             # SEMI / OFF: SEMI — подтверждение вручную; OFF — по факту тоже не должен предлагать, но оставим безопасно.
@@ -2902,7 +3399,7 @@ async def _on_cb_internal(
             ap = _autopilot_get(aid)
             mode = str(ap.get("mode") or "OFF").upper()
             if mode != "AUTO_LIMITS":
-                await q.answer("Force подтверждение доступно только в AUTO_LIMITS.", show_alert=True)
+                await q.answer("Force подтверждение доступно только в режиме 'Авто с лимитами'.", show_alert=True)
                 return
 
             op = "apply"
@@ -2975,7 +3472,7 @@ async def _on_cb_internal(
                         )
                         await safe_edit_message(
                             q,
-                            _ap_action_text(act) + f"\n\n⚠️ Выходит за лимиты AUTO_LIMITS: {why}\nПодтвердить сверх лимитов?",
+                            _ap_action_text(act) + f"\n\n⚠️ Выходит за лимиты режима 'Авто с лимитами': {why}\nПодтвердить сверх лимитов?",
                             reply_markup=_ap_force_kb(token),
                         )
                         return
@@ -6271,6 +6768,7 @@ async def on_text_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "await_ap_leads_for" in context.user_data:
         payload = context.user_data.pop("await_ap_leads_for") or {}
         aid = payload.get("aid")
+        gid = payload.get("gid")
         try:
             val = int(float(text.replace(",", ".")))
         except Exception:
@@ -6278,12 +6776,21 @@ async def on_text_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["await_ap_leads_for"] = payload
             return
 
-        ap = _autopilot_get(aid)
-        goals = ap.get("goals") or {}
-        if not isinstance(goals, dict):
-            goals = {}
-        goals["leads"] = None if val <= 0 else int(val)
-        _autopilot_set(aid, {"goals": goals})
+        if gid:
+            grp = _autopilot_group_get(aid, gid)
+            goals = grp.get("goals") or {}
+            if not isinstance(goals, dict):
+                goals = {}
+            goals["leads"] = None if val <= 0 else int(val)
+            grp["goals"] = goals
+            _autopilot_group_set(aid, gid, grp)
+        else:
+            ap = _autopilot_get(aid)
+            goals = ap.get("goals") or {}
+            if not isinstance(goals, dict):
+                goals = {}
+            goals["leads"] = None if val <= 0 else int(val)
+            _autopilot_set(aid, {"goals": goals})
         append_autopilot_event(
             aid,
             {"type": "goal_set", "key": "leads", "value": goals.get("leads")},
@@ -6294,6 +6801,7 @@ async def on_text_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "await_ap_cpl_for" in context.user_data:
         payload = context.user_data.pop("await_ap_cpl_for") or {}
         aid = payload.get("aid")
+        gid = payload.get("gid")
         try:
             val = float(text.replace(",", "."))
         except Exception:
@@ -6301,12 +6809,21 @@ async def on_text_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["await_ap_cpl_for"] = payload
             return
 
-        ap = _autopilot_get(aid)
-        goals = ap.get("goals") or {}
-        if not isinstance(goals, dict):
-            goals = {}
-        goals["target_cpl"] = None if val <= 0 else float(val)
-        _autopilot_set(aid, {"goals": goals})
+        if gid:
+            grp = _autopilot_group_get(aid, gid)
+            goals = grp.get("goals") or {}
+            if not isinstance(goals, dict):
+                goals = {}
+            goals["target_cpl"] = None if val <= 0 else float(val)
+            grp["goals"] = goals
+            _autopilot_group_set(aid, gid, grp)
+        else:
+            ap = _autopilot_get(aid)
+            goals = ap.get("goals") or {}
+            if not isinstance(goals, dict):
+                goals = {}
+            goals["target_cpl"] = None if val <= 0 else float(val)
+            _autopilot_set(aid, {"goals": goals})
         append_autopilot_event(
             aid,
             {"type": "goal_set", "key": "target_cpl", "value": goals.get("target_cpl")},
@@ -6317,6 +6834,7 @@ async def on_text_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "await_ap_budget_for" in context.user_data:
         payload = context.user_data.pop("await_ap_budget_for") or {}
         aid = payload.get("aid")
+        gid = payload.get("gid")
         try:
             val = float(text.replace(",", "."))
         except Exception:
@@ -6324,12 +6842,21 @@ async def on_text_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["await_ap_budget_for"] = payload
             return
 
-        ap = _autopilot_get(aid)
-        goals = ap.get("goals") or {}
-        if not isinstance(goals, dict):
-            goals = {}
-        goals["planned_budget"] = None if val <= 0 else float(val)
-        _autopilot_set(aid, {"goals": goals})
+        if gid:
+            grp = _autopilot_group_get(aid, gid)
+            goals = grp.get("goals") or {}
+            if not isinstance(goals, dict):
+                goals = {}
+            goals["planned_budget"] = None if val <= 0 else float(val)
+            grp["goals"] = goals
+            _autopilot_group_set(aid, gid, grp)
+        else:
+            ap = _autopilot_get(aid)
+            goals = ap.get("goals") or {}
+            if not isinstance(goals, dict):
+                goals = {}
+            goals["planned_budget"] = None if val <= 0 else float(val)
+            _autopilot_set(aid, {"goals": goals})
         append_autopilot_event(
             aid,
             {"type": "goal_set", "key": "planned_budget", "value": goals.get("planned_budget")},
@@ -6340,6 +6867,7 @@ async def on_text_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "await_ap_until_for" in context.user_data:
         payload = context.user_data.pop("await_ap_until_for") or {}
         aid = payload.get("aid")
+        gid = payload.get("gid")
 
         try:
             dt = datetime.strptime(text.strip(), "%d.%m.%Y").date()
@@ -6348,13 +6876,24 @@ async def on_text_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["await_ap_until_for"] = payload
             return
 
-        ap = _autopilot_get(aid)
-        goals = ap.get("goals") or {}
-        if not isinstance(goals, dict):
-            goals = {}
+        if gid:
+            grp = _autopilot_group_get(aid, gid)
+            goals = grp.get("goals") or {}
+            if not isinstance(goals, dict):
+                goals = {}
+        else:
+            ap = _autopilot_get(aid)
+            goals = ap.get("goals") or {}
+            if not isinstance(goals, dict):
+                goals = {}
         goals["period"] = "until"
         goals["until"] = dt.strftime("%d.%m.%Y")
-        _autopilot_set(aid, {"goals": goals})
+
+        if gid:
+            grp["goals"] = goals
+            _autopilot_group_set(aid, gid, grp)
+        else:
+            _autopilot_set(aid, {"goals": goals})
         append_autopilot_event(
             aid,
             {"type": "goal_set", "key": "until", "value": goals.get("until")},
