@@ -32,7 +32,12 @@ except Exception:  # noqa: BLE001 - нам важен ЛЮБОЙ ImportError/Run
         return None
 
 try:  # pragma: no cover
-    from services.facebook_api import fetch_insights, safe_api_call
+    from services.facebook_api import (
+        fetch_insights,
+        safe_api_call,
+        _normalize_insight,
+        _period_to_params,
+    )
     from services.analytics import (
         parse_insight,
         analyze_account,
@@ -48,7 +53,13 @@ except Exception:  # noqa: BLE001
     def safe_api_call(_fn, *args, **kwargs):  # type: ignore[override]
         return None
 
-    def parse_insight(_ins: dict) -> dict:  # type: ignore[override]
+    def _normalize_insight(_row):  # type: ignore[override]
+        return {}
+
+    def _period_to_params(_period):  # type: ignore[override]
+        return {}
+
+    def parse_insight(_ins: dict, **_kwargs) -> dict:  # type: ignore[override]
         return {"msgs": 0, "leads": 0, "total": 0, "spend": 0.0}
 
     def analyze_account(_aid: str, days: int = 7, period=None):  # type: ignore[override]
@@ -1396,22 +1407,10 @@ async def _hourly_snapshot_job(context: ContextTypes.DEFAULT_TYPE):
         try:
             from facebook_business.adobjects.adaccount import AdAccount
 
-            def _export_row(r):
-                if r is None:
-                    return {}
-                if hasattr(r, "export_all_data"):
-                    try:
-                        return r.export_all_data()
-                    except Exception:
-                        return {}
-                try:
-                    return dict(r)
-                except Exception:
-                    return {}
-
             def _fetch_level_rows(level: str):
                 acc = AdAccount(aid)
-                params = {"date_preset": "today", "level": level}
+                params = _period_to_params("today")
+                params["level"] = level
                 fields = ["spend", "actions", "cost_per_action_type", "impressions", "clicks"]
                 data = safe_api_call(acc.get_insights, fields=fields, params=params)
                 return data or []
@@ -1425,7 +1424,7 @@ async def _hourly_snapshot_job(context: ContextTypes.DEFAULT_TYPE):
             ad_section.setdefault(aid, {})
 
             for rr in adset_rows:
-                row_d = _export_row(rr)
+                row_d = _normalize_insight(rr)
                 adset_id = str(row_d.get("adset_id") or "")
                 if not adset_id:
                     continue
@@ -1465,7 +1464,7 @@ async def _hourly_snapshot_job(context: ContextTypes.DEFAULT_TYPE):
                 }
 
             for rr in ad_rows:
-                row_d = _export_row(rr)
+                row_d = _normalize_insight(rr)
                 ad_id = str(row_d.get("ad_id") or "")
                 if not ad_id:
                     continue
@@ -1508,13 +1507,41 @@ async def _hourly_snapshot_job(context: ContextTypes.DEFAULT_TYPE):
 
     # Обрезаем историю старше cutoff_date
     for aid, acc_stats in list(stats.items()):
-        if aid == "_acc":
+        if str(aid).startswith("_"):
             continue
         if not isinstance(acc_stats, dict):
             continue
         for d in list(acc_stats.keys()):
             if d < cutoff_date:
                 del acc_stats[d]
+
+    for aid, by_adset in list((stats.get("_adset") or {}).items()):
+        if not isinstance(by_adset, dict):
+            continue
+        for adset_id, adset_days in list(by_adset.items()):
+            if not isinstance(adset_days, dict):
+                continue
+            for d in list(adset_days.keys()):
+                if d < cutoff_date:
+                    del adset_days[d]
+            if not adset_days:
+                del by_adset[adset_id]
+        if not by_adset:
+            del stats["_adset"][aid]
+
+    for aid, by_ad in list((stats.get("_ad") or {}).items()):
+        if not isinstance(by_ad, dict):
+            continue
+        for ad_id, ad_days in list(by_ad.items()):
+            if not isinstance(ad_days, dict):
+                continue
+            for d in list(ad_days.keys()):
+                if d < cutoff_date:
+                    del ad_days[d]
+            if not ad_days:
+                del by_ad[ad_id]
+        if not by_ad:
+            del stats["_ad"][aid]
 
     save_hourly_stats(stats)
 
