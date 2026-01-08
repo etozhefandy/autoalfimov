@@ -2337,7 +2337,13 @@ async def on_cb_autopilot(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not _allowed(update):
         await safe_edit_message(q, "⛔️ Нет доступа.")
-    # ... (rest of the function remains the same)
+        return
+
+    data = q.data or ""
+    chat_id = str(q.message.chat.id)
+
+    await _on_cb_internal(update, context, q, chat_id, data)
+    return
 
 
 async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
