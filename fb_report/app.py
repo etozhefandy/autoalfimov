@@ -7393,6 +7393,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("version", cmd_version))
     app.add_handler(CommandHandler("ap_here", cmd_ap_here))
     app.add_handler(CommandHandler("billing", cmd_billing))
     app.add_handler(CommandHandler("sync_accounts", cmd_sync))
