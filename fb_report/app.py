@@ -20,6 +20,7 @@ from telegram.ext import (
 )
 
 import logging
+from collections import Counter
 
 from billing_watch import init_billing_watch
 from autopilat.actions import apply_budget_change, set_adset_budget, disable_entity, can_disable, parse_manual_input
@@ -70,6 +71,7 @@ from .creatives import fetch_instagram_active_ads_links, format_instagram_ads_li
 from .adsets import send_adset_report
 from .billing import send_billing, send_billing_forecast, billing_digest_job
 from .jobs import full_daily_scan_job, daily_report_job, schedule_cpa_alerts, _resolve_account_cpa
+from .autopilot_format import ap_action_text
 
 from services.analytics import analyze_campaigns, analyze_adsets, analyze_account, analyze_ads
 from services.facebook_api import (
@@ -156,11 +158,38 @@ def _build_version_text() -> str:
     return "\n".join(lines)
 
 
+def _ap_reason_human(code: str) -> str:
+    m = {
+        "no_goal_target_cpl": "цель CPL не задана (работаю от базы 3 дня)",
+        "insufficient_volume": "недостаточно объёма (мало конверсий/переписок)",
+        "no_spend": "нет расходов за период",
+        "too_low_spend": "слишком малый расход для уверенных выводов",
+        "rate_limit": "лимит Facebook API (code 17)",
+        "api_error": "ошибка Facebook API",
+        "no_campaigns_in_group": "в группе нет кампаний",
+        "all_candidates_blocked_by_limits": "все кандидаты вне лимитов режима AUTO_LIMITS",
+        "mode_not_auto_limits": "режим не AUTO_LIMITS",
+        "no_monitored_groups": "нет мониторимых групп",
+    }
+    return m.get(str(code), str(code))
+
+
+def _ap_top_reasons(reasons: list[str] | None, *, n: int = 2) -> str:
+    if not reasons:
+        return ""
+    c = Counter([str(x) for x in reasons if x])
+    top = [k for k, _v in c.most_common(max(1, int(n)))]
+    if not top:
+        return ""
+    return "; ".join(_ap_reason_human(x) for x in top)
+
+
 def _autopilot_analysis_kb(aid: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("🔄 Обновить", callback_data=f"ap_analyze|{aid}")],
             [InlineKeyboardButton("🛠 Предложить действия", callback_data=f"ap_suggest|{aid}")],
+            [InlineKeyboardButton("🧪 Прогнать сейчас (без применения)", callback_data=f"ap_dry|{aid}")],
             [InlineKeyboardButton("🕒 Часы (тепловая карта)", callback_data=f"ap_hm|{aid}")],
             [InlineKeyboardButton("⬅️ Назад", callback_data=f"autopilot_acc|{aid}")],
             [InlineKeyboardButton("⬅️ К аккаунтам", callback_data="autopilot_menu")],
@@ -289,58 +318,15 @@ def _ap_action_kb(*, allow_apply: bool, token: str, allow_edit: bool) -> InlineK
 
 
 def _ap_action_text(action: dict) -> str:
-    kind = str(action.get("kind") or "")
-    name = action.get("name") or action.get("adset_id")
-    reason = action.get("reason") or ""
-    sp_t = action.get("spend_today")
-    ld_t = action.get("leads_today")
-    cpl_t = action.get("cpl_today")
-    cpl_3 = action.get("cpl_3d")
-
-    def _fmt_money(v):
-        if v is None:
-            return "—"
-        try:
-            return f"{float(v):.2f} $"
-        except Exception:
-            return "—"
-
-    def _fmt_int(v):
-        try:
-            return str(int(float(v)))
-        except Exception:
-            return "0"
-
-    lines = [f"🧭 Автопилат: действие для adset", f"{name}", f"ID: {action.get('adset_id')}", ""]
-    lines.append(f"Сегодня: spend {_fmt_money(sp_t)} | leads {_fmt_int(ld_t)} | CPL {_fmt_money(cpl_t)}")
-    lines.append(f"Последние 3 дня: CPL {_fmt_money(cpl_3)}")
-    lines.append("")
-
-    if kind == "budget_pct":
-        pct = action.get("percent")
-        try:
-            pct_f = float(pct)
-        except Exception:
-            pct_f = 0.0
-        sign = "+" if pct_f >= 0 else ""
-        lines.append(f"👉 Предложение: изменить бюджет на {sign}{pct_f:.0f}%")
-    elif kind == "pause_adset":
-        lines.append("👉 Предложение: остановить adset")
-    elif kind == "pause_ad":
-        ad_name = action.get("ad_name") or action.get("ad_id")
-        lines.append(f"👉 Предложение: отключить объявление ({ad_name})")
-    elif kind == "note":
-        lines.append("ℹ️ Рекомендация без кнопки применения")
-    else:
-        lines.append("👉 Предложение: (неизвестно)")
-
-    if reason:
-        lines.append(f"Причина: {reason}")
-
-    return "\n".join(lines)
+    return ap_action_text(action)
 
 
-def _ap_generate_actions(aid: str, *, eff: dict | None = None) -> list[dict]:
+def _ap_generate_actions(
+    aid: str,
+    *,
+    eff: dict | None = None,
+    debug: bool = False,
+) -> list[dict] | tuple[list[dict], list[str]]:
     ap = _autopilot_get(aid)
     mode = str(ap.get("mode") or "OFF").upper()
     eff = eff or _autopilot_effective_config(aid)
@@ -349,8 +335,15 @@ def _ap_generate_actions(aid: str, *, eff: dict | None = None) -> list[dict]:
     group_campaign_ids = eff.get("campaign_ids")
     group_campaign_set = set(str(x) for x in (group_campaign_ids or []) if x)
 
+    debug_reasons: list[str] = []
+
     if eff.get("group_id") and not group_campaign_set:
-        return []
+        debug_reasons.append("no_campaigns_in_group")
+        return ([], debug_reasons) if debug else []
+
+    if is_rate_limited_now():
+        debug_reasons.append("rate_limit")
+        return ([], debug_reasons) if debug else []
 
     limits = ap.get("limits") or {}
 
@@ -373,20 +366,34 @@ def _ap_generate_actions(aid: str, *, eff: dict | None = None) -> list[dict]:
         "until": yday.strftime("%Y-%m-%d"),
     }
 
+    api_failed = False
     try:
         today_rows = analyze_adsets(aid, period="today", lead_action_type=lead_action_type) or []
     except Exception:
         today_rows = []
+        api_failed = True
 
     try:
         d3_rows = analyze_adsets(aid, period=period_3d, lead_action_type=lead_action_type) or []
     except Exception:
         d3_rows = []
+        api_failed = True
 
     try:
         today_ads = analyze_ads(aid, period="today", lead_action_type=lead_action_type) or []
     except Exception:
         today_ads = []
+        api_failed = True
+
+    try:
+        err_code = int((get_last_api_error_info() or {}).get("code") or 0)
+    except Exception:
+        err_code = 0
+    if err_code == 17:
+        debug_reasons.append("rate_limit")
+        return ([], debug_reasons) if debug else []
+    if api_failed and not debug_reasons:
+        debug_reasons.append("api_error")
 
     ads_by_adset: dict[str, list[dict]] = {}
     for a in (today_ads or []):
@@ -445,8 +452,14 @@ def _ap_generate_actions(aid: str, *, eff: dict | None = None) -> list[dict]:
     if target_cpl_f is not None and target_cpl_f <= 0:
         target_cpl_f = None
 
+    if target_cpl_f is None:
+        debug_reasons.append("no_goal_target_cpl")
+
     keys = sorted(set(today_map.keys()) | set(d3_map.keys()))
     rows = []
+
+    total_spend_today = 0.0
+    total_kpi_today = 0
     for k in keys:
         t = today_map.get(k) or {}
         d = d3_map.get(k) or {}
@@ -456,11 +469,18 @@ def _ap_generate_actions(aid: str, *, eff: dict | None = None) -> list[dict]:
         ld_t = _kpi_count(t)
         cpl_t = _cpl(sp_t, ld_t)
 
+        total_spend_today += float(sp_t)
+        total_kpi_today += int(ld_t)
+
         sp_3 = _to_float(d.get("spend"))
         ld_3 = _kpi_count(d)
         cpl_3 = _cpl(sp_3, ld_3)
 
         if sp_t <= 0:
+            continue
+
+        # Слишком маленький расход — избегаем шумных рекомендаций.
+        if float(sp_t) < 5.0:
             continue
 
         if ld_t <= 0:
@@ -533,15 +553,20 @@ def _ap_generate_actions(aid: str, *, eff: dict | None = None) -> list[dict]:
 
         if target_cpl_f is not None and target_cpl_f > 0:
             ratio = float(cpl_t) / float(target_cpl_f)
+            inc_thr = 1.05
+            dec_thr = 1.30
         elif cpl_3 is not None and float(cpl_3) > 0:
             ratio = float(cpl_t) / float(cpl_3)
+            # «Мягкая оптимизация» без заданной цели CPL.
+            inc_thr = 0.90
+            dec_thr = 1.25
         else:
             ratio = None
 
         if ratio is None:
             continue
 
-        if ratio <= 1.05:
+        if ratio <= inc_thr:
             rows.append(
                 {
                     "kind": "budget_pct",
@@ -556,7 +581,7 @@ def _ap_generate_actions(aid: str, *, eff: dict | None = None) -> list[dict]:
                     "score": sp_t,
                 }
             )
-        elif ratio >= 1.30:
+        elif ratio >= dec_thr:
             rows.append(
                 {
                     "kind": "budget_pct",
@@ -717,6 +742,7 @@ async def _autopilot_hourly_job(context: ContextTypes.DEFAULT_TYPE):
             pass
         return
 
+    log = logging.getLogger(__name__)
     store = load_accounts() or {}
     hit_rate_limit = False
     for aid, row in store.items():
@@ -726,31 +752,51 @@ async def _autopilot_hourly_job(context: ContextTypes.DEFAULT_TYPE):
         if not isinstance(ap, dict):
             continue
         mode = str(ap.get("mode") or "OFF").upper()
+        gids = _autopilot_active_group_ids(aid)
+
+        log.info(
+            "autopilot_hourly_start aid=%s mode=%s active_group_ids=%s groups_count=%s",
+            str(aid),
+            str(mode),
+            ",".join([str(x) for x in (gids or [])]) if gids else "",
+            int(len(gids or [])),
+        )
+
         if mode != "AUTO_LIMITS":
+            log.info("autopilot_hourly_skip aid=%s reason=mode_not_auto_limits mode=%s", str(aid), str(mode))
             continue
 
-        gids = _autopilot_active_group_ids(aid)
         if not gids:
+            log.info("autopilot_hourly_skip aid=%s reason=no_monitored_groups", str(aid))
             continue
+
+        actions_total = 0
+        applied_total = 0
+        skipped_reason_counts: Counter[str] = Counter()
 
         for gid in gids:
             eff = _autopilot_effective_config_for_group(aid, gid)
             try:
-                actions = _ap_generate_actions(aid, eff=eff) or []
+                actions, reasons = _ap_generate_actions(aid, eff=eff, debug=True)  # type: ignore[misc]
             except Exception:
-                actions = []
+                actions, reasons = ([], ["api_error"])
 
             err_info = get_last_api_error_info() or {}
             if int(err_info.get("code") or 0) == 17:
                 hit_rate_limit = True
                 break
+
+            actions_total += int(len(actions or []))
             if not actions:
+                skipped_reason_counts.update([str(x) for x in (reasons or []) if x])
                 continue
 
             applied_msgs = []
+            blocked_by_limits = 0
             for act in actions:
                 ok, _why = _ap_within_limits_for_auto(aid, act)
                 if not ok:
+                    blocked_by_limits += 1
                     continue
                 kind = str(act.get("kind") or "")
 
@@ -762,6 +808,7 @@ async def _autopilot_hourly_job(context: ContextTypes.DEFAULT_TYPE):
                     res = apply_budget_change(str(act.get("adset_id") or ""), pct_f)
                     if str(res.get("status") or "").lower() in {"ok", "success"}:
                         applied_msgs.append(str(res.get("message") or "") + "\n\n" + _ap_action_text(act))
+                        applied_total += 1
                         append_autopilot_event(
                             aid,
                             {
@@ -782,6 +829,7 @@ async def _autopilot_hourly_job(context: ContextTypes.DEFAULT_TYPE):
                     res = pause_ad(ad_id)
                     if str(res.get("status") or "").lower() in {"ok", "success"}:
                         applied_msgs.append(str(res.get("message") or res.get("exception") or "") + "\n\n" + _ap_action_text(act))
+                        applied_total += 1
                         append_autopilot_event(
                             aid,
                             {
@@ -824,8 +872,32 @@ async def _autopilot_hourly_job(context: ContextTypes.DEFAULT_TYPE):
                     disable_notification=bool(quiet),
                 )
 
+            if actions and blocked_by_limits >= int(len(actions)):
+                skipped_reason_counts.update(["all_candidates_blocked_by_limits"])
+
         if hit_rate_limit:
             break
+
+        log.info(
+            "autopilot_hourly_finish aid=%s actions_total=%s applied_total=%s skipped_reason_counts=%s",
+            str(aid),
+            int(actions_total),
+            int(applied_total),
+            dict(skipped_reason_counts),
+        )
+
+        if int(actions_total) <= 0 and not hit_rate_limit:
+            reason_txt = _ap_top_reasons(list(skipped_reason_counts.elements()) or [], n=2)
+            if reason_txt:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"🤖 Автопилот — почасовой прогон ({get_account_name(aid)})\n"
+                        "Действий: 0\n"
+                        f"Причина: {reason_txt}"
+                    ),
+                    disable_notification=bool(quiet),
+                )
 
     if hit_rate_limit:
         after_s = rate_limit_retry_after_seconds()
@@ -887,6 +959,7 @@ async def _autopilot_warmup_job(context: ContextTypes.DEFAULT_TYPE):
     total_groups = 0
     total_actions = 0
     hit_rate_limit = False
+    reason_counts: Counter[str] = Counter()
 
     for aid, row in store.items():
         if not (row or {}).get("enabled", True):
@@ -912,9 +985,9 @@ async def _autopilot_warmup_job(context: ContextTypes.DEFAULT_TYPE):
             gname = eff.get("group_name") or str(gid)
 
             try:
-                actions = _ap_generate_actions(aid, eff=eff) or []
+                actions, reasons = _ap_generate_actions(aid, eff=eff, debug=True)  # type: ignore[misc]
             except Exception:
-                actions = []
+                actions, reasons = ([], ["api_error"])
 
             err_info = get_last_api_error_info() or {}
             code = int(err_info.get("code") or 0)
@@ -934,11 +1007,11 @@ async def _autopilot_warmup_job(context: ContextTypes.DEFAULT_TYPE):
                 any_lines.append(f"\n🤖 Группа: {gname} — идеи: {len(actions)}{suffix}")
                 any_lines.append("\n\n---\n\n".join(shown))
             else:
-                goals = eff.get("goals") or {}
-                if isinstance(goals, dict) and (goals.get("target_cpl") in (None, "")):
-                    any_lines.append(f"\n🤖 Группа: {gname} — действий нет (цель CPL не задана → работаю от базы 3 дня)")
-                else:
-                    any_lines.append(f"\n🤖 Группа: {gname} — действий нет")
+                reason_counts.update([str(x) for x in (reasons or []) if x])
+                reason_txt = _ap_top_reasons(reasons or [], n=2)
+                any_lines.append(f"\n🤖 Группа: {gname} — действий нет")
+                if reason_txt:
+                    any_lines.append(f"Причина: {reason_txt}")
 
         if hit_rate_limit:
             break
@@ -952,6 +1025,11 @@ async def _autopilot_warmup_job(context: ContextTypes.DEFAULT_TYPE):
     header = header + status_line + "\n"
     header = header + "Это не часовой срез. Ничего не применяю, только подсказываю идеи.\n"
     header = header + f"Активных групп: {total_groups} | Рекомендаций: {total_actions}\n"
+
+    if int(total_actions) <= 0 and not hit_rate_limit:
+        top_reason = _ap_top_reasons(list(reason_counts.elements()) or [], n=2)
+        if top_reason:
+            header = header + f"Причина: {top_reason}\n"
 
     if diag_lines:
         diag = "\n" + "\n".join(diag_lines[:3])
@@ -2433,6 +2511,11 @@ def account_reports_periods_kb(aid: str, mode: str) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
+                    "Свой диапазон", callback_data=f"{base}|custom"
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     "⬅️ Назад",
                     callback_data=f"rep_acc_back|{aid}|{mode}",
                 )
@@ -3787,7 +3870,10 @@ async def _on_cb_internal(
 
         ap = _autopilot_get(aid)
         mode = str(ap.get("mode") or "OFF").upper()
-        actions = _ap_generate_actions(aid) or []
+        try:
+            actions, reasons = _ap_generate_actions(aid, debug=True)  # type: ignore[misc]
+        except Exception:
+            actions, reasons = ([], ["api_error"])
         append_autopilot_event(
             aid,
             {
@@ -3798,10 +3884,12 @@ async def _on_cb_internal(
         )
 
         if not actions:
+            reason_txt = _ap_top_reasons(reasons or [], n=2)
             await safe_edit_message(
                 q,
                 "Нет подходящих действий по текущим данным.\n\n"
-                "Подсказка: проверь, что есть spend сегодня и что adset ACTIVE/SCHEDULED.",
+                + (f"Причина: {reason_txt}\n\n" if reason_txt else "")
+                + "Подсказка: проверь, что есть spend сегодня и что adset ACTIVE/SCHEDULED.",
                 reply_markup=_autopilot_analysis_kb(aid),
             )
             return
@@ -3916,7 +4004,12 @@ async def _on_cb_internal(
                 kind = str(act.get("kind") or "")
                 allow_edit = kind == "budget_pct"
                 kb = _ap_action_kb(allow_apply=True, token=token, allow_edit=allow_edit)
-                await context.bot.send_message(chat_id, _ap_action_text(act) + f"\n\n⚠️ Вне лимитов режима 'Авто с лимитами': {why}", reply_markup=kb)
+                await context.bot.send_message(
+                    chat_id,
+                    _ap_action_text(act)
+                    + f"\n\n⚠️ Вне лимитов режима 'Авто с лимитами': {why}",
+                    reply_markup=kb,
+                )
                 continue
 
             # SEMI / OFF: SEMI — подтверждение вручную; OFF — по факту тоже не должен предлагать, но оставим безопасно.
@@ -3926,7 +4019,9 @@ async def _on_cb_internal(
 
             kind = str(act.get("kind") or "")
             allow_edit = kind == "budget_pct"
-            kb = _ap_action_kb(allow_apply=bool(act.get("allow_apply")), token=token, allow_edit=allow_edit)
+            kb = _ap_action_kb(
+                allow_apply=bool(act.get("allow_apply")), token=token, allow_edit=allow_edit
+            )
             await context.bot.send_message(chat_id, _ap_action_text(act), reply_markup=kb)
 
         await safe_edit_message(
@@ -3936,6 +4031,59 @@ async def _on_cb_internal(
             + "Каждое действие отдельным сообщением ниже.",
             reply_markup=_autopilot_analysis_kb(aid),
         )
+        return
+
+    if data.startswith("ap_dry|"):
+        aid = data.split("|", 1)[1]
+        await safe_edit_message(q, f"🧪 Dry-run: {get_account_name(aid)} — считаю, что бы сделал…")
+
+        ap = _autopilot_get(aid)
+        mode = str(ap.get("mode") or "OFF").upper()
+        gids = _autopilot_active_group_ids(aid)
+
+        lines = [f"🧪 Dry-run автопилота: {get_account_name(aid)}", f"Режим: {mode}", ""]
+        if mode != "AUTO_LIMITS":
+            lines.append(f"⚠️ Прогон без применения: режим сейчас {mode} (hourly работает только в AUTO_LIMITS)")
+            lines.append("")
+
+        if not gids:
+            lines.append("Действий: 0")
+            lines.append(f"Причина: {_ap_reason_human('no_monitored_groups')}")
+            await context.bot.send_message(chat_id, "\n".join(lines), disable_notification=False)
+            await safe_edit_message(q, "🧪 Dry-run завершён.", reply_markup=_autopilot_analysis_kb(aid))
+            return
+
+        total_actions = 0
+        reason_counts: Counter[str] = Counter()
+        for gid in gids:
+            eff = _autopilot_effective_config_for_group(aid, gid)
+            gname = eff.get("group_name") or str(gid)
+            try:
+                actions, reasons = _ap_generate_actions(aid, eff=eff, debug=True)  # type: ignore[misc]
+            except Exception:
+                actions, reasons = ([], ["api_error"])
+
+            total_actions += int(len(actions or []))
+            if actions:
+                lines.append(f"🤖 Группа: {gname} — идеи: {len(actions)}")
+                for act in (actions or [])[:5]:
+                    lines.append("")
+                    lines.append(_ap_action_text(act))
+            else:
+                reason_counts.update([str(x) for x in (reasons or []) if x])
+                reason_txt = _ap_top_reasons(reasons or [], n=2)
+                lines.append(f"🤖 Группа: {gname} — действий 0")
+                if reason_txt:
+                    lines.append(f"Причина: {reason_txt}")
+            lines.append("")
+
+        if total_actions <= 0:
+            top = _ap_top_reasons(list(reason_counts.elements()) or [], n=2)
+            if top:
+                lines.append(f"Итого причина: {top}")
+
+        await context.bot.send_message(chat_id, "\n".join(lines), disable_notification=False)
+        await safe_edit_message(q, "🧪 Dry-run завершён.", reply_markup=_autopilot_analysis_kb(aid))
         return
 
     if data == "insta_links_menu":
@@ -5030,6 +5178,25 @@ async def _on_cb_internal(
         # Формат: rep_acc_p|{aid}|{mode}|{kind}
         _, aid, mode, kind = data.split("|", 3)
 
+        if kind == "custom":
+            context.user_data["await_rep_acc_range_for"] = {"aid": aid, "mode": mode}
+            mode_human = {
+                "general": "общий отчёт",
+                "campaigns": "по кампаниям",
+                "adsets": "по адсетам",
+                "ads": "по объявлениям",
+            }.get(str(mode), str(mode))
+            await safe_edit_message(
+                q,
+                (
+                    f"🗓 Отчёт по: {get_account_name(aid)}\n"
+                    f"Уровень: {mode_human}\n\n"
+                    "Введи даты форматом: 01.06.2025-07.06.2025"
+                ),
+                reply_markup=account_reports_periods_kb(aid, mode),
+            )
+            return
+
         # Общий отчёт по аккаунту — используем существующую логику one_*.
         if mode == "general":
             if kind == "today":
@@ -5132,6 +5299,19 @@ async def _on_cb_internal(
                 f"Готовлю отчёт по адсетам для {name} ({label})…",
             )
             txt = build_account_report(aid, period, "ADSET", label=label)
+            await context.bot.send_message(
+                chat_id,
+                txt or "Нет данных/нет доступа.",
+                parse_mode="HTML",
+            )
+            return
+
+        if mode == "ads":
+            await safe_edit_message(
+                q,
+                f"Готовлю отчёт по объявлениям для {name} ({label})…",
+            )
+            txt = build_account_report(aid, period, "AD", label=label)
             await context.bot.send_message(
                 chat_id,
                 txt or "Нет данных/нет доступа.",
@@ -7111,6 +7291,64 @@ async def on_text_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
         period, label = parsed
         await update.message.reply_text(f"Готовлю отчёт за {label}…")
         await send_period_report(context, str(DEFAULT_REPORT_CHAT), period, label)
+        return
+
+    # Кастомный диапазон для отчёта по одному аккаунту на выбранном уровне (rep_acc_p|...|custom)
+    if context.user_data.get("await_rep_acc_range_for"):
+        payload = context.user_data.pop("await_rep_acc_range_for", None) or {}
+        aid = str(payload.get("aid") or "")
+        mode = str(payload.get("mode") or "general")
+        parsed = parse_range(text)
+        if not parsed:
+            await update.message.reply_text(
+                "Формат дат: 01.06.2025-07.06.2025. Попробуй ещё раз."
+            )
+            context.user_data["await_rep_acc_range_for"] = payload
+            return
+
+        period, label = parsed
+        name = get_account_name(aid) if aid else ""
+        if not aid:
+            await update.message.reply_text("❌ Не удалось построить отчёт: не найден аккаунт.")
+            return
+
+        if mode == "general":
+            await update.message.reply_text(f"Готовлю отчёт по {name} за {label}…")
+            txt = get_cached_report(aid, period, label)
+            await update.message.reply_text(
+                txt or "Нет данных/нет доступа.",
+                parse_mode="HTML",
+            )
+            return
+
+        if mode == "campaigns":
+            await update.message.reply_text(f"Готовлю отчёт по кампаниям для {name} ({label})…")
+            txt = build_account_report(aid, period, "CAMPAIGN", label=label)
+            await update.message.reply_text(
+                txt or "Нет данных/нет доступа.",
+                parse_mode="HTML",
+            )
+            return
+
+        if mode == "adsets":
+            await update.message.reply_text(f"Готовлю отчёт по адсетам для {name} ({label})…")
+            txt = build_account_report(aid, period, "ADSET", label=label)
+            await update.message.reply_text(
+                txt or "Нет данных/нет доступа.",
+                parse_mode="HTML",
+            )
+            return
+
+        if mode == "ads":
+            await update.message.reply_text(f"Готовлю отчёт по объявлениям для {name} ({label})…")
+            txt = build_account_report(aid, period, "AD", label=label)
+            await update.message.reply_text(
+                txt or "Нет данных/нет доступа.",
+                parse_mode="HTML",
+            )
+            return
+
+        await update.message.reply_text("❌ Не удалось построить отчёт: неизвестный режим.")
         return
 
     # Сравнение периодов для отчёта "по всем" (rep_all_compare)

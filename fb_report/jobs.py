@@ -19,6 +19,7 @@ from .cpa_monitoring import (
 )
 from .adsets import fetch_adset_insights_7d
 from .insights import build_hourly_heatmap_for_account
+from .autopilot_format import ap_action_text
 
 # Для Railway могут быть разные пути импорта services.*.
 # Пытаемся взять реальные функции, а при ошибке делаем мягкие заглушки,
@@ -1409,8 +1410,21 @@ async def _autopilot_heatmap_job(context: ContextTypes.DEFAULT_TYPE):
         lines.append("Изменения бюджетов:")
         for a in applied[:25]:
             nm = str(a.get("adset_name") or "").strip()
-            head = f"- {a['adset_id']}" + (f" ({nm})" if nm else "")
-            lines.append(f"{head}: {float(a['old']):.2f} → {float(a['new']):.2f} $")
+            act = {
+                "kind": "budget_abs",
+                "adset_id": str(a.get("adset_id") or ""),
+                "name": nm or str(a.get("adset_id") or ""),
+                "old_budget": float(a.get("old") or 0.0),
+                "new_budget": float(a.get("new") or 0.0),
+                "reason": f"heatmap hour={hour:02d}:00 ({hour_tag})",
+            }
+            # Переиспользуем автопилотный формат сообщений (единый UX).
+            try:
+                lines.append(ap_action_text(act))
+            except Exception:
+                lines.append(
+                    f"- {act['adset_id']}: {float(act.get('old_budget') or 0.0):.2f} → {float(act.get('new_budget') or 0.0):.2f} $"
+                )
 
             ht = a.get("hm_today") or {}
             h7 = a.get("hm_7d") or {}

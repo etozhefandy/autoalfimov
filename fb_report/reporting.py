@@ -28,7 +28,7 @@ from .insights import (
     _blend_totals,
 )
 
-from services.analytics import analyze_campaigns, analyze_adsets
+from services.analytics import analyze_campaigns, analyze_adsets, analyze_ads
 from services.analytics import lead_cost_and_count
 
 
@@ -502,6 +502,30 @@ def build_account_report(
         )
         chunks.append(adsets_text)
         current_chars += len(sep) + len(adsets_text)
+        if show_blended_after_sections and show_blended:
+            if current_chars + len(sep) + len(acc_blended_after_sections) <= tg_max_chars:
+                chunks.append(acc_blended_after_sections)
+                current_chars += len(sep) + len(acc_blended_after_sections)
+
+    if lvl == "AD":
+        ads: list[dict] = []
+        try:
+            ads = analyze_ads(aid, period=period) or []
+        except Exception:
+            ads = []
+
+        # Единственный обязательный фильтр: spend > 0
+        ads_spend = [a for a in (ads or []) if float((a or {}).get("spend", 0.0) or 0.0) > 0]
+        ads_text, _ = _truncate_entity_blocks(
+            header="🎯 Объявления",
+            entities=ads_spend,
+            flags=flags,
+            max_chars=tg_max_chars,
+            current_chars=current_chars + len(sep),
+            kind="объявлений",
+        )
+        chunks.append(ads_text)
+        current_chars += len(sep) + len(ads_text)
         if show_blended_after_sections and show_blended:
             if current_chars + len(sep) + len(acc_blended_after_sections) <= tg_max_chars:
                 chunks.append(acc_blended_after_sections)
