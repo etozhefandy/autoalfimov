@@ -10,7 +10,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes, Application
 
 from .constants import ALMATY_TZ, DEFAULT_REPORT_CHAT, AUTOPILOT_CHAT_ID, ALLOWED_USER_IDS
-from .storage import load_accounts, get_account_name, get_autopilot_chat_id
+from .storage import load_accounts, get_account_name, resolve_autopilot_chat_id
 from .reporting import send_period_report, get_cached_report, build_account_report
 from .cpa_monitoring import (
     build_monitor_snapshot,
@@ -101,12 +101,20 @@ except Exception:  # noqa: BLE001
 
 
 def _autopilot_report_chat_id() -> str:
-    cid = get_autopilot_chat_id()
-    if cid:
-        return str(cid)
-    if str(AUTOPILOT_CHAT_ID or "").strip():
-        return str(AUTOPILOT_CHAT_ID).strip()
-    return str(DEFAULT_REPORT_CHAT)
+    # Backward-compat wrapper (kept to avoid invasive refactor).
+    cid, _src = resolve_autopilot_chat_id()
+    return str(cid)
+
+
+def _resolve_autopilot_chat_id_logged(*, reason: str) -> tuple[str, str]:
+    cid, src = resolve_autopilot_chat_id()
+    logging.getLogger(__name__).info(
+        "autopilot_chat_resolve autopilot_chat_id=%s source=%s reason=%s",
+        str(cid),
+        str(src),
+        str(reason),
+    )
+    return str(cid), str(src)
 
 
 try:  # pragma: no cover
@@ -655,7 +663,7 @@ def _ap_heatmap_profile(summary: dict) -> tuple[list[int], list[int]]:
 
 
 async def _autopilot_heatmap_job(context: ContextTypes.DEFAULT_TYPE):
-    chat_id = _autopilot_report_chat_id()
+    chat_id, _src = _resolve_autopilot_chat_id_logged(reason="autopilot_heatmap_job")
     now = datetime.now(ALMATY_TZ)
     hour = int(now.strftime("%H"))
 
@@ -2346,22 +2354,44 @@ def schedule_cpa_alerts(app: Application):
     # Планировщик CPA-алёртов: единый повторяющийся джоб раз в час.
     # Внутри _cpa_alerts_job уже учитывает days/freq и решает,
     # нужно ли слать уведомления в этот час.
+    # Stagger jobs to reduce FB burst.
+    try:
+        now = datetime.now(ALMATY_TZ)
+        first_cpa = now.replace(minute=25, second=0, microsecond=0)
+        if first_cpa <= now:
+            first_cpa = first_cpa + timedelta(hours=1)
+    except Exception:
+        first_cpa = timedelta(minutes=25)
     app.job_queue.run_repeating(
         _cpa_alerts_job,
         interval=timedelta(hours=1),
-        first=timedelta(minutes=15),
+        first=first_cpa,
     )
 
     # Часовой снимок инсайтов за today для часового кэша
+    try:
+        now = datetime.now(ALMATY_TZ)
+        first_snap = now.replace(minute=0, second=0, microsecond=0)
+        if first_snap <= now:
+            first_snap = first_snap + timedelta(hours=1)
+    except Exception:
+        first_snap = timedelta(minutes=0)
     app.job_queue.run_repeating(
         _hourly_snapshot_job,
         interval=timedelta(hours=1),
-        first=timedelta(minutes=5),
+        first=first_snap,
     )
 
     # Heatmap Autopilot (AUTO_LIMITS)
+    try:
+        now = datetime.now(ALMATY_TZ)
+        first_hm = now.replace(minute=15, second=0, microsecond=0)
+        if first_hm <= now:
+            first_hm = first_hm + timedelta(hours=1)
+    except Exception:
+        first_hm = timedelta(minutes=15)
     app.job_queue.run_repeating(
         _autopilot_heatmap_job,
         interval=timedelta(hours=1),
-        first=timedelta(minutes=20),
+        first=first_hm,
     )

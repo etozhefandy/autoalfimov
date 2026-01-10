@@ -49,8 +49,8 @@ from .storage import (
     get_lead_metric_for_account,
     set_lead_metric_for_account,
     clear_lead_metric_for_account,
-    get_autopilot_chat_id,
     set_autopilot_chat_id,
+    resolve_autopilot_chat_id,
 )
 from .reporting import (
     fmt_int,
@@ -83,6 +83,7 @@ from services.facebook_api import (
     get_last_api_error_info,
     is_rate_limited_now,
     rate_limit_retry_after_seconds,
+    classify_api_error,
 )
 from services.ai_focus import get_focus_comment, ask_deepseek, sanitize_ai_text
 from fb_report.cpa_monitoring import build_anomaly_messages_for_account
@@ -102,13 +103,15 @@ def _allowed(update: Update) -> bool:
     return False
 
 
-def _autopilot_report_chat_id() -> str:
-    cid = get_autopilot_chat_id()
-    if cid:
-        return str(cid)
-    if str(AUTOPILOT_CHAT_ID or "").strip():
-        return str(AUTOPILOT_CHAT_ID).strip()
-    return str(DEFAULT_REPORT_CHAT)
+def _resolve_autopilot_chat_id_logged(*, reason: str) -> tuple[str, str]:
+    cid, src = resolve_autopilot_chat_id()
+    logging.getLogger(__name__).info(
+        "autopilot_chat_resolve autopilot_chat_id=%s source=%s reason=%s",
+        str(cid),
+        str(src),
+        str(reason),
+    )
+    return str(cid), str(src)
 
 
 def _autopilot_menu_kb() -> InlineKeyboardMarkup:
@@ -165,6 +168,10 @@ def _ap_reason_human(code: str) -> str:
         "no_spend": "нет расходов за период",
         "too_low_spend": "слишком малый расход для уверенных выводов",
         "rate_limit": "лимит Facebook API (code 17)",
+        "fb_auth_error": "токен/доступ (code 190)",
+        "fb_invalid_param": "неверный параметр (code 100)",
+        "fb_permission_error": "нет прав/доступа (FB permissions)",
+        "fb_unknown_api_error": "неизвестная ошибка Facebook API",
         "api_error": "ошибка Facebook API",
         "no_campaigns_in_group": "в группе нет кампаний",
         "all_candidates_blocked_by_limits": "все кандидаты вне лимитов режима AUTO_LIMITS",
@@ -393,7 +400,10 @@ def _ap_generate_actions(
         debug_reasons.append("rate_limit")
         return ([], debug_reasons) if debug else []
     if api_failed and not debug_reasons:
-        debug_reasons.append("api_error")
+        try:
+            debug_reasons.append(str(classify_api_error(get_last_api_error_info() or {})))
+        except Exception:
+            debug_reasons.append("api_error")
 
     ads_by_adset: dict[str, list[dict]] = {}
     for a in (today_ads or []):
@@ -713,7 +723,7 @@ def _ap_within_limits_for_auto(aid: str, act: dict) -> tuple[bool, str]:
 
 
 async def _autopilot_hourly_job(context: ContextTypes.DEFAULT_TYPE):
-    chat_id = _autopilot_report_chat_id()
+    chat_id, _src = _resolve_autopilot_chat_id_logged(reason="autopilot_hourly_job")
     now = datetime.now(ALMATY_TZ)
     hour = int(now.strftime("%H"))
     quiet = (hour >= 22) or (hour < 10)
@@ -924,7 +934,7 @@ async def _autopilot_hourly_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _autopilot_warmup_job(context: ContextTypes.DEFAULT_TYPE):
-    chat_id = _autopilot_report_chat_id()
+    chat_id, _src = _resolve_autopilot_chat_id_logged(reason="autopilot_warmup_job")
     now = datetime.now(ALMATY_TZ)
     hour = int(now.strftime("%H"))
     quiet = (hour >= 22) or (hour < 10)
@@ -3254,7 +3264,23 @@ async def on_cb_autopilot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = q.data or ""
     chat_id = str(q.message.chat.id)
 
-    await _on_cb_internal(update, context, q, chat_id, data)
+    try:
+        await _on_cb_internal(update, context, q, chat_id, data)
+    except Exception as e:
+        logging.getLogger(__name__).exception(
+            "callback_error scope=autopilot chat_id=%s data=%s",
+            str(chat_id),
+            str(data),
+            exc_info=e,
+        )
+        try:
+            await q.answer("⚠️ Ошибка обработки кнопки (см. логи)", show_alert=True)
+        except Exception:
+            pass
+        try:
+            await safe_edit_message(q, "⚠️ Ошибка обработки кнопки, смотри логи.")
+        except Exception:
+            pass
     return
 
 
@@ -3268,7 +3294,23 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = q.data or ""
     chat_id = str(q.message.chat.id)
 
-    await _on_cb_internal(update, context, q, chat_id, data)
+    try:
+        await _on_cb_internal(update, context, q, chat_id, data)
+    except Exception as e:
+        logging.getLogger(__name__).exception(
+            "callback_error scope=general chat_id=%s data=%s",
+            str(chat_id),
+            str(data),
+            exc_info=e,
+        )
+        try:
+            await q.answer("⚠️ Ошибка обработки кнопки (см. логи)", show_alert=True)
+        except Exception:
+            pass
+        try:
+            await safe_edit_message(q, "⚠️ Ошибка обработки кнопки, смотри логи.")
+        except Exception:
+            pass
 
 
 async def _on_cb_internal(
@@ -3868,6 +3910,23 @@ async def _on_cb_internal(
         aid = data.split("|", 1)[1]
         await safe_edit_message(q, f"Генерирую действия для {get_account_name(aid)}…")
 
+        ap_chat_id, _src = _resolve_autopilot_chat_id_logged(reason="ap_suggest")
+
+        if is_rate_limited_now():
+            after_s = rate_limit_retry_after_seconds()
+            mins = max(1, int(round(float(after_s) / 60.0)))
+            await context.bot.send_message(
+                chat_id=ap_chat_id,
+                text=(
+                    f"🤖 Автопилот — предложения ({get_account_name(aid)})\n"
+                    "Действий: 0\n"
+                    f"Причина: лимит API (code 17), повторю через ~{mins} мин"
+                ),
+                disable_notification=False,
+            )
+            await safe_edit_message(q, "⚠️ Сейчас лимит FB API. Попробуй позже.", reply_markup=_autopilot_analysis_kb(aid))
+            return
+
         ap = _autopilot_get(aid)
         mode = str(ap.get("mode") or "OFF").upper()
         try:
@@ -3905,7 +3964,7 @@ async def _on_cb_internal(
                 act["token"] = token
                 pending[token] = act
                 kb = _ap_action_kb(allow_apply=False, token=token, allow_edit=False)
-                await context.bot.send_message(chat_id, _ap_action_text(act), reply_markup=kb)
+                await context.bot.send_message(ap_chat_id, _ap_action_text(act), reply_markup=kb)
                 continue
 
             # AUTO_LIMITS: автоприменяем только строго в рамках лимитов.
@@ -3936,7 +3995,7 @@ async def _on_cb_internal(
                             },
                         )
                         await context.bot.send_message(
-                            chat_id,
+                            ap_chat_id,
                             "🤖 Авто с лимитами: применено автоматически\n\n" + str(res.get("message") or "") + "\n\n" + _ap_action_text(act),
                         )
                         auto_applied += 1
@@ -3969,7 +4028,7 @@ async def _on_cb_internal(
                                 },
                             )
                             await context.bot.send_message(
-                                chat_id,
+                                ap_chat_id,
                                 "🤖 Авто с лимитами: применено автоматически\n\n" + str(res.get("message") or res.get("exception") or "") + "\n\n" + _ap_action_text(act),
                             )
                             auto_applied += 1
@@ -3991,7 +4050,7 @@ async def _on_cb_internal(
                             },
                         )
                         await context.bot.send_message(
-                            chat_id,
+                            ap_chat_id,
                             "🤖 Авто с лимитами: применено автоматически\n\n" + (res.get("message") or "") + "\n\n" + _ap_action_text(act),
                         )
                         auto_applied += 1
@@ -4005,7 +4064,7 @@ async def _on_cb_internal(
                 allow_edit = kind == "budget_pct"
                 kb = _ap_action_kb(allow_apply=True, token=token, allow_edit=allow_edit)
                 await context.bot.send_message(
-                    chat_id,
+                    ap_chat_id,
                     _ap_action_text(act)
                     + f"\n\n⚠️ Вне лимитов режима 'Авто с лимитами': {why}",
                     reply_markup=kb,
@@ -4037,6 +4096,8 @@ async def _on_cb_internal(
         aid = data.split("|", 1)[1]
         await safe_edit_message(q, f"🧪 Dry-run: {get_account_name(aid)} — считаю, что бы сделал…")
 
+        ap_chat_id, _src = _resolve_autopilot_chat_id_logged(reason="ap_dry")
+
         ap = _autopilot_get(aid)
         mode = str(ap.get("mode") or "OFF").upper()
         gids = _autopilot_active_group_ids(aid)
@@ -4049,7 +4110,7 @@ async def _on_cb_internal(
         if not gids:
             lines.append("Действий: 0")
             lines.append(f"Причина: {_ap_reason_human('no_monitored_groups')}")
-            await context.bot.send_message(chat_id, "\n".join(lines), disable_notification=False)
+            await context.bot.send_message(ap_chat_id, "\n".join(lines), disable_notification=False)
             await safe_edit_message(q, "🧪 Dry-run завершён.", reply_markup=_autopilot_analysis_kb(aid))
             return
 
@@ -4082,7 +4143,7 @@ async def _on_cb_internal(
             if top:
                 lines.append(f"Итого причина: {top}")
 
-        await context.bot.send_message(chat_id, "\n".join(lines), disable_notification=False)
+        await context.bot.send_message(ap_chat_id, "\n".join(lines), disable_notification=False)
         await safe_edit_message(q, "🧪 Dry-run завершён.", reply_markup=_autopilot_analysis_kb(aid))
         return
 
@@ -7652,10 +7713,23 @@ def build_app() -> Application:
 
     schedule_cpa_alerts(app)
 
+    try:
+        _resolve_autopilot_chat_id_logged(reason="scheduler_startup")
+    except Exception:
+        pass
+
+    # Stagger hourly jobs to reduce FB burst: hourly autopilot starts at :05 each hour.
+    try:
+        now = datetime.now(ALMATY_TZ)
+        first_at = now.replace(minute=5, second=0, microsecond=0)
+        if first_at <= now:
+            first_at = first_at + timedelta(hours=1)
+    except Exception:
+        first_at = timedelta(minutes=5)
     app.job_queue.run_repeating(
         _autopilot_hourly_job,
         interval=timedelta(hours=1),
-        first=timedelta(minutes=13),
+        first=first_at,
     )
 
     app.job_queue.run_once(

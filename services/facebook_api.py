@@ -5,6 +5,8 @@ from datetime import datetime
 import json
 import time
 import random
+import os
+import threading
 
 from facebook_business.api import FacebookAdsApi
 from facebook_business.adobjects.adaccount import AdAccount
@@ -20,6 +22,11 @@ _LAST_API_ERROR: Optional[str] = None
 _LAST_API_ERROR_AT: Optional[str] = None
 _LAST_API_ERROR_INFO: Dict[str, Any] = {}
 _RATE_LIMIT_UNTIL_TS: float = 0.0
+
+_RL_LOCK = threading.Lock()
+_NEXT_ALLOWED_TS: float = 0.0
+_MIN_DELAY_S: float = float(os.getenv("FB_MIN_DELAY_S", "0.25") or 0.25)
+_JITTER_S: float = float(os.getenv("FB_JITTER_S", "0.15") or 0.15)
 
 
 def get_last_api_error() -> Dict[str, Optional[str]]:
@@ -58,6 +65,61 @@ def _set_last_error_info(info: Dict[str, Any]) -> None:
     _LAST_API_ERROR_INFO = info
 
 
+def classify_api_error(info: Dict[str, Any]) -> str:
+    """Classifies FB errors into stable short codes for UI/debug reasons."""
+    try:
+        code = int((info or {}).get("code") or 0)
+    except Exception:
+        code = 0
+    if code == 17:
+        return "rate_limit"
+    if code == 190:
+        return "fb_auth_error"
+    if code == 100:
+        return "fb_invalid_param"
+    if code in {10, 200, 368}:
+        return "fb_permission_error"
+    if code:
+        return "fb_unknown_api_error"
+    return "api_error"
+
+
+def _sanitize_params(params: Any) -> Any:
+    if not isinstance(params, dict):
+        return None
+    out: Dict[str, Any] = {}
+    for k, v in params.items():
+        key = str(k)
+        if key.lower() in {"access_token", "appsecret_proof"}:
+            continue
+        if isinstance(v, (list, tuple)):
+            out[key] = f"list(len={len(v)})"
+        elif isinstance(v, dict):
+            out[key] = f"dict(keys={len(v)})"
+        else:
+            try:
+                s = str(v)
+            except Exception:
+                s = "<unprintable>"
+            out[key] = s[:120]
+    return out
+
+
+def _rate_limit_wait() -> None:
+    global _NEXT_ALLOWED_TS
+    if float(_MIN_DELAY_S or 0.0) <= 0:
+        return
+    now = time.time()
+    with _RL_LOCK:
+        base = max(float(_NEXT_ALLOWED_TS or 0.0), now)
+        jitter = random.random() * float(_JITTER_S or 0.0)
+        next_ts = base + float(_MIN_DELAY_S) + jitter
+        wait_s = max(0.0, base - now)
+        _NEXT_ALLOWED_TS = next_ts
+    if wait_s > 0:
+        time.sleep(wait_s)
+
+
 # ИНИЦИАЛИЗАЦИЯ FACEBOOK API (один раз для всего проекта)
 if FB_ACCESS_TOKEN:
     # Используем токен без app_id/app_secret, как в config.py.
@@ -72,16 +134,29 @@ def safe_api_call(fn, *args, **kwargs):
     Ловит ошибки, возвращает None в случае неудачи.
     """
     global _LAST_API_ERROR, _LAST_API_ERROR_AT
+    meta = kwargs.pop("_meta", None)
+    endpoint = None
+    meta_params = None
+    try:
+        if isinstance(meta, dict):
+            endpoint = meta.get("endpoint") or meta.get("path") or meta.get("name")
+            meta_params = meta.get("params")
+    except Exception:
+        endpoint = None
+        meta_params = None
+
     if is_rate_limited_now():
         _set_last_error_info(
             {
                 "code": 17,
                 "message": "User request limit reached (rate limited)",
                 "kind": "rate_limit",
+                "endpoint": endpoint,
             }
         )
         return None
     try:
+        _rate_limit_wait()
         return fn(*args, **kwargs)
     except FacebookRequestError as e:
         code = None
@@ -109,14 +184,28 @@ def safe_api_call(fn, *args, **kwargs):
             "code": code,
             "subcode": subcode,
             "message": _LAST_API_ERROR,
+            "endpoint": endpoint,
+            "params": _sanitize_params(meta_params) or _sanitize_params(kwargs.get("params")),
         }
+        try:
+            fbtrace_id = getattr(e, "api_error_trace_id", None)
+            if callable(fbtrace_id):
+                info["fbtrace_id"] = fbtrace_id()
+        except Exception:
+            pass
         _set_last_error_info(info)
 
         if code == 17:
-            base_min = 20
-            base_max = 30
-            jitter = random.randint(0, 5)
-            minutes = random.randint(base_min, base_max) + jitter
+            try:
+                base_min = int(os.getenv("FB_RL_BACKOFF_MIN", "10") or 10)
+            except Exception:
+                base_min = 10
+            try:
+                base_max = int(os.getenv("FB_RL_BACKOFF_MAX", "20") or 20)
+            except Exception:
+                base_max = 20
+            jitter_m = random.randint(0, 5)
+            minutes = random.randint(base_min, max(base_min, base_max)) + jitter_m
             _mark_rate_limited_for(float(minutes) * 60.0)
 
         print(f"[facebook_api] Error: {e}")

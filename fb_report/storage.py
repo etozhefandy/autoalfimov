@@ -17,6 +17,8 @@ from .constants import (
     EXCLUDED_NAME_KEYWORDS,
     AD_ACCOUNTS_FALLBACK,
     ALMATY_TZ,
+    AUTOPILOT_CHAT_ID,
+    DEFAULT_REPORT_CHAT,
 )
 
 
@@ -54,6 +56,17 @@ def get_autopilot_chat_id() -> str | None:
 def set_autopilot_chat_id(chat_id: str) -> None:
     cid = str(chat_id or "").strip()
     _atomic_write_json(AUTOPILOT_CONFIG_FILE, {"chat_id": cid})
+
+
+def resolve_autopilot_chat_id() -> tuple[str, str]:
+    """Returns (chat_id, source), where source is one of: storage|env|fallback."""
+    cid = get_autopilot_chat_id()
+    if cid:
+        return str(cid), "storage"
+    env = str(AUTOPILOT_CHAT_ID or "").strip()
+    if env:
+        return env, "env"
+    return str(DEFAULT_REPORT_CHAT), "fallback"
 
 
 def _ensure_accounts_file():
