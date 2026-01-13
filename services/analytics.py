@@ -331,6 +331,8 @@ def analyze_adsets(
     days: int = 7,
     period: Optional[Dict[str, str]] = None,
     lead_action_type: Optional[str] = None,
+    campaign_ids: Optional[List[str]] = None,
+    adset_ids: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Аналитика адсетов:
@@ -353,6 +355,25 @@ def analyze_adsets(
 
     adset_map = {str(a.get("id") or ""): a for a in (adsets or []) if a and a.get("id")}
 
+    filtering = []
+    if campaign_ids:
+        filtering.append(
+            {
+                "field": "campaign.id",
+                "operator": "IN",
+                "value": [str(x) for x in (campaign_ids or []) if str(x)],
+            }
+        )
+    if adset_ids:
+        filtering.append(
+            {
+                "field": "adset.id",
+                "operator": "IN",
+                "value": [str(x) for x in (adset_ids or []) if str(x)],
+            }
+        )
+    params_extra = {"filtering": filtering} if filtering else None
+
     rows = fetch_insights_bulk(
         aid,
         period=period,
@@ -369,6 +390,7 @@ def analyze_adsets(
             "adset_id",
             "campaign_id",
         ],
+        params_extra=params_extra,
     )
 
     try:
@@ -486,6 +508,7 @@ def analyze_ads(
     days: int = 7,
     period: Optional[Dict[str, str]] = None,
     lead_action_type: Optional[str] = None,
+    campaign_ids: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Аналитика объявлений:
@@ -507,6 +530,18 @@ def analyze_ads(
     from services.facebook_api import fetch_insights_bulk
 
     ad_map = {str(a.get("id") or ""): a for a in (ads or []) if a and a.get("id")}
+    params_extra = None
+    if campaign_ids:
+        params_extra = {
+            "filtering": [
+                {
+                    "field": "campaign.id",
+                    "operator": "IN",
+                    "value": [str(x) for x in (campaign_ids or []) if str(x)],
+                }
+            ]
+        }
+
     rows = fetch_insights_bulk(
         aid,
         period=period,
@@ -524,6 +559,7 @@ def analyze_ads(
             "adset_id",
             "campaign_id",
         ],
+        params_extra=params_extra,
     )
 
     try:

@@ -25,8 +25,8 @@ _RATE_LIMIT_UNTIL_TS: float = 0.0
 
 _RL_LOCK = threading.Lock()
 _NEXT_ALLOWED_TS: float = 0.0
-_MIN_DELAY_S: float = float(os.getenv("FB_MIN_DELAY_S", "0.25") or 0.25)
-_JITTER_S: float = float(os.getenv("FB_JITTER_S", "0.15") or 0.15)
+_MIN_DELAY_S: float = float(os.getenv("FB_MIN_DELAY_S", "0.35") or 0.35)
+_JITTER_S: float = float(os.getenv("FB_JITTER_S", "0.20") or 0.20)
 
 
 def get_last_api_error() -> Dict[str, Optional[str]]:
@@ -319,7 +319,12 @@ def _period_to_params(period: Any) -> Dict[str, Any]:
             }
         }
     else:
-        return {"date_preset": str(period)}
+        p = str(period)
+        if p == "last_7_days":
+            p = "last_7d"
+        elif p == "last_3_days":
+            p = "last_3d"
+        return {"date_preset": str(p)}
 
 
 # ========= ОСНОВНАЯ ФУНКЦИЯ: ПОЛУЧЕНИЕ ИНСАЙТОВ С КЭШЕМ =========
@@ -385,7 +390,7 @@ def fetch_campaigns(aid: str) -> List[Dict[str, Any]]:
     ]
     """
     cache_key = f"campaigns:{aid}"
-    cached = _cache_get(cache_key, ttl_s=1800.0)
+    cached = _cache_get(cache_key, ttl_s=21600.0)
     if cached is not None:
         return list(cached)
 
@@ -495,7 +500,7 @@ def fetch_adsets(aid: str) -> List[Dict[str, Any]]:
     ]
     """
     cache_key = f"adsets:{aid}"
-    cached = _cache_get(cache_key, ttl_s=1800.0)
+    cached = _cache_get(cache_key, ttl_s=21600.0)
     if cached is not None:
         return list(cached)
 
@@ -543,7 +548,7 @@ def fetch_ads(aid: str) -> List[Dict[str, Any]]:
     ]
     """
     cache_key = f"ads:{aid}"
-    cached = _cache_get(cache_key, ttl_s=900.0)
+    cached = _cache_get(cache_key, ttl_s=21600.0)
     if cached is not None:
         return list(cached)
 

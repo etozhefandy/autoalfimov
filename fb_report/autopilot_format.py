@@ -7,6 +7,9 @@ def ap_action_text(action: dict) -> str:
     cpl_t = action.get("cpl_today")
     cpl_3 = action.get("cpl_3d")
 
+    label_main = str(action.get("period_label_main") or "Сегодня")
+    label_base = str(action.get("period_label_base") or "Последние 3 дня")
+
     def _fmt_money(v):
         if v is None:
             return "—"
@@ -21,9 +24,10 @@ def ap_action_text(action: dict) -> str:
         except Exception:
             return "0"
 
-    lines = [f"Объект: {name}"]
-    lines.append(f"Сегодня: spend {_fmt_money(sp_t)} | leads {_fmt_int(ld_t)} | CPL {_fmt_money(cpl_t)}")
-    lines.append(f"Последние 3 дня: CPL {_fmt_money(cpl_3)}")
+    lines = []
+    lines.append(f"Объект: {name}")
+    lines.append(f"{label_main}: spend {_fmt_money(sp_t)} | leads {_fmt_int(ld_t)} | CPL {_fmt_money(cpl_t)}")
+    lines.append(f"{label_base}: CPL {_fmt_money(cpl_3)}")
     lines.append("")
 
     if kind == "budget_pct":

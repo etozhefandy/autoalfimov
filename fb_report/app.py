@@ -167,15 +167,16 @@ def _ap_reason_human(code: str) -> str:
         "insufficient_volume": "недостаточно объёма (мало конверсий/переписок)",
         "no_spend": "нет расходов за период",
         "too_low_spend": "слишком малый расход для уверенных выводов",
-        "rate_limit": "лимит Facebook API (code 17)",
+        "rate_limit": "достигнут лимит Facebook API — подожду и продолжу анализ позже",
+        "cache_used": "📌 использую кэшированные данные (обновлю при снятии лимита)",
         "fb_auth_error": "токен/доступ (code 190)",
         "fb_invalid_param": "неверный параметр (code 100)",
         "fb_permission_error": "нет прав/доступа (FB permissions)",
         "fb_unknown_api_error": "неизвестная ошибка Facebook API",
-        "api_error": "ошибка Facebook API",
+        "api_error": "данные из Facebook временно недоступны",
         "no_campaigns_in_group": "в группе нет кампаний",
         "all_candidates_blocked_by_limits": "все кандидаты вне лимитов режима AUTO_LIMITS",
-        "mode_not_auto_limits": "режим не AUTO_LIMITS",
+        "mode_not_supported": "режим не поддерживает почасовой прогон",
         "no_monitored_groups": "нет мониторимых групп",
     }
     return m.get(str(code), str(code))
@@ -348,9 +349,9 @@ def _ap_generate_actions(
         debug_reasons.append("no_campaigns_in_group")
         return ([], debug_reasons) if debug else []
 
-    if is_rate_limited_now():
-        debug_reasons.append("rate_limit")
-        return ([], debug_reasons) if debug else []
+    cache_mode = bool(is_rate_limited_now())
+    if cache_mode:
+        debug_reasons.append("cache_used")
 
     limits = ap.get("limits") or {}
 
@@ -366,31 +367,69 @@ def _ap_generate_actions(
     allow_pause_ads = bool(limits.get("allow_pause_ads", True))
     allow_pause_adsets = bool(limits.get("allow_pause_adsets", False))
 
-    now = datetime.now(ALMATY_TZ)
-    yday = (now - timedelta(days=1)).date()
-    period_3d = {
-        "since": (yday - timedelta(days=2)).strftime("%Y-%m-%d"),
-        "until": yday.strftime("%Y-%m-%d"),
-    }
-
     api_failed = False
+
+    main_period = "last_3d"
+    base_period = "last_7d"
+    used_main = main_period
+    used_base = base_period
+
+    label_main = "Последние 3 дня"
+    if used_main == "today":
+        label_main = "Сегодня"
+
+    label_base = "Последние 7 дней"
+    if used_base == "last_3d":
+        label_base = "Последние 3 дня"
+    elif used_base == "today":
+        label_base = "Сегодня"
+
+    def _enough_rows(rows: list[dict]) -> bool:
+        try:
+            return bool(rows) and len(rows) >= 3
+        except Exception:
+            return bool(rows)
+
     try:
-        today_rows = analyze_adsets(aid, period="today", lead_action_type=lead_action_type) or []
+        today_rows = analyze_adsets(
+            aid,
+            period=main_period,
+            lead_action_type=lead_action_type,
+            campaign_ids=list(group_campaign_set) if group_campaign_set else None,
+        ) or []
     except Exception:
         today_rows = []
         api_failed = True
 
     try:
-        d3_rows = analyze_adsets(aid, period=period_3d, lead_action_type=lead_action_type) or []
+        d3_rows = analyze_adsets(
+            aid,
+            period=base_period,
+            lead_action_type=lead_action_type,
+            campaign_ids=list(group_campaign_set) if group_campaign_set else None,
+        ) or []
     except Exception:
         d3_rows = []
         api_failed = True
 
-    try:
-        today_ads = analyze_ads(aid, period="today", lead_action_type=lead_action_type) or []
-    except Exception:
-        today_ads = []
-        api_failed = True
+    if not _enough_rows(today_rows):
+        used_main = "today"
+        label_main = "Сегодня"
+        try:
+            today_rows = analyze_adsets(
+                aid,
+                period="today",
+                lead_action_type=lead_action_type,
+                campaign_ids=list(group_campaign_set) if group_campaign_set else None,
+            ) or []
+        except Exception:
+            today_rows = []
+            api_failed = True
+
+    if not d3_rows:
+        used_base = used_main
+        label_base = label_main
+        d3_rows = list(today_rows or [])
 
     try:
         err_code = int((get_last_api_error_info() or {}).get("code") or 0)
@@ -398,7 +437,8 @@ def _ap_generate_actions(
         err_code = 0
     if err_code == 17:
         debug_reasons.append("rate_limit")
-        return ([], debug_reasons) if debug else []
+        if not today_rows and not d3_rows:
+            return ([], debug_reasons) if debug else []
     if api_failed and not debug_reasons:
         try:
             debug_reasons.append(str(classify_api_error(get_last_api_error_info() or {})))
@@ -406,19 +446,7 @@ def _ap_generate_actions(
             debug_reasons.append("api_error")
 
     ads_by_adset: dict[str, list[dict]] = {}
-    for a in (today_ads or []):
-        if group_campaign_set:
-            if str((a or {}).get("campaign_id") or "") not in group_campaign_set:
-                continue
-        adset_id = str((a or {}).get("adset_id") or "")
-        if not adset_id:
-            continue
-        st = str((a or {}).get("effective_status") or (a or {}).get("status") or "").upper()
-        if st != "ACTIVE":
-            continue
-        if float((a or {}).get("spend", 0.0) or 0.0) <= 0:
-            continue
-        ads_by_adset.setdefault(adset_id, []).append(a)
+    today_ads: list[dict] = []
 
     def _in_group(r: dict) -> bool:
         if not group_campaign_set:
@@ -505,6 +533,8 @@ def _ap_generate_actions(
                         "leads_today": ld_t,
                         "cpl_today": cpl_t,
                         "cpl_3d": cpl_3,
+                        "period_label_main": label_main,
+                        "period_label_base": label_base,
                         "reason": "Сегодня есть расход, но нет лидов.",
                         "score": sp_t,
                     }
@@ -519,6 +549,29 @@ def _ap_generate_actions(
                 active_cnt = 0
 
             if allow_pause_ads and active_cnt > 1:
+                if not today_ads:
+                    try:
+                        today_ads = analyze_ads(
+                            aid,
+                            period=used_main,
+                            lead_action_type=lead_action_type,
+                            campaign_ids=list(group_campaign_set) if group_campaign_set else None,
+                        ) or []
+                    except Exception:
+                        today_ads = []
+                        api_failed = True
+
+                    for a in (today_ads or []):
+                        adset_id = str((a or {}).get("adset_id") or "")
+                        if not adset_id:
+                            continue
+                        st = str((a or {}).get("effective_status") or (a or {}).get("status") or "").upper()
+                        if st != "ACTIVE":
+                            continue
+                        if float((a or {}).get("spend", 0.0) or 0.0) <= 0:
+                            continue
+                        ads_by_adset.setdefault(adset_id, []).append(a)
+
                 cands = ads_by_adset.get(str(k)) or []
                 cands.sort(key=lambda x: float((x or {}).get("spend", 0.0) or 0.0), reverse=True)
                 cand = cands[0] if cands else None
@@ -536,6 +589,8 @@ def _ap_generate_actions(
                             "leads_today": ld_t,
                             "cpl_today": cpl_t,
                             "cpl_3d": cpl_3,
+                            "period_label_main": label_main,
+                            "period_label_base": label_base,
                             "reason": "Сегодня есть расход, но нет лидов. В adset >1 активного объявления.",
                             "score": sp_t,
                         }
@@ -552,6 +607,8 @@ def _ap_generate_actions(
                     "leads_today": ld_t,
                     "cpl_today": cpl_t,
                     "cpl_3d": cpl_3,
+                    "period_label_main": label_main,
+                    "period_label_base": label_base,
                     "reason": "Сегодня есть расход, но нет лидов. В adset единственное активное объявление — стоит заменить/отключить вручную.",
                     "score": sp_t,
                 }
@@ -587,6 +644,8 @@ def _ap_generate_actions(
                     "leads_today": ld_t,
                     "cpl_today": cpl_t,
                     "cpl_3d": cpl_3,
+                    "period_label_main": label_main,
+                    "period_label_base": label_base,
                     "reason": "CPL в норме/лучше бенчмарка.",
                     "score": sp_t,
                 }
@@ -602,6 +661,8 @@ def _ap_generate_actions(
                     "leads_today": ld_t,
                     "cpl_today": cpl_t,
                     "cpl_3d": cpl_3,
+                    "period_label_main": label_main,
+                    "period_label_base": label_base,
                     "reason": "CPL хуже бенчмарка.",
                     "score": sp_t,
                 }
@@ -728,29 +789,22 @@ async def _autopilot_hourly_job(context: ContextTypes.DEFAULT_TYPE):
     hour = int(now.strftime("%H"))
     quiet = (hour >= 22) or (hour < 10)
 
-    if is_rate_limited_now():
+    rate_limited_start = bool(is_rate_limited_now())
+    rl_mins: int | None = None
+    if rate_limited_start:
         after_s = rate_limit_retry_after_seconds()
-        mins = max(1, int(round(float(after_s) / 60.0)))
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                "🤖 Автопилот — почасовой прогон\n"
-                "⚠️ FB лимит запросов (code 17). Данных нет.\n"
-                f"Повторю через ~{mins} мин."
-            ),
-            disable_notification=bool(quiet),
-        )
+        rl_mins = max(1, int(round(float(after_s) / 60.0)))
+        # Do not stop the job: continue in cache-only mode and retry later.
         try:
             token = uuid.uuid4().hex[:8]
             jitter = int(uuid.uuid4().int % 6)
             context.job_queue.run_once(
                 _autopilot_hourly_job,
-                when=timedelta(minutes=max(5, min(35, mins + jitter))),
+                when=timedelta(minutes=max(5, min(35, int(rl_mins) + jitter))),
                 name=f"autopilot_hourly_retry_{token}",
             )
         except Exception:
             pass
-        return
 
     log = logging.getLogger(__name__)
     store = load_accounts() or {}
@@ -772,9 +826,12 @@ async def _autopilot_hourly_job(context: ContextTypes.DEFAULT_TYPE):
             int(len(gids or [])),
         )
 
-        if mode != "AUTO_LIMITS":
-            log.info("autopilot_hourly_skip aid=%s reason=mode_not_auto_limits mode=%s", str(aid), str(mode))
+        if mode not in {"AUTO_LIMITS", "SEMI"}:
+            log.info("autopilot_hourly_skip aid=%s reason=mode_not_supported mode=%s", str(aid), str(mode))
             continue
+
+        # SEMI always means recommendations-only. Also force dry-run during rate limit.
+        dry_run = (mode == "SEMI") or bool(rate_limited_start)
 
         if not gids:
             log.info("autopilot_hourly_skip aid=%s reason=no_monitored_groups", str(aid))
@@ -783,6 +840,7 @@ async def _autopilot_hourly_job(context: ContextTypes.DEFAULT_TYPE):
         actions_total = 0
         applied_total = 0
         skipped_reason_counts: Counter[str] = Counter()
+        semi_blocks: list[str] = []
 
         for gid in gids:
             eff = _autopilot_effective_config_for_group(aid, gid)
@@ -794,6 +852,7 @@ async def _autopilot_hourly_job(context: ContextTypes.DEFAULT_TYPE):
             err_info = get_last_api_error_info() or {}
             if int(err_info.get("code") or 0) == 17:
                 hit_rate_limit = True
+                skipped_reason_counts.update(["rate_limit"])
                 break
 
             actions_total += int(len(actions or []))
@@ -801,9 +860,23 @@ async def _autopilot_hourly_job(context: ContextTypes.DEFAULT_TYPE):
                 skipped_reason_counts.update([str(x) for x in (reasons or []) if x])
                 continue
 
+            if dry_run:
+                gname = eff.get("group_name") or str(gid)
+                shown = []
+                for act in (actions or [])[:10]:
+                    shown.append(_ap_action_text(act))
+                semi_blocks.append(
+                    f"🤖 Группа: {gname} — рекомендации: {len(actions)}\n\n" + "\n\n---\n\n".join(shown)
+                )
+                continue
+
             applied_msgs = []
             blocked_by_limits = 0
             for act in actions:
+                if is_rate_limited_now():
+                    hit_rate_limit = True
+                    skipped_reason_counts.update(["rate_limit"])
+                    break
                 ok, _why = _ap_within_limits_for_auto(aid, act)
                 if not ok:
                     blocked_by_limits += 1
@@ -896,15 +969,35 @@ async def _autopilot_hourly_job(context: ContextTypes.DEFAULT_TYPE):
             dict(skipped_reason_counts),
         )
 
+        if dry_run and semi_blocks and not hit_rate_limit:
+            banner = ""
+            if mode == "SEMI":
+                banner = "Изменения не применяются, только рекомендации"
+            elif rate_limited_start:
+                banner = "⚠️ Достигнут лимит Facebook API. Изменения не применяются, только рекомендации (кэш)"
+                if rl_mins is not None:
+                    banner = banner + f"\nПовторю сбор данных через ~{int(rl_mins)} мин."
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"🤖 Автопилот — почасовой прогон ({'SEMI' if mode == 'SEMI' else 'AUTO_LIMITS'}) ({get_account_name(aid)})\n"
+                    + banner
+                    + "\n\n"
+                    + "\n\n".join(semi_blocks)
+                ),
+                disable_notification=bool(quiet),
+            )
+
         if int(actions_total) <= 0 and not hit_rate_limit:
             reason_txt = _ap_top_reasons(list(skipped_reason_counts.elements()) or [], n=2)
             if reason_txt:
                 await context.bot.send_message(
                     chat_id=chat_id,
                     text=(
-                        f"🤖 Автопилот — почасовой прогон ({get_account_name(aid)})\n"
-                        "Действий: 0\n"
-                        f"Причина: {reason_txt}"
+                        f"🤖 Автопилот — почасовой прогон ({'SEMI' if dry_run else 'AUTO_LIMITS'}) ({get_account_name(aid)})\n"
+                        + ("Изменения не применяются, только рекомендации\n" if dry_run else "")
+                        + "Действий: 0\n"
+                        + f"Причина: {reason_txt}"
                     ),
                     disable_notification=bool(quiet),
                 )
@@ -916,7 +1009,7 @@ async def _autopilot_hourly_job(context: ContextTypes.DEFAULT_TYPE):
             chat_id=chat_id,
             text=(
                 "🤖 Автопилот — почасовой прогон\n"
-                "⚠️ FB лимит запросов (code 17). Остановил прогон, чтобы не добивать API.\n"
+                "⚠️ Достигнут лимит Facebook API. Дальше не трогаю API, использую кэш.\n"
                 f"Повторю через ~{mins} мин."
             ),
             disable_notification=bool(quiet),

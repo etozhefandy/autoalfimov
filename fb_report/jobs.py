@@ -948,26 +948,32 @@ async def _autopilot_heatmap_job(context: ContextTypes.DEFAULT_TYPE):
         good_ids: set[str] = set()
         bad_ids: set[str] = set()
         try:
-            rows_today = analyze_adsets(aid, period="today") or []
-            rows_3d = analyze_adsets(aid, period=period_3d) or []
-            map_3d = {str(r.get("id") or ""): r for r in rows_3d if r}
-            for r in rows_today:
+            rows_main = analyze_adsets(aid, period="last_3d", adset_ids=list(active_ids)) or []
+            rows_base = analyze_adsets(aid, period="last_7d", adset_ids=list(active_ids)) or []
+
+            if not rows_main or len(rows_main) < 3:
+                rows_main = analyze_adsets(aid, period="today", adset_ids=list(active_ids)) or []
+            if not rows_base:
+                rows_base = list(rows_main or [])
+
+            map_base = {str(r.get("id") or ""): r for r in rows_base if r}
+            for r in rows_main:
                 adset_id = str((r or {}).get("id") or "")
                 if not adset_id:
                     continue
                 cpl_t = float((r or {}).get("cpl") or 0.0)
-                cpl_3 = float((map_3d.get(adset_id) or {}).get("cpl") or 0.0)
-                if cpl_t <= 0 or cpl_3 <= 0:
+                cpl_b = float((map_base.get(adset_id) or {}).get("cpl") or 0.0)
+                if cpl_t <= 0 or cpl_b <= 0:
                     continue
                 if target_f is not None and target_f > 0:
-                    if cpl_t <= float(target_f) * 1.05 and cpl_t <= cpl_3 * 0.95:
+                    if cpl_t <= float(target_f) * 1.05 and cpl_t <= cpl_b * 0.95:
                         good_ids.add(adset_id)
-                    elif cpl_t >= float(target_f) * 1.5 and cpl_t >= cpl_3 * 1.15:
+                    elif cpl_t >= float(target_f) * 1.5 and cpl_t >= cpl_b * 1.15:
                         bad_ids.add(adset_id)
                 else:
-                    if cpl_t <= cpl_3 * 0.90:
+                    if cpl_t <= cpl_b * 0.90:
                         good_ids.add(adset_id)
-                    elif cpl_t >= cpl_3 * 1.20:
+                    elif cpl_t >= cpl_b * 1.20:
                         bad_ids.add(adset_id)
         except Exception:
             good_ids = set()
