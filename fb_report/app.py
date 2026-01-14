@@ -84,9 +84,12 @@ from services.facebook_api import (
     is_rate_limited_now,
     rate_limit_retry_after_seconds,
     classify_api_error,
+    allow_fb_api_calls,
+    deny_fb_api_calls,
 )
 from services.ai_focus import get_focus_comment, ask_deepseek, sanitize_ai_text
 from fb_report.cpa_monitoring import build_anomaly_messages_for_account
+from services.heatmap_store import get_heatmap_dataset, prev_full_hour_window, sum_ready_spend_for_date
 import json
 import asyncio
 import time as pytime
@@ -166,15 +169,19 @@ def _ap_reason_human(code: str) -> str:
         "no_goal_target_cpl": "цель CPL не задана (работаю от базы 3 дня)",
         "insufficient_volume": "недостаточно объёма (мало конверсий/переписок)",
         "no_spend": "нет расходов за период",
-        "too_low_spend": "слишком малый расход для уверенных выводов",
-        "rate_limit": "достигнут лимит Facebook API — подожду и продолжу анализ позже",
-        "cache_used": "📌 использую кэшированные данные (обновлю при снятии лимита)",
+        "low_volume": "слишком малый расход/объём для уверенных выводов",
+        "no_snapshot": "нет слепка (heatmap cache) — подожду сборщик",
+        "snapshot_collecting": "слепок собирается (heatmap cache)",
+        "snapshot_failed": "слепок не собран (ошибка)",
+        "rate_limit": "лимит Facebook API — сборщик слепков временно не трогает API",
+        "cache_used": "📌 источник: heatmap cache",
         "fb_auth_error": "токен/доступ (code 190)",
         "fb_invalid_param": "неверный параметр (code 100)",
         "fb_permission_error": "нет прав/доступа (FB permissions)",
         "fb_unknown_api_error": "неизвестная ошибка Facebook API",
         "api_error": "данные из Facebook временно недоступны",
         "no_campaigns_in_group": "в группе нет кампаний",
+        "no_active_entities": "нет активных сущностей/строк в слепке",
         "all_candidates_blocked_by_limits": "все кандидаты вне лимитов режима AUTO_LIMITS",
         "mode_not_supported": "режим не поддерживает почасовой прогон",
         "no_monitored_groups": "нет мониторимых групп",
@@ -349,9 +356,8 @@ def _ap_generate_actions(
         debug_reasons.append("no_campaigns_in_group")
         return ([], debug_reasons) if debug else []
 
-    cache_mode = bool(is_rate_limited_now())
-    if cache_mode:
-        debug_reasons.append("cache_used")
+    # Source of truth: heatmap snapshots.
+    debug_reasons.append("cache_used")
 
     limits = ap.get("limits") or {}
 
@@ -367,94 +373,42 @@ def _ap_generate_actions(
     allow_pause_ads = bool(limits.get("allow_pause_ads", True))
     allow_pause_adsets = bool(limits.get("allow_pause_adsets", False))
 
-    api_failed = False
+    win = prev_full_hour_window()
+    date_str = str(win.get("date") or "")
+    hour_int = int(win.get("hour") or 0)
+    window_label = f"{(win.get('window') or {}).get('start','')}–{(win.get('window') or {}).get('end','')}"
 
-    main_period = "last_3d"
-    base_period = "last_7d"
-    used_main = main_period
-    used_base = base_period
+    with deny_fb_api_calls(reason="autopilot_generate_actions"):
+        ds, ds_status, ds_reason, ds_meta = get_heatmap_dataset(
+            str(aid),
+            date_str=date_str,
+            hours=[hour_int],
+        )
 
-    label_main = "Последние 3 дня"
-    if used_main == "today":
-        label_main = "Сегодня"
+    if ds_status != "ready" or not ds:
+        if ds_status == "missing":
+            debug_reasons.append("no_snapshot")
+        elif ds_status == "collecting":
+            debug_reasons.append(str(ds_reason or "snapshot_collecting"))
+        else:
+            debug_reasons.append(str(ds_reason or "snapshot_failed"))
+        return ([], debug_reasons) if debug else []
 
-    label_base = "Последние 7 дней"
-    if used_base == "last_3d":
-        label_base = "Последние 3 дня"
-    elif used_base == "today":
-        label_base = "Сегодня"
-
-    def _enough_rows(rows: list[dict]) -> bool:
-        try:
-            return bool(rows) and len(rows) >= 3
-        except Exception:
-            return bool(rows)
-
-    try:
-        today_rows = analyze_adsets(
-            aid,
-            period=main_period,
-            lead_action_type=lead_action_type,
-            campaign_ids=list(group_campaign_set) if group_campaign_set else None,
-        ) or []
-    except Exception:
-        today_rows = []
-        api_failed = True
-
-    try:
-        d3_rows = analyze_adsets(
-            aid,
-            period=base_period,
-            lead_action_type=lead_action_type,
-            campaign_ids=list(group_campaign_set) if group_campaign_set else None,
-        ) or []
-    except Exception:
-        d3_rows = []
-        api_failed = True
-
-    if not _enough_rows(today_rows):
-        used_main = "today"
-        label_main = "Сегодня"
-        try:
-            today_rows = analyze_adsets(
-                aid,
-                period="today",
-                lead_action_type=lead_action_type,
-                campaign_ids=list(group_campaign_set) if group_campaign_set else None,
-            ) or []
-        except Exception:
-            today_rows = []
-            api_failed = True
-
-    if not d3_rows:
-        used_base = used_main
-        label_base = label_main
-        d3_rows = list(today_rows or [])
-
-    try:
-        err_code = int((get_last_api_error_info() or {}).get("code") or 0)
-    except Exception:
-        err_code = 0
-    if err_code == 17:
-        debug_reasons.append("rate_limit")
-        if not today_rows and not d3_rows:
-            return ([], debug_reasons) if debug else []
-    if api_failed and not debug_reasons:
-        try:
-            debug_reasons.append(str(classify_api_error(get_last_api_error_info() or {})))
-        except Exception:
-            debug_reasons.append("api_error")
-
-    ads_by_adset: dict[str, list[dict]] = {}
-    today_ads: list[dict] = []
+    rows_src = list((ds or {}).get("rows") or [])
 
     def _in_group(r: dict) -> bool:
         if not group_campaign_set:
             return True
         return str((r or {}).get("campaign_id") or "") in group_campaign_set
 
-    today_map = {str(r.get("adset_id")): r for r in (today_rows or []) if r.get("adset_id") and _allowed_row(r) and _in_group(r)}
-    d3_map = {str(r.get("adset_id")): r for r in (d3_rows or []) if r.get("adset_id") and _allowed_row(r) and _in_group(r)}
+    rows_src = [r for r in rows_src if isinstance(r, dict) and str(r.get("adset_id") or "") and _in_group(r)]
+
+    if not rows_src:
+        debug_reasons.append("no_active_entities")
+        return ([], debug_reasons) if debug else []
+
+    label_main = f"Окно {window_label}" if window_label.strip("–") else "Предыдущий час"
+    label_base = label_main
 
     def _to_float(v):
         try:
@@ -493,180 +447,98 @@ def _ap_generate_actions(
     if target_cpl_f is None:
         debug_reasons.append("no_goal_target_cpl")
 
-    keys = sorted(set(today_map.keys()) | set(d3_map.keys()))
-    rows = []
+    rows: list[dict] = []
+    any_low_spend = False
+    for r in rows_src:
+        adset_id = str((r or {}).get("adset_id") or "")
+        if not adset_id:
+            continue
+        name = (r or {}).get("name") or adset_id
 
-    total_spend_today = 0.0
-    total_kpi_today = 0
-    for k in keys:
-        t = today_map.get(k) or {}
-        d = d3_map.get(k) or {}
-        name = t.get("name") or d.get("name") or k
-
-        sp_t = _to_float(t.get("spend"))
-        ld_t = _kpi_count(t)
-        cpl_t = _cpl(sp_t, ld_t)
-
-        total_spend_today += float(sp_t)
-        total_kpi_today += int(ld_t)
-
-        sp_3 = _to_float(d.get("spend"))
-        ld_3 = _kpi_count(d)
-        cpl_3 = _cpl(sp_3, ld_3)
+        sp_t = _to_float((r or {}).get("spend"))
+        ld_t = _kpi_count(r)
+        cpl_t = (r or {}).get("cpl")
+        try:
+            cpl_t = float(cpl_t) if cpl_t not in (None, "") else _cpl(sp_t, ld_t)
+        except Exception:
+            cpl_t = _cpl(sp_t, ld_t)
 
         if sp_t <= 0:
             continue
 
-        # Слишком маленький расход — избегаем шумных рекомендаций.
         if float(sp_t) < 5.0:
+            any_low_spend = True
             continue
 
         if ld_t <= 0:
-            # В v1 pausing adset разрешаем ТОЛЬКО отдельным флагом.
-            if allow_pause_adsets and can_disable(aid, k):
-                rows.append(
-                    {
-                        "kind": "pause_adset",
-                        "adset_id": k,
-                        "name": name,
-                        "spend_today": sp_t,
-                        "leads_today": ld_t,
-                        "cpl_today": cpl_t,
-                        "cpl_3d": cpl_3,
-                        "period_label_main": label_main,
-                        "period_label_base": label_base,
-                        "reason": "Сегодня есть расход, но нет лидов.",
-                        "score": sp_t,
-                    }
-                )
-                continue
-
-            # Основной сценарий v1: предлагаем отключить объявление внутри adset.
-            # Кнопка только если >1 активного объявления.
-            try:
-                active_cnt = _count_active_ads_in_adset(aid, k)
-            except Exception:
-                active_cnt = 0
-
-            if allow_pause_ads and active_cnt > 1:
-                if not today_ads:
-                    try:
-                        today_ads = analyze_ads(
-                            aid,
-                            period=used_main,
-                            lead_action_type=lead_action_type,
-                            campaign_ids=list(group_campaign_set) if group_campaign_set else None,
-                        ) or []
-                    except Exception:
-                        today_ads = []
-                        api_failed = True
-
-                    for a in (today_ads or []):
-                        adset_id = str((a or {}).get("adset_id") or "")
-                        if not adset_id:
-                            continue
-                        st = str((a or {}).get("effective_status") or (a or {}).get("status") or "").upper()
-                        if st != "ACTIVE":
-                            continue
-                        if float((a or {}).get("spend", 0.0) or 0.0) <= 0:
-                            continue
-                        ads_by_adset.setdefault(adset_id, []).append(a)
-
-                cands = ads_by_adset.get(str(k)) or []
-                cands.sort(key=lambda x: float((x or {}).get("spend", 0.0) or 0.0), reverse=True)
-                cand = cands[0] if cands else None
-                ad_id = str((cand or {}).get("ad_id") or "")
-                ad_name = (cand or {}).get("name") if cand else None
-                if ad_id:
-                    rows.append(
-                        {
-                            "kind": "pause_ad",
-                            "ad_id": ad_id,
-                            "ad_name": ad_name,
-                            "adset_id": k,
-                            "name": name,
-                            "spend_today": sp_t,
-                            "leads_today": ld_t,
-                            "cpl_today": cpl_t,
-                            "cpl_3d": cpl_3,
-                            "period_label_main": label_main,
-                            "period_label_base": label_base,
-                            "reason": "Сегодня есть расход, но нет лидов. В adset >1 активного объявления.",
-                            "score": sp_t,
-                        }
-                    )
-                    continue
-
-            # Если объявление одно — только рекомендация (без кнопки отключения).
             rows.append(
                 {
                     "kind": "note",
-                    "adset_id": k,
+                    "adset_id": adset_id,
                     "name": name,
                     "spend_today": sp_t,
                     "leads_today": ld_t,
                     "cpl_today": cpl_t,
-                    "cpl_3d": cpl_3,
+                    "cpl_3d": None,
                     "period_label_main": label_main,
                     "period_label_base": label_base,
-                    "reason": "Сегодня есть расход, но нет лидов. В adset единственное активное объявление — стоит заменить/отключить вручную.",
+                    "reason": "Есть расход, но нет лидов/сообщений в этом часовом окне.",
                     "score": sp_t,
+                    "snapshot": {"date": date_str, "hour": int(hour_int), "window": window_label},
                 }
             )
+            continue
+
+        if target_cpl_f is None or target_cpl_f <= 0:
             continue
 
         if cpl_t is None:
             continue
 
-        if target_cpl_f is not None and target_cpl_f > 0:
+        try:
             ratio = float(cpl_t) / float(target_cpl_f)
-            inc_thr = 1.05
-            dec_thr = 1.30
-        elif cpl_3 is not None and float(cpl_3) > 0:
-            ratio = float(cpl_t) / float(cpl_3)
-            # «Мягкая оптимизация» без заданной цели CPL.
-            inc_thr = 0.90
-            dec_thr = 1.25
-        else:
-            ratio = None
-
-        if ratio is None:
+        except Exception:
             continue
 
-        if ratio <= inc_thr:
+        if ratio <= 1.05:
             rows.append(
                 {
                     "kind": "budget_pct",
-                    "adset_id": k,
+                    "adset_id": adset_id,
                     "name": name,
                     "percent": +max_step,
                     "spend_today": sp_t,
                     "leads_today": ld_t,
                     "cpl_today": cpl_t,
-                    "cpl_3d": cpl_3,
+                    "cpl_3d": None,
                     "period_label_main": label_main,
                     "period_label_base": label_base,
-                    "reason": "CPL в норме/лучше бенчмарка.",
+                    "reason": "CPL в норме/лучше цели в часовом окне.",
                     "score": sp_t,
+                    "snapshot": {"date": date_str, "hour": int(hour_int), "window": window_label},
                 }
             )
-        elif ratio >= dec_thr:
+        elif ratio >= 1.30:
             rows.append(
                 {
                     "kind": "budget_pct",
-                    "adset_id": k,
+                    "adset_id": adset_id,
                     "name": name,
                     "percent": -max_step,
                     "spend_today": sp_t,
                     "leads_today": ld_t,
                     "cpl_today": cpl_t,
-                    "cpl_3d": cpl_3,
+                    "cpl_3d": None,
                     "period_label_main": label_main,
                     "period_label_base": label_base,
-                    "reason": "CPL хуже бенчмарка.",
+                    "reason": "CPL хуже цели в часовом окне.",
                     "score": sp_t,
+                    "snapshot": {"date": date_str, "hour": int(hour_int), "window": window_label},
                 }
             )
+
+    if not rows and any_low_spend:
+        debug_reasons.append("low_volume")
 
     rows.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)
     rows = rows[:8]
@@ -717,12 +589,16 @@ def _ap_daily_budget_limit_usd(aid: str) -> float | None:
 
 
 def _ap_spend_today_usd(aid: str) -> float:
+    # Spend is derived only from snapshots (heatmap cache).
+    now = datetime.now(ALMATY_TZ)
+    date_str = now.strftime("%Y-%m-%d")
+    hours = list(range(0, int(now.strftime("%H")) + 1))
+    with deny_fb_api_calls(reason="autopilot_spend_today"):
+        total, st, _reason = sum_ready_spend_for_date(str(aid), date_str=date_str, hours=hours)
+    if st != "ready" or total is None:
+        return 0.0
     try:
-        ins = fetch_insights(aid, "today") or {}
-    except Exception:
-        ins = {}
-    try:
-        return float((ins or {}).get("spend", 0) or 0)
+        return float(total)
     except Exception:
         return 0.0
 
@@ -789,26 +665,11 @@ async def _autopilot_hourly_job(context: ContextTypes.DEFAULT_TYPE):
     hour = int(now.strftime("%H"))
     quiet = (hour >= 22) or (hour < 10)
 
-    rate_limited_start = bool(is_rate_limited_now())
-    rl_mins: int | None = None
-    if rate_limited_start:
-        after_s = rate_limit_retry_after_seconds()
-        rl_mins = max(1, int(round(float(after_s) / 60.0)))
-        # Do not stop the job: continue in cache-only mode and retry later.
-        try:
-            token = uuid.uuid4().hex[:8]
-            jitter = int(uuid.uuid4().int % 6)
-            context.job_queue.run_once(
-                _autopilot_hourly_job,
-                when=timedelta(minutes=max(5, min(35, int(rl_mins) + jitter))),
-                name=f"autopilot_hourly_retry_{token}",
-            )
-        except Exception:
-            pass
+    win = prev_full_hour_window(now=now)
+    window_label = f"{(win.get('window') or {}).get('start','')}–{(win.get('window') or {}).get('end','')}"
 
     log = logging.getLogger(__name__)
     store = load_accounts() or {}
-    hit_rate_limit = False
     for aid, row in store.items():
         if not (row or {}).get("enabled", True):
             continue
@@ -830,12 +691,20 @@ async def _autopilot_hourly_job(context: ContextTypes.DEFAULT_TYPE):
             log.info("autopilot_hourly_skip aid=%s reason=mode_not_supported mode=%s", str(aid), str(mode))
             continue
 
-        # SEMI always means recommendations-only. Also force dry-run during rate limit.
-        dry_run = (mode == "SEMI") or bool(rate_limited_start)
+        # SEMI always means recommendations-only.
+        dry_run = (mode == "SEMI")
 
         if not gids:
             log.info("autopilot_hourly_skip aid=%s reason=no_monitored_groups", str(aid))
             continue
+
+        # Snapshot status for UX.
+        with deny_fb_api_calls(reason="autopilot_hourly_dataset"):
+            _ds, ds_status, ds_reason, ds_meta = get_heatmap_dataset(
+                str(aid),
+                date_str=str(win.get("date") or ""),
+                hours=[int(win.get("hour") or 0)],
+            )
 
         actions_total = 0
         applied_total = 0
@@ -845,15 +714,10 @@ async def _autopilot_hourly_job(context: ContextTypes.DEFAULT_TYPE):
         for gid in gids:
             eff = _autopilot_effective_config_for_group(aid, gid)
             try:
-                actions, reasons = _ap_generate_actions(aid, eff=eff, debug=True)  # type: ignore[misc]
+                with deny_fb_api_calls(reason="autopilot_hourly_generate"):
+                    actions, reasons = _ap_generate_actions(aid, eff=eff, debug=True)  # type: ignore[misc]
             except Exception:
                 actions, reasons = ([], ["api_error"])
-
-            err_info = get_last_api_error_info() or {}
-            if int(err_info.get("code") or 0) == 17:
-                hit_rate_limit = True
-                skipped_reason_counts.update(["rate_limit"])
-                break
 
             actions_total += int(len(actions or []))
             if not actions:
@@ -873,10 +737,6 @@ async def _autopilot_hourly_job(context: ContextTypes.DEFAULT_TYPE):
             applied_msgs = []
             blocked_by_limits = 0
             for act in actions:
-                if is_rate_limited_now():
-                    hit_rate_limit = True
-                    skipped_reason_counts.update(["rate_limit"])
-                    break
                 ok, _why = _ap_within_limits_for_auto(aid, act)
                 if not ok:
                     blocked_by_limits += 1
@@ -888,7 +748,8 @@ async def _autopilot_hourly_job(context: ContextTypes.DEFAULT_TYPE):
                         pct_f = float(act.get("percent") or 0.0)
                     except Exception:
                         pct_f = 0.0
-                    res = apply_budget_change(str(act.get("adset_id") or ""), pct_f)
+                    with allow_fb_api_calls(reason="autopilot_apply"):
+                        res = apply_budget_change(str(act.get("adset_id") or ""), pct_f)
                     if str(res.get("status") or "").lower() in {"ok", "success"}:
                         applied_msgs.append(str(res.get("message") or "") + "\n\n" + _ap_action_text(act))
                         applied_total += 1
@@ -909,7 +770,8 @@ async def _autopilot_hourly_job(context: ContextTypes.DEFAULT_TYPE):
 
                 if kind == "pause_ad":
                     ad_id = str(act.get("ad_id") or "")
-                    res = pause_ad(ad_id)
+                    with allow_fb_api_calls(reason="autopilot_apply"):
+                        res = pause_ad(ad_id)
                     if str(res.get("status") or "").lower() in {"ok", "success"}:
                         applied_msgs.append(str(res.get("message") or res.get("exception") or "") + "\n\n" + _ap_action_text(act))
                         applied_total += 1
@@ -929,7 +791,8 @@ async def _autopilot_hourly_job(context: ContextTypes.DEFAULT_TYPE):
                     continue
 
                 if kind == "pause_adset":
-                    res = disable_entity(str(act.get("adset_id") or ""))
+                    with allow_fb_api_calls(reason="autopilot_apply"):
+                        res = disable_entity(str(act.get("adset_id") or ""))
                     if str(res.get("status") or "").lower() in {"ok", "success"}:
                         applied_msgs.append(str(res.get("message") or "") + "\n\n" + _ap_action_text(act))
                         append_autopilot_event(
@@ -958,9 +821,6 @@ async def _autopilot_hourly_job(context: ContextTypes.DEFAULT_TYPE):
             if actions and blocked_by_limits >= int(len(actions)):
                 skipped_reason_counts.update(["all_candidates_blocked_by_limits"])
 
-        if hit_rate_limit:
-            break
-
         log.info(
             "autopilot_hourly_finish aid=%s actions_total=%s applied_total=%s skipped_reason_counts=%s",
             str(aid),
@@ -969,14 +829,13 @@ async def _autopilot_hourly_job(context: ContextTypes.DEFAULT_TYPE):
             dict(skipped_reason_counts),
         )
 
-        if dry_run and semi_blocks and not hit_rate_limit:
-            banner = ""
-            if mode == "SEMI":
-                banner = "Изменения не применяются, только рекомендации"
-            elif rate_limited_start:
-                banner = "⚠️ Достигнут лимит Facebook API. Изменения не применяются, только рекомендации (кэш)"
-                if rl_mins is not None:
-                    banner = banner + f"\nПовторю сбор данных через ~{int(rl_mins)} мин."
+        snap_line = f"Слепок: {ds_status}"
+        if ds_status != "ready":
+            snap_line = snap_line + f" ({ds_reason})"
+        banner = f"Источник данных: heatmap cache\nОкно: {window_label}\n{snap_line}"
+
+        if dry_run and semi_blocks:
+            banner = banner + "\nИзменения не применяются, только рекомендации"
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=(
@@ -988,42 +847,21 @@ async def _autopilot_hourly_job(context: ContextTypes.DEFAULT_TYPE):
                 disable_notification=bool(quiet),
             )
 
-        if int(actions_total) <= 0 and not hit_rate_limit:
+        if int(actions_total) <= 0:
             reason_txt = _ap_top_reasons(list(skipped_reason_counts.elements()) or [], n=2)
             if reason_txt:
                 await context.bot.send_message(
                     chat_id=chat_id,
                     text=(
                         f"🤖 Автопилот — почасовой прогон ({'SEMI' if dry_run else 'AUTO_LIMITS'}) ({get_account_name(aid)})\n"
+                        + banner
+                        + "\n"
                         + ("Изменения не применяются, только рекомендации\n" if dry_run else "")
                         + "Действий: 0\n"
                         + f"Причина: {reason_txt}"
                     ),
                     disable_notification=bool(quiet),
                 )
-
-    if hit_rate_limit:
-        after_s = rate_limit_retry_after_seconds()
-        mins = max(1, int(round(float(after_s) / 60.0)))
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                "🤖 Автопилот — почасовой прогон\n"
-                "⚠️ Достигнут лимит Facebook API. Дальше не трогаю API, использую кэш.\n"
-                f"Повторю через ~{mins} мин."
-            ),
-            disable_notification=bool(quiet),
-        )
-        try:
-            token = uuid.uuid4().hex[:8]
-            jitter = int(uuid.uuid4().int % 6)
-            context.job_queue.run_once(
-                _autopilot_hourly_job,
-                when=timedelta(minutes=max(5, min(35, mins + jitter))),
-                name=f"autopilot_hourly_retry_{token}",
-            )
-        except Exception:
-            pass
 
 
 async def _autopilot_warmup_job(context: ContextTypes.DEFAULT_TYPE):
@@ -1032,36 +870,14 @@ async def _autopilot_warmup_job(context: ContextTypes.DEFAULT_TYPE):
     hour = int(now.strftime("%H"))
     quiet = (hour >= 22) or (hour < 10)
 
-    if is_rate_limited_now():
-        after_s = rate_limit_retry_after_seconds()
-        mins = max(1, int(round(float(after_s) / 60.0)))
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                "🤖 Автопилот — первичный прогон после старта\n"
-                "⚠️ FB лимит запросов (code 17). Данных нет.\n"
-                f"Повторю через ~{mins} мин."
-            ),
-            disable_notification=bool(quiet),
-        )
-        try:
-            token = uuid.uuid4().hex[:8]
-            jitter = int(uuid.uuid4().int % 6)
-            context.job_queue.run_once(
-                _autopilot_warmup_job,
-                when=timedelta(minutes=max(5, min(35, mins + jitter))),
-                name=f"autopilot_warmup_retry_{token}",
-            )
-        except Exception:
-            pass
-        return
+    win = prev_full_hour_window(now=now)
+    window_label = f"{(win.get('window') or {}).get('start','')}–{(win.get('window') or {}).get('end','')}"
 
     store = load_accounts() or {}
     any_lines = []
     diag_lines = []
     total_groups = 0
     total_actions = 0
-    hit_rate_limit = False
     reason_counts: Counter[str] = Counter()
 
     for aid, row in store.items():
@@ -1088,15 +904,10 @@ async def _autopilot_warmup_job(context: ContextTypes.DEFAULT_TYPE):
             gname = eff.get("group_name") or str(gid)
 
             try:
-                actions, reasons = _ap_generate_actions(aid, eff=eff, debug=True)  # type: ignore[misc]
+                with deny_fb_api_calls(reason="autopilot_warmup_generate"):
+                    actions, reasons = _ap_generate_actions(aid, eff=eff, debug=True)  # type: ignore[misc]
             except Exception:
                 actions, reasons = ([], ["api_error"])
-
-            err_info = get_last_api_error_info() or {}
-            code = int(err_info.get("code") or 0)
-            if code == 17:
-                hit_rate_limit = True
-                break
 
             shown = []
             for act in (actions or [])[:5]:
@@ -1116,20 +927,29 @@ async def _autopilot_warmup_job(context: ContextTypes.DEFAULT_TYPE):
                 if reason_txt:
                     any_lines.append(f"Причина: {reason_txt}")
 
-        if hit_rate_limit:
-            break
-
     header = "🤖 Автопилот — первичный прогон после старта\n"
-    status_line = "✅ Данные: OK"
-    if hit_rate_limit:
-        after_s = rate_limit_retry_after_seconds()
-        mins = max(1, int(round(float(after_s) / 60.0)))
-        status_line = f"⚠️ Данные: FB лимит запросов (code 17). Повторю через ~{mins} мин."
-    header = header + status_line + "\n"
+    header = header + "Источник данных: heatmap cache\n"
+    header = header + f"Окно: {window_label}\n"
+    # Snapshot status: take first enabled account if exists.
+    snap_status = "missing"
+    snap_reason = "missing_snapshot"
+    for _aid, _row in (store or {}).items():
+        if not (_row or {}).get("enabled", True):
+            continue
+        with deny_fb_api_calls(reason="autopilot_warmup_dataset"):
+            _ds, st, rs, _meta = get_heatmap_dataset(
+                str(_aid),
+                date_str=str(win.get("date") or ""),
+                hours=[int(win.get("hour") or 0)],
+            )
+        snap_status = str(st)
+        snap_reason = str(rs)
+        break
+    header = header + f"Слепок: {snap_status} ({snap_reason})\n"
     header = header + "Это не часовой срез. Ничего не применяю, только подсказываю идеи.\n"
     header = header + f"Активных групп: {total_groups} | Рекомендаций: {total_actions}\n"
 
-    if int(total_actions) <= 0 and not hit_rate_limit:
+    if int(total_actions) <= 0:
         top_reason = _ap_top_reasons(list(reason_counts.elements()) or [], n=2)
         if top_reason:
             header = header + f"Причина: {top_reason}\n"
@@ -1151,18 +971,6 @@ async def _autopilot_warmup_job(context: ContextTypes.DEFAULT_TYPE):
         disable_notification=bool(quiet),
     )
 
-    if hit_rate_limit:
-        try:
-            token = uuid.uuid4().hex[:8]
-            jitter = int(uuid.uuid4().int % 6)
-            context.job_queue.run_once(
-                _autopilot_warmup_job,
-                when=timedelta(minutes=25 + jitter),
-                name=f"autopilot_warmup_retry_{token}",
-            )
-        except Exception:
-            pass
-
 
 def _ap_force_kb(token: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
@@ -1177,58 +985,59 @@ def _ap_force_kb(token: str) -> InlineKeyboardMarkup:
 
 def _autopilot_analysis_text(aid: str) -> str:
     now = datetime.now(ALMATY_TZ)
-    yday = (now - timedelta(days=1)).date()
-    period_3d = {
-        "since": (yday - timedelta(days=2)).strftime("%Y-%m-%d"),
-        "until": yday.strftime("%Y-%m-%d"),
-    }
-
     eff = _autopilot_effective_config(aid)
-    lead_action_type = eff.get("lead_action_type")
     kpi_mode = str(eff.get("kpi") or "total")
     group_campaign_ids = eff.get("campaign_ids")
     group_campaign_set = set(str(x) for x in (group_campaign_ids or []) if x)
 
-    try:
-        today_rows = analyze_adsets(aid, period="today", lead_action_type=lead_action_type) or []
-    except Exception:
-        today_rows = []
+    win = prev_full_hour_window(now=now)
+    window_label = f"{(win.get('window') or {}).get('start','')}–{(win.get('window') or {}).get('end','')}"
 
-    try:
-        d3_rows = analyze_adsets(aid, period=period_3d, lead_action_type=lead_action_type) or []
-    except Exception:
-        d3_rows = []
+    with deny_fb_api_calls(reason="autopilot_analysis_text"):
+        ds, st, reason, meta = get_heatmap_dataset(
+            str(aid),
+            date_str=str(win.get("date") or ""),
+            hours=[int(win.get("hour") or 0)],
+        )
 
-    def _allowed_row(r: dict) -> bool:
-        st = str((r or {}).get("effective_status") or (r or {}).get("status") or "").upper()
-        return st in {"ACTIVE", "SCHEDULED"}
+    scope_line = ""
+    if eff.get("group_id"):
+        gname = eff.get("group_name") or eff.get("group_id")
+        scope_line = f" (группа: {gname})"
 
-    def _in_group(r: dict) -> bool:
-        if not group_campaign_set:
-            return True
-        return str((r or {}).get("campaign_id") or "") in group_campaign_set
+    lines = [
+        f"📊 Автопилат — анализ (heatmap cache): {get_account_name(aid)}" + scope_line,
+        "",
+        "Источник: heatmap cache",
+        f"Окно: {window_label}",
+        f"Слепок: {st} ({reason})",
+        "",
+    ]
 
-    today_map = {str(r.get("adset_id")): r for r in (today_rows or []) if r.get("adset_id") and _allowed_row(r) and _in_group(r)}
-    d3_map = {str(r.get("adset_id")): r for r in (d3_rows or []) if r.get("adset_id") and _allowed_row(r) and _in_group(r)}
-
-    goals = (eff.get("goals") or {}) if isinstance(eff.get("goals"), dict) else {}
-    target_cpl = goals.get("target_cpl")
-    try:
-        target_cpl_f = float(target_cpl) if target_cpl not in (None, "") else None
-    except Exception:
-        target_cpl_f = None
-    if target_cpl_f is not None and target_cpl_f <= 0:
-        target_cpl_f = None
-
-    def _to_float(v):
+    if st != "ready" or not ds:
+        lines.append("Данных пока нет.")
+        lines.append(f"Причина: {_ap_reason_human(str(reason))}")
         try:
-            return float(v)
+            nxt = int((meta or {}).get("next_try_in_min") or 0)
         except Exception:
-            return 0.0
+            nxt = 0
+        if nxt > 0:
+            lines.append(f"Повторю через ~{nxt} мин (сборщик слепков).")
+        return "\n".join(lines).strip()
 
-    def _to_int(v):
+    def _kpi_count_row(row: dict) -> int:
+        if kpi_mode == "msgs":
+            try:
+                return int(float((row or {}).get("msgs") or 0) or 0)
+            except Exception:
+                return 0
+        if kpi_mode == "leads":
+            try:
+                return int(float((row or {}).get("leads") or 0) or 0)
+            except Exception:
+                return 0
         try:
-            return int(float(v))
+            return int(float((row or {}).get("total") or 0) or 0)
         except Exception:
             return 0
 
@@ -1240,104 +1049,34 @@ def _autopilot_analysis_text(aid: str) -> str:
         except Exception:
             return "—"
 
-    def _cpl(spend: float, leads: int):
-        if leads <= 0:
-            return None
-        if spend <= 0:
-            return 0.0
-        return float(spend) / float(leads)
+    rows = list((ds or {}).get("rows") or [])
+    if group_campaign_set:
+        rows = [r for r in rows if str((r or {}).get("campaign_id") or "") in group_campaign_set]
 
-    def _status(sp_t: float, ld_t: int, cpl_t, cpl_3):
-        # Пустая статистика сегодня
-        if (sp_t or 0.0) <= 0:
-            return "🟡"
-        if ld_t <= 0:
-            return "🔴"
+    sum_spend = 0.0
+    sum_kpi = 0
+    for r in rows:
+        try:
+            sum_spend += float((r or {}).get("spend") or 0.0)
+        except Exception:
+            pass
+        sum_kpi += int(_kpi_count_row(r))
+    cpl = (float(sum_spend) / float(sum_kpi)) if (sum_spend > 0 and sum_kpi > 0) else None
 
-        if target_cpl_f is not None and cpl_t is not None:
-            ratio = float(cpl_t) / float(target_cpl_f) if target_cpl_f > 0 else 999
-        elif cpl_3 is not None and cpl_t is not None and float(cpl_3) > 0:
-            ratio = float(cpl_t) / float(cpl_3)
-        else:
-            return "🟡"
-
-        if ratio <= 1.05:
-            return "🟢"
-        if ratio <= 1.30:
-            return "🟡"
-        if ratio <= 1.70:
-            return "🟠"
-        return "🔴"
-
-    keys = sorted(set(today_map.keys()) | set(d3_map.keys()))
-    merged = []
-    for k in keys:
-        t = today_map.get(k) or {}
-        d = d3_map.get(k) or {}
-        name = t.get("name") or d.get("name") or k
-
-        sp_t = _to_float(t.get("spend"))
-        ld_t = _kpi_count(t)
-        cpl_t = _cpl(sp_t, ld_t)
-
-        sp_3 = _to_float(d.get("spend"))
-        ld_3 = _kpi_count(d)
-        cpl_3 = _cpl(sp_3, ld_3)
-
-        emoji = _status(sp_t, ld_t, cpl_t, cpl_3)
-        merged.append(
-            {
-                "id": k,
-                "name": str(name),
-                "emoji": emoji,
-                "sp_t": sp_t,
-                "ld_t": ld_t,
-                "cpl_t": cpl_t,
-                "sp_3": sp_3,
-                "ld_3": ld_3,
-                "cpl_3": cpl_3,
-            }
-        )
-
-    merged.sort(key=lambda x: float(x.get("sp_t") or 0.0), reverse=True)
-
-    sum_sp_t = sum(float(x.get("sp_t") or 0.0) for x in merged)
-    sum_ld_t = sum(int(x.get("ld_t") or 0) for x in merged)
-    sum_cpl_t = _cpl(sum_sp_t, sum_ld_t)
-
-    sum_sp_3 = sum(float(x.get("sp_3") or 0.0) for x in merged)
-    sum_ld_3 = sum(int(x.get("ld_3") or 0) for x in merged)
-    sum_cpl_3 = _cpl(sum_sp_3, sum_ld_3)
-
-    scope_line = ""
-    if eff.get("group_id"):
-        gname = eff.get("group_name") or eff.get("group_id")
-        scope_line = f" (группа: {gname})"
-
-    lines = [
-        f"📊 Автопилат — анализ adset: {get_account_name(aid)}" + scope_line,
-        "",
-        f"Сегодня: spend {_fmt_money(sum_sp_t)} | leads {sum_ld_t} | CPL {_fmt_money(sum_cpl_t)}",
-        f"Последние 3 дня (до вчера): spend {_fmt_money(sum_sp_3)} | leads {sum_ld_3} | CPL {_fmt_money(sum_cpl_3)}",
-    ]
-    if target_cpl_f is not None:
-        lines.append(f"Целевой CPL: {_fmt_money(target_cpl_f)}")
-
+    lines.append(f"Итого: spend {_fmt_money(sum_spend)} | results {sum_kpi} | CPL {_fmt_money(cpl)}")
     lines.append("")
-    if not merged:
-        lines.append("Нет данных по ACTIVE/SCHEDULED адсетам.")
-        return "\n".join(lines)
 
-    lines.append("Топ adset по spend сегодня:")
-    for x in merged[:12]:
-        lines.extend(
-            [
-                f"{x['emoji']} {x['name']}",
-                f"• today: spend {_fmt_money(x['sp_t'])} | leads {x['ld_t']} | CPL {_fmt_money(x['cpl_t'])}",
-                f"• 3d: spend {_fmt_money(x['sp_3'])} | leads {x['ld_3']} | CPL {_fmt_money(x['cpl_3'])}",
-                "",
-            ]
-        )
+    if not rows:
+        lines.append("Нет строк в слепке (после фильтров).")
+        return "\n".join(lines).strip()
+
+    lines.append("Топ adset по spend:")
+    for r in rows[:12]:
+        name = str((r or {}).get("name") or (r or {}).get("adset_id") or "")
+        sp = float((r or {}).get("spend") or 0.0)
+        kpi = _kpi_count_row(r)
+        cpl_r = (sp / float(kpi)) if (sp > 0 and kpi > 0) else None
+        lines.append(f"• {name}: spend {_fmt_money(sp)} | results {kpi} | CPL {_fmt_money(cpl_r)}")
 
     return "\n".join(lines).strip()
 
@@ -4005,25 +3744,20 @@ async def _on_cb_internal(
 
         ap_chat_id, _src = _resolve_autopilot_chat_id_logged(reason="ap_suggest")
 
-        if is_rate_limited_now():
-            after_s = rate_limit_retry_after_seconds()
-            mins = max(1, int(round(float(after_s) / 60.0)))
-            await context.bot.send_message(
-                chat_id=ap_chat_id,
-                text=(
-                    f"🤖 Автопилот — предложения ({get_account_name(aid)})\n"
-                    "Действий: 0\n"
-                    f"Причина: лимит API (code 17), повторю через ~{mins} мин"
-                ),
-                disable_notification=False,
+        win = prev_full_hour_window()
+        window_label = f"{(win.get('window') or {}).get('start','')}–{(win.get('window') or {}).get('end','')}"
+        with deny_fb_api_calls(reason="autopilot_suggest_dataset"):
+            _ds, ds_status, ds_reason, ds_meta = get_heatmap_dataset(
+                str(aid),
+                date_str=str(win.get("date") or ""),
+                hours=[int(win.get("hour") or 0)],
             )
-            await safe_edit_message(q, "⚠️ Сейчас лимит FB API. Попробуй позже.", reply_markup=_autopilot_analysis_kb(aid))
-            return
 
         ap = _autopilot_get(aid)
         mode = str(ap.get("mode") or "OFF").upper()
         try:
-            actions, reasons = _ap_generate_actions(aid, debug=True)  # type: ignore[misc]
+            with deny_fb_api_calls(reason="autopilot_suggest_generate"):
+                actions, reasons = _ap_generate_actions(aid, debug=True)  # type: ignore[misc]
         except Exception:
             actions, reasons = ([], ["api_error"])
         append_autopilot_event(
@@ -4040,6 +3774,9 @@ async def _on_cb_internal(
             await safe_edit_message(
                 q,
                 "Нет подходящих действий по текущим данным.\n\n"
+                + "Источник данных: heatmap cache\n"
+                + f"Окно: {window_label}\n"
+                + f"Слепок: {ds_status} ({ds_reason})\n\n"
                 + (f"Причина: {reason_txt}\n\n" if reason_txt else "")
                 + "Подсказка: проверь, что есть spend сегодня и что adset ACTIVE/SCHEDULED.",
                 reply_markup=_autopilot_analysis_kb(aid),
@@ -4106,7 +3843,8 @@ async def _on_cb_internal(
                             ok = False
                             why = "single_active_ad"
                         else:
-                            res = pause_ad(ad_id)
+                            with allow_fb_api_calls(reason="ap_suggest_apply"):
+                                res = pause_ad(ad_id)
                             append_autopilot_event(
                                 aid,
                                 {
@@ -4129,7 +3867,8 @@ async def _on_cb_internal(
 
                     if kind == "pause_adset":
                         # В AUTO_LIMITS всё равно только если явно включено allow_pause_adsets (генератор уже отфильтровал).
-                        res = disable_entity(str(act.get("adset_id") or ""))
+                        with allow_fb_api_calls(reason="ap_suggest_apply"):
+                            res = disable_entity(str(act.get("adset_id") or ""))
                         append_autopilot_event(
                             aid,
                             {
@@ -4195,9 +3934,26 @@ async def _on_cb_internal(
         mode = str(ap.get("mode") or "OFF").upper()
         gids = _autopilot_active_group_ids(aid)
 
-        lines = [f"🧪 Dry-run автопилота: {get_account_name(aid)}", f"Режим: {mode}", ""]
-        if mode != "AUTO_LIMITS":
-            lines.append(f"⚠️ Прогон без применения: режим сейчас {mode} (hourly работает только в AUTO_LIMITS)")
+        win = prev_full_hour_window()
+        window_label = f"{(win.get('window') or {}).get('start','')}–{(win.get('window') or {}).get('end','')}"
+
+        with deny_fb_api_calls(reason="autopilot_dry_dataset"):
+            _ds, ds_status, ds_reason, ds_meta = get_heatmap_dataset(
+                str(aid),
+                date_str=str(win.get("date") or ""),
+                hours=[int(win.get("hour") or 0)],
+            )
+
+        lines = [
+            f"🧪 Dry-run автопилота: {get_account_name(aid)}",
+            f"Режим: {mode}",
+            "Источник данных: heatmap cache",
+            f"Окно: {window_label}",
+            f"Слепок: {ds_status} ({ds_reason})",
+            "",
+        ]
+        if mode not in {"AUTO_LIMITS", "SEMI", "ADVISOR", "OFF"}:
+            lines.append(f"⚠️ Неизвестный режим: {mode}")
             lines.append("")
 
         if not gids:
@@ -4213,7 +3969,8 @@ async def _on_cb_internal(
             eff = _autopilot_effective_config_for_group(aid, gid)
             gname = eff.get("group_name") or str(gid)
             try:
-                actions, reasons = _ap_generate_actions(aid, eff=eff, debug=True)  # type: ignore[misc]
+                with deny_fb_api_calls(reason="autopilot_dry_generate"):
+                    actions, reasons = _ap_generate_actions(aid, eff=eff, debug=True)  # type: ignore[misc]
             except Exception:
                 actions, reasons = ([], ["api_error"])
 

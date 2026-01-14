@@ -7,6 +7,7 @@ import time
 import random
 import os
 import threading
+import contextlib
 
 from facebook_business.api import FacebookAdsApi
 from facebook_business.adobjects.adaccount import AdAccount
@@ -27,6 +28,40 @@ _RL_LOCK = threading.Lock()
 _NEXT_ALLOWED_TS: float = 0.0
 _MIN_DELAY_S: float = float(os.getenv("FB_MIN_DELAY_S", "0.35") or 0.35)
 _JITTER_S: float = float(os.getenv("FB_JITTER_S", "0.20") or 0.20)
+
+_FB_API_ALLOW_DEPTH: int = 0
+_FB_API_ALLOW_REASON: Optional[str] = None
+
+_FB_API_DENY_DEPTH: int = 0
+_FB_API_DENY_REASON: Optional[str] = None
+
+
+@contextlib.contextmanager
+def allow_fb_api_calls(reason: str | None = None):
+    global _FB_API_ALLOW_DEPTH, _FB_API_ALLOW_REASON
+    _FB_API_ALLOW_DEPTH += 1
+    if reason:
+        _FB_API_ALLOW_REASON = str(reason)
+    try:
+        yield
+    finally:
+        _FB_API_ALLOW_DEPTH = max(0, int(_FB_API_ALLOW_DEPTH) - 1)
+        if _FB_API_ALLOW_DEPTH <= 0:
+            _FB_API_ALLOW_REASON = None
+
+
+@contextlib.contextmanager
+def deny_fb_api_calls(reason: str | None = None):
+    global _FB_API_DENY_DEPTH, _FB_API_DENY_REASON
+    _FB_API_DENY_DEPTH += 1
+    if reason:
+        _FB_API_DENY_REASON = str(reason)
+    try:
+        yield
+    finally:
+        _FB_API_DENY_DEPTH = max(0, int(_FB_API_DENY_DEPTH) - 1)
+        if _FB_API_DENY_DEPTH <= 0:
+            _FB_API_DENY_REASON = None
 
 
 def get_last_api_error() -> Dict[str, Optional[str]]:
@@ -144,6 +179,45 @@ def safe_api_call(fn, *args, **kwargs):
     except Exception:
         endpoint = None
         meta_params = None
+
+    # Policy guard:
+    # - if deny_fb_api_calls() is active -> block by default
+    # - allow_fb_api_calls() overrides deny
+    # - callers can set _allow_fb_api explicitly (True/False)
+    allow = kwargs.pop("_allow_fb_api", None)
+    caller = kwargs.pop("_caller", None)
+
+    deny_active = int(_FB_API_DENY_DEPTH or 0) > 0
+    allow_active = int(_FB_API_ALLOW_DEPTH or 0) > 0
+
+    effective_allow = True
+    if allow is True:
+        effective_allow = True
+    elif allow is False:
+        effective_allow = False
+    else:
+        # allow is None: default depends on deny context.
+        effective_allow = False if deny_active else True
+
+    if (not effective_allow) and (not allow_active):
+        info = {
+            "kind": "blocked_by_policy",
+            "message": "FB API call blocked by policy",
+            "endpoint": endpoint,
+            "caller": str(caller or ""),
+        }
+        _set_last_error_info(info)
+        try:
+            logging.getLogger(__name__).warning(
+                "[facebook_api] blocked_by_policy endpoint=%s caller=%s reason=%s deny_reason=%s",
+                str(endpoint),
+                str(caller or ""),
+                str(_FB_API_ALLOW_REASON or ""),
+                str(_FB_API_DENY_REASON or ""),
+            )
+        except Exception:
+            pass
+        return None
 
     if is_rate_limited_now():
         _set_last_error_info(

@@ -5,6 +5,8 @@ import asyncio
 import re
 import json
 import logging
+import os
+import uuid
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes, Application
@@ -49,7 +51,14 @@ try:  # pragma: no cover
     )
     from services.ai_focus import ask_deepseek
     from services.facebook_api import fetch_adsets
-    from services.facebook_api import is_rate_limited_now, rate_limit_retry_after_seconds, get_last_api_error_info
+    from services.facebook_api import (
+        is_rate_limited_now,
+        rate_limit_retry_after_seconds,
+        get_last_api_error_info,
+        classify_api_error,
+        allow_fb_api_calls,
+        deny_fb_api_calls,
+    )
 except Exception:  # noqa: BLE001
     fetch_insights = None  # type: ignore[assignment]
 
@@ -73,6 +82,22 @@ except Exception:  # noqa: BLE001
 
     def get_last_api_error_info() -> dict:  # type: ignore[override]
         return {}
+
+    def classify_api_error(_info: dict) -> str:  # type: ignore[override]
+        return "api_error"
+
+    class _Allow:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, _t, _v, _tb):
+            return False
+
+    def allow_fb_api_calls(_reason: str | None = None):  # type: ignore[override]
+        return _Allow()
+
+    def deny_fb_api_calls(_reason: str | None = None):  # type: ignore[override]
+        return _Allow()
 
     def analyze_account(_aid: str, days: int = 7, period=None):  # type: ignore[override]
         return {"aid": _aid, "metrics": None}
@@ -98,6 +123,349 @@ except Exception:  # noqa: BLE001
 
     def fetch_adsets(_aid: str):  # type: ignore[override]
         return []
+
+
+try:  # pragma: no cover
+    from services.heatmap_store import (
+        find_latest_ready_snapshots,
+        get_heatmap_dataset,
+        prev_full_hour_window,
+    )
+except Exception:  # noqa: BLE001
+    def find_latest_ready_snapshots(  # type: ignore[override]
+        _aid: str,
+        *,
+        max_hours: int,
+        now: datetime | None = None,
+    ):
+        return []
+
+    def get_heatmap_dataset(_aid: str, *, date_str: str, hours: list[int]):  # type: ignore[override]
+        return None, "missing", "no_snapshot", {}
+
+    def prev_full_hour_window(now: datetime | None = None):  # type: ignore[override]
+        return {}
+
+
+def _cpa_agg_from_rows(rows: list[dict]) -> tuple[float, int]:
+    spend = 0.0
+    total = 0
+    for r in rows or []:
+        if not isinstance(r, dict):
+            continue
+        try:
+            spend += float(r.get("spend") or 0.0)
+        except Exception:
+            pass
+        try:
+            t = r.get("total")
+            if t is None:
+                t = int(r.get("msgs") or 0) + int(r.get("leads") or 0)
+            total += int(t or 0)
+        except Exception:
+            pass
+    return float(spend), int(total)
+
+
+def _cpa_series_from_snapshots(snaps: list[dict]) -> tuple[list[float | None], list[float], list[int]]:
+    cpa_series: list[float | None] = []
+    spend_series: list[float] = []
+    total_series: list[int] = []
+    for snap in snaps or []:
+        rows = (snap or {}).get("rows") or []
+        if not isinstance(rows, list):
+            rows = []
+        sp, tot = _cpa_agg_from_rows(rows)
+        spend_series.append(float(sp))
+        total_series.append(int(tot))
+        if tot > 0 and sp > 0:
+            cpa_series.append(float(sp) / float(tot))
+        else:
+            cpa_series.append(None)
+    return cpa_series, spend_series, total_series
+
+
+def _delta_pct(first: float | None, last: float | None) -> int | None:
+    if first is None or last is None or first <= 0:
+        return None
+    try:
+        return int(round(((float(last) - float(first)) / float(first)) * 100.0))
+    except Exception:
+        return None
+
+
+async def _cpa_alerts_job_snapshots_only(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    now: datetime,
+    accounts: dict,
+    chat_id: str,
+) -> None:
+    try:
+        min_spend = float(os.getenv("CPA_ALERTS_MIN_SPEND", "20") or 20)
+    except Exception:
+        min_spend = 20.0
+    try:
+        min_actions = int(float(os.getenv("CPA_ALERTS_MIN_ACTIONS", "5") or 5))
+    except Exception:
+        min_actions = 5
+
+    win = prev_full_hour_window(now=now) or {}
+    win_label = f"{((win.get('window') or {}).get('start') or '')}–{((win.get('window') or {}).get('end') or '')}"
+
+    for aid, row in (accounts or {}).items():
+        alerts = (row or {}).get("alerts") or {}
+        if not isinstance(alerts, dict):
+            alerts = {}
+
+        if not bool(alerts.get("enabled", False)):
+            continue
+        if not _is_day_enabled(alerts, now):
+            continue
+
+        freq = alerts.get("freq", "3x")
+        if freq == "3x":
+            current_time = now.replace(second=0, microsecond=0).time()
+            if current_time not in CPA_ALERT_TIMES:
+                continue
+        elif freq == "hourly":
+            if not (CPA_HOURLY_START <= now.hour <= CPA_HOURLY_END):
+                continue
+        else:
+            continue
+
+        with deny_fb_api_calls(reason="cpa_alerts_prev_hour"):
+            _ds, ds_status, ds_reason, _ds_meta = get_heatmap_dataset(
+                str(aid),
+                date_str=str(win.get("date") or ""),
+                hours=[int(win.get("hour") or 0)],
+            )
+        if str(ds_status) not in {"ready", "ready_low_confidence"}:
+            continue
+
+        snaps_desc = find_latest_ready_snapshots(str(aid), max_hours=4, now=now) or []
+        snaps = list(reversed(snaps_desc))
+        if not snaps:
+            continue
+
+        account_target = _resolve_account_cpa(alerts)
+        if float(account_target) <= 0:
+            continue
+
+        campaign_alerts = alerts.get("campaign_alerts", {}) or {}
+        adset_alerts = alerts.get("adset_alerts", {}) or {}
+
+        account_cpa_series, account_spend_series, account_total_series = _cpa_series_from_snapshots(snaps)
+        last_cpa = account_cpa_series[-1] if account_cpa_series else None
+        last_spend = float(account_spend_series[-1] if account_spend_series else 0.0)
+        last_total = int(account_total_series[-1] if account_total_series else 0)
+        first_cpa = next((v for v in account_cpa_series if v is not None), None)
+        dp = _delta_pct(first_cpa, last_cpa)
+
+        if (
+            last_cpa is not None
+            and float(last_cpa) > float(account_target)
+            and last_spend >= float(min_spend)
+            and last_total >= int(min_actions)
+        ):
+            rules = [{"rule": "cpa_above_target", "severity": "high", "should_notify": True}]
+            if dp is not None and int(dp) >= 50:
+                rules.append({"rule": "cpa_spike", "severity": "high", "should_notify": True})
+
+            snap_msg = {
+                "account_id": str(aid),
+                "account_name": get_account_name(str(aid)),
+                "entity_id": None,
+                "level": "account",
+                "history_days": 1,
+                "cpa_series": account_cpa_series,
+                "delta_pct": dp,
+                "target_cpa": float(account_target),
+            }
+
+            try:
+                msg_lines = [
+                    "Источник данных: heatmap cache",
+                    f"Окно: {win_label}",
+                    f"Слепок: {ds_status} ({ds_reason})",
+                    "",
+                    format_cpa_anomaly_message(
+                        snapshot=snap_msg,
+                        entity_name=get_account_name(str(aid)),
+                        level_human="Аккаунт",
+                        triggered_rules=rules,
+                        ai_text=None,
+                        ai_confidence=None,
+                    ),
+                ]
+                await context.bot.send_message(chat_id, "\n".join(msg_lines))
+                await asyncio.sleep(0.3)
+            except Exception:
+                pass
+
+        # Campaign/adset alerts (use campaign_id/adset_id from snapshot rows)
+        camp_series: dict[str, list[float | None]] = {}
+        camp_spend: dict[str, list[float]] = {}
+        camp_total: dict[str, list[int]] = {}
+        adset_series: dict[str, list[float | None]] = {}
+        adset_spend: dict[str, list[float]] = {}
+        adset_total: dict[str, list[int]] = {}
+        adset_names: dict[str, str] = {}
+        adset_campaign: dict[str, str] = {}
+
+        for snap in snaps:
+            rows = (snap or {}).get("rows") or []
+            if not isinstance(rows, list):
+                rows = []
+
+            by_camp: dict[str, list[dict]] = {}
+            by_adset: dict[str, list[dict]] = {}
+            for r in rows:
+                if not isinstance(r, dict):
+                    continue
+                cid = str(r.get("campaign_id") or "")
+                if cid:
+                    by_camp.setdefault(cid, []).append(r)
+                adset_id = str(r.get("adset_id") or "")
+                if adset_id:
+                    by_adset.setdefault(adset_id, []).append(r)
+                    if adset_id not in adset_names:
+                        adset_names[adset_id] = str(r.get("name") or adset_id)
+                    if cid and adset_id not in adset_campaign:
+                        adset_campaign[adset_id] = cid
+
+            for cid, rr in by_camp.items():
+                sp, tot = _cpa_agg_from_rows(rr)
+                camp_spend.setdefault(cid, []).append(float(sp))
+                camp_total.setdefault(cid, []).append(int(tot))
+                camp_series.setdefault(cid, []).append((float(sp) / float(tot)) if tot > 0 and sp > 0 else None)
+
+            for adset_id, rr in by_adset.items():
+                sp, tot = _cpa_agg_from_rows(rr)
+                adset_spend.setdefault(adset_id, []).append(float(sp))
+                adset_total.setdefault(adset_id, []).append(int(tot))
+                adset_series.setdefault(adset_id, []).append((float(sp) / float(tot)) if tot > 0 and sp > 0 else None)
+
+        for cid, series in (camp_series or {}).items():
+            cfg = (campaign_alerts.get(cid) or {}) if isinstance(campaign_alerts, dict) else {}
+            if cfg and cfg.get("enabled") is False:
+                continue
+            tgt = float(cfg.get("target_cpa") or 0.0)
+            effective_target = tgt if tgt > 0 else float(account_target)
+            if effective_target <= 0:
+                continue
+            sp_series = camp_spend.get(cid) or []
+            t_series = camp_total.get(cid) or []
+            if not sp_series or not t_series or len(series) != len(sp_series) or len(series) != len(t_series):
+                continue
+            last_val = series[-1]
+            if last_val is None:
+                continue
+            last_sp = float(sp_series[-1] or 0.0)
+            last_tot = int(t_series[-1] or 0)
+            if last_sp < float(min_spend) or last_tot < int(min_actions):
+                continue
+            if float(last_val) <= float(effective_target):
+                continue
+            first_val = next((v for v in series if v is not None), None)
+            cdp = _delta_pct(first_val, last_val)
+            rules = [{"rule": "cpa_above_target", "severity": "high", "should_notify": True}]
+            if cdp is not None and int(cdp) >= 50:
+                rules.append({"rule": "cpa_spike", "severity": "high", "should_notify": True})
+
+            snap_msg = {
+                "account_id": str(aid),
+                "account_name": get_account_name(str(aid)),
+                "entity_id": str(cid),
+                "level": "campaign",
+                "history_days": 1,
+                "cpa_series": series,
+                "delta_pct": cdp,
+                "target_cpa": float(effective_target),
+            }
+            try:
+                msg_lines = [
+                    "Источник данных: heatmap cache",
+                    f"Окно: {win_label}",
+                    f"Слепок: {ds_status} ({ds_reason})",
+                    "",
+                    format_cpa_anomaly_message(
+                        snapshot=snap_msg,
+                        entity_name=str(cid),
+                        level_human="Кампания",
+                        triggered_rules=rules,
+                        ai_text=None,
+                        ai_confidence=None,
+                    ),
+                ]
+                await context.bot.send_message(chat_id, "\n".join(msg_lines))
+                await asyncio.sleep(0.3)
+            except Exception:
+                pass
+
+        for adset_id, series in (adset_series or {}).items():
+            cfg = (adset_alerts.get(adset_id) or {}) if isinstance(adset_alerts, dict) else {}
+            if cfg and cfg.get("enabled") is False:
+                continue
+            tgt = float(cfg.get("target_cpa") or 0.0)
+            camp_id = str(adset_campaign.get(adset_id) or "")
+            camp_target = 0.0
+            if camp_id and isinstance(campaign_alerts, dict) and camp_id in campaign_alerts:
+                try:
+                    camp_target = float((campaign_alerts.get(camp_id) or {}).get("target_cpa") or 0.0)
+                except Exception:
+                    camp_target = 0.0
+            effective_target = tgt if tgt > 0 else camp_target if camp_target > 0 else float(account_target)
+            if effective_target <= 0:
+                continue
+            sp_series = adset_spend.get(adset_id) or []
+            t_series = adset_total.get(adset_id) or []
+            if not sp_series or not t_series or len(series) != len(sp_series) or len(series) != len(t_series):
+                continue
+            last_val = series[-1]
+            if last_val is None:
+                continue
+            last_sp = float(sp_series[-1] or 0.0)
+            last_tot = int(t_series[-1] or 0)
+            if last_sp < float(min_spend) or last_tot < int(min_actions):
+                continue
+            if float(last_val) <= float(effective_target):
+                continue
+            first_val = next((v for v in series if v is not None), None)
+            adp = _delta_pct(first_val, last_val)
+            rules = [{"rule": "cpa_above_target", "severity": "high", "should_notify": True}]
+            if adp is not None and int(adp) >= 50:
+                rules.append({"rule": "cpa_spike", "severity": "high", "should_notify": True})
+
+            snap_msg = {
+                "account_id": str(aid),
+                "account_name": get_account_name(str(aid)),
+                "entity_id": str(adset_id),
+                "level": "adset",
+                "history_days": 1,
+                "cpa_series": series,
+                "delta_pct": adp,
+                "target_cpa": float(effective_target),
+            }
+            try:
+                msg_lines = [
+                    "Источник данных: heatmap cache",
+                    f"Окно: {win_label}",
+                    f"Слепок: {ds_status} ({ds_reason})",
+                    "",
+                    format_cpa_anomaly_message(
+                        snapshot=snap_msg,
+                        entity_name=str(adset_names.get(adset_id) or adset_id),
+                        level_human="Адсет",
+                        triggered_rules=rules,
+                        ai_text=None,
+                        ai_confidence=None,
+                    ),
+                ]
+                await context.bot.send_message(chat_id, "\n".join(msg_lines))
+                await asyncio.sleep(0.3)
+            except Exception:
+                pass
 
 
 def _autopilot_report_chat_id() -> str:
@@ -660,6 +1028,261 @@ def _ap_heatmap_profile(summary: dict) -> tuple[list[int], list[int]]:
     scored_low = sorted(scored, key=lambda x: (x[2], x[1]))
     low = [h for h, _s, _t in scored_low][:4]
     return top, low
+
+
+async def _heatmap_snapshot_collector_job(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    manual: bool = False,
+    manual_aid: str | None = None,
+):
+    from services.heatmap_store import load_snapshot, save_snapshot, build_snapshot_shell
+
+    now = datetime.now(ALMATY_TZ)
+    end_dt = now.replace(minute=0, second=0, microsecond=0)
+    start_dt = end_dt - timedelta(hours=1)
+    date_str = start_dt.strftime("%Y-%m-%d")
+    hour_int = int(start_dt.strftime("%H"))
+    deadline_dt = end_dt + timedelta(minutes=30)
+
+    try:
+        min_rows_required = int(os.getenv("HEATMAP_MIN_ROWS_REQUIRED", "30") or 30)
+    except Exception:
+        min_rows_required = 30
+
+    try:
+        max_calls = int(os.getenv("FB_MAX_CALLS_PER_ATTEMPT", "3") or 3)
+    except Exception:
+        max_calls = 3
+
+    accounts = load_accounts() or {}
+    if manual_aid:
+        accounts = {str(manual_aid): accounts.get(str(manual_aid))}
+
+    for aid, row in (accounts or {}).items():
+        if not row:
+            continue
+        if not (row or {}).get("enabled", True):
+            continue
+
+        snap = load_snapshot(str(aid), date_str=date_str, hour=hour_int)
+        if not snap:
+            snap = build_snapshot_shell(
+                str(aid),
+                date_str=date_str,
+                hour=hour_int,
+                start_dt=start_dt,
+                end_dt=end_dt,
+                deadline_dt=deadline_dt,
+                min_rows_required=min_rows_required,
+            )
+
+        # Ensure snapshot schema fields exist.
+        snap["source"] = "heatmap_cache"
+        if "reason" not in snap:
+            snap["reason"] = "snapshot_collecting"
+        if "rows_count" not in snap:
+            try:
+                snap["rows_count"] = int(len(snap.get("rows") or []))
+            except Exception:
+                snap["rows_count"] = 0
+        if "spend" not in snap:
+            snap["spend"] = 0.0
+
+        if str((snap or {}).get("status") or "") == "ready":
+            continue
+
+        try:
+            dl_raw = (snap or {}).get("deadline_at")
+            dl = datetime.fromisoformat(str(dl_raw)) if dl_raw else deadline_dt
+        except Exception:
+            dl = deadline_dt
+
+        if now > dl:
+            err = (snap or {}).get("error")
+            if not isinstance(err, dict):
+                err = {"type": "api_error"}
+
+            has_any = False
+            try:
+                has_any = bool(snap.get("rows"))
+            except Exception:
+                has_any = False
+
+            if has_any:
+                snap["status"] = "ready_low_confidence"
+                snap["reason"] = "low_volume"
+                snap["error"] = None
+                snap["next_try_at"] = None
+            else:
+                snap["status"] = "failed"
+                et = str((err or {}).get("type") or "api_error")
+                snap["reason"] = "rate_limit" if et == "rate_limit" else "snapshot_failed"
+                snap["error"] = err
+            save_snapshot(snap)
+            continue
+
+        snap["status"] = "collecting"
+        snap["reason"] = "snapshot_collecting"
+        snap["last_try_at"] = now.isoformat()
+        try:
+            snap["next_try_at"] = (now + timedelta(minutes=10)).isoformat()
+        except Exception:
+            snap["next_try_at"] = None
+
+        if is_rate_limited_now():
+            info = get_last_api_error_info() or {}
+            snap["error"] = {
+                "type": "rate_limit",
+                "fb_code": (info or {}).get("code") or 17,
+                "fb_subcode": (info or {}).get("subcode"),
+                "fbtrace_id": (info or {}).get("fbtrace_id"),
+            }
+            snap["reason"] = "rate_limit"
+            save_snapshot(snap)
+            continue
+
+        try:
+            snap["attempts"] = int((snap or {}).get("attempts") or 0) + 1
+        except Exception:
+            snap["attempts"] = 1
+
+        calls_used = 0
+
+        lead_action_type = None
+        try:
+            from fb_report.storage import get_lead_metric_for_account
+
+            sel = get_lead_metric_for_account(str(aid))
+            if isinstance(sel, dict):
+                lead_action_type = sel.get("action_type")
+        except Exception:
+            lead_action_type = None
+
+        adset_meta: dict[str, dict] = {}
+        data = None
+        with allow_fb_api_calls(reason="heatmap_snapshot_collector"):
+            if max_calls > 0:
+                calls_used += 1
+                try:
+                    adsets = fetch_adsets(str(aid)) or []
+                except Exception:
+                    adsets = []
+                for a in (adsets or []):
+                    adset_id = str((a or {}).get("id") or "")
+                    if adset_id:
+                        adset_meta[adset_id] = a
+
+            if calls_used < max_calls:
+                calls_used += 1
+                try:
+                    from facebook_business.adobjects.adaccount import AdAccount
+
+                    acc = AdAccount(str(aid))
+                    params = {
+                        "level": "adset",
+                        "time_range": {"since": date_str, "until": date_str},
+                        "breakdowns": ["hourly_stats_aggregated_by_advertiser_time_zone"],
+                        "time_increment": 1,
+                    }
+                    fields = [
+                        "spend",
+                        "actions",
+                        "cost_per_action_type",
+                        "impressions",
+                        "clicks",
+                        "frequency",
+                        "adset_id",
+                        "campaign_id",
+                    ]
+                    data = safe_api_call(
+                        acc.get_insights,
+                        fields=fields,
+                        params=params,
+                        _meta={"endpoint": "insights/adset/hourly", "params": params},
+                    )
+                except Exception:
+                    data = None
+
+        rows_out: list[dict] = []
+        if data:
+            for rr in (data or []):
+                d = _normalize_insight(rr)
+                raw_hour = str((d or {}).get("hourly_stats_aggregated_by_advertiser_time_zone") or "")
+                if not raw_hour:
+                    continue
+                hh_ok = raw_hour.startswith(f"{hour_int:02d}") or (f" {hour_int:02d}:" in raw_hour)
+                if not hh_ok:
+                    continue
+
+                try:
+                    parsed = parse_insight(d or {}, aid=str(aid), lead_action_type=lead_action_type)
+                except Exception:
+                    parsed = {"msgs": 0, "leads": 0, "total": 0, "spend": 0.0, "cpa": None}
+
+                adset_id = str((d or {}).get("adset_id") or "")
+                if not adset_id:
+                    continue
+                meta = adset_meta.get(adset_id) or {}
+                total = int(parsed.get("total") or 0)
+                spend = float(parsed.get("spend") or 0.0)
+                rows_out.append(
+                    {
+                        "adset_id": adset_id,
+                        "name": meta.get("name"),
+                        "campaign_id": meta.get("campaign_id") or (d or {}).get("campaign_id"),
+                        "spend": spend,
+                        "msgs": int(parsed.get("msgs") or 0),
+                        "leads": int(parsed.get("leads") or 0),
+                        "total": total,
+                        "results": total,
+                        "cpl": parsed.get("cpa"),
+                        "hour": int(hour_int),
+                    }
+                )
+
+        snap["rows"] = rows_out
+        snap["collected_rows"] = int(len(rows_out))
+        snap["rows_count"] = int(len(rows_out))
+        try:
+            snap["spend"] = float(sum(float((r or {}).get("spend") or 0.0) for r in (rows_out or [])))
+        except Exception:
+            snap["spend"] = 0.0
+
+        ready = False
+        if int(snap.get("collected_rows") or 0) >= int(snap.get("min_rows_required") or min_rows_required):
+            ready = True
+        else:
+            try:
+                ready = bool(rows_out) and any(float((r or {}).get("spend") or 0.0) > 0 for r in rows_out)
+            except Exception:
+                ready = bool(rows_out)
+
+        if ready:
+            snap["status"] = "ready"
+            snap["reason"] = ""
+            snap["next_try_at"] = None
+            snap["error"] = None
+        else:
+            info = get_last_api_error_info() or {}
+            et = "api_error"
+            try:
+                et = str(classify_api_error(info))
+            except Exception:
+                et = "api_error"
+            snap["error"] = {
+                "type": et,
+                "fb_code": (info or {}).get("code"),
+                "fb_subcode": (info or {}).get("subcode"),
+                "fbtrace_id": (info or {}).get("fbtrace_id"),
+            }
+            snap["reason"] = "rate_limit" if et == "rate_limit" else "snapshot_collecting"
+
+        save_snapshot(snap)
+
+        if manual and manual_aid:
+            # One attempt in manual mode.
+            break
 
 
 async def _autopilot_heatmap_job(context: ContextTypes.DEFAULT_TYPE):
@@ -1540,6 +2163,15 @@ async def _cpa_alerts_job(context: ContextTypes.DEFAULT_TYPE):
 
     chat_id = owner_id if owner_id is not None else str(DEFAULT_REPORT_CHAT)
 
+    with deny_fb_api_calls(reason="cpa_alerts_job"):
+        await _cpa_alerts_job_snapshots_only(
+            context,
+            now=now,
+            accounts=accounts,
+            chat_id=str(chat_id),
+        )
+    return
+
     # Для алёрта берём текущее состояние за today,
     # чтобы видеть актуальный CPA на момент часа.
     period = "today"
@@ -2133,6 +2765,11 @@ async def _hourly_snapshot_job(context: ContextTypes.DEFAULT_TYPE):
     - дельта по messages/leads/total/spend пишется в hourly_stats.json;
     - храним историю ~2 года по дням и часам.
     """
+    logging.getLogger(__name__).info(
+        "hourly_snapshot_job_disabled reason=heatmap_snapshots_single_source_of_truth"
+    )
+    return
+
     now = datetime.now(ALMATY_TZ)
     date_str = now.strftime("%Y-%m-%d")
     hour_str = now.strftime("%H")
@@ -2375,29 +3012,20 @@ def schedule_cpa_alerts(app: Application):
     )
 
     # Часовой снимок инсайтов за today для часового кэша
+    # Heatmap snapshot collector: единственный компонент, который ходит в FB.
+    # Запускаем раз в 10 минут; он собирает предыдущий полный час и дособирает до дедлайна.
     try:
         now = datetime.now(ALMATY_TZ)
-        first_snap = now.replace(minute=0, second=0, microsecond=0)
-        if first_snap <= now:
-            first_snap = first_snap + timedelta(hours=1)
+        first_col = now.replace(minute=(int(now.minute / 10) * 10), second=0, microsecond=0)
+        if first_col <= now:
+            first_col = first_col + timedelta(minutes=10)
     except Exception:
-        first_snap = timedelta(minutes=0)
+        first_col = timedelta(minutes=10)
     app.job_queue.run_repeating(
-        _hourly_snapshot_job,
-        interval=timedelta(hours=1),
-        first=first_snap,
+        _heatmap_snapshot_collector_job,
+        interval=timedelta(minutes=10),
+        first=first_col,
     )
 
-    # Heatmap Autopilot (AUTO_LIMITS)
-    try:
-        now = datetime.now(ALMATY_TZ)
-        first_hm = now.replace(minute=15, second=0, microsecond=0)
-        if first_hm <= now:
-            first_hm = first_hm + timedelta(hours=1)
-    except Exception:
-        first_hm = timedelta(minutes=15)
-    app.job_queue.run_repeating(
-        _autopilot_heatmap_job,
-        interval=timedelta(hours=1),
-        first=first_hm,
-    )
+    # NOTE: _autopilot_heatmap_job is intentionally not scheduled here.
+    # It will be re-enabled after it is migrated to snapshots-only data.
