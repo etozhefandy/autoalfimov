@@ -23,6 +23,15 @@ from .adsets import fetch_adset_insights_7d
 from .insights import build_hourly_heatmap_for_account
 from .autopilot_format import ap_action_text
 
+try:  # pragma: no cover
+    from services.heatmap_store import load_snapshot, prev_full_hour_window
+except Exception:  # noqa: BLE001
+    def load_snapshot(_aid: str, *, date_str: str, hour: int):  # type: ignore[override]
+        return None
+
+    def prev_full_hour_window(now: datetime | None = None):  # type: ignore[override]
+        return {}
+
 # Для Railway могут быть разные пути импорта services.*.
 # Пытаемся взять реальные функции, а при ошибке делаем мягкие заглушки,
 # чтобы бот не падал при старте.
@@ -1051,9 +1060,19 @@ async def _heatmap_snapshot_collector_job(
         min_rows_required = 30
 
     try:
-        max_calls = int(os.getenv("FB_MAX_CALLS_PER_ATTEMPT", "3") or 3)
+        max_calls = int(os.getenv("FB_MAX_CALLS_PER_ATTEMPT", "1") or 1)
     except Exception:
-        max_calls = 3
+        max_calls = 1
+    max_calls = 1
+
+    try:
+        max_attempts = int(os.getenv("FB_MAX_ATTEMPTS_PER_HOUR", "3") or 3)
+    except Exception:
+        max_attempts = 3
+    if max_attempts < 1:
+        max_attempts = 1
+
+    log = logging.getLogger(__name__)
 
     accounts = load_accounts() or {}
     if manual_aid:
@@ -1092,6 +1111,20 @@ async def _heatmap_snapshot_collector_job(
         if str((snap or {}).get("status") or "") == "ready":
             continue
 
+        attempt_next = int((snap or {}).get("attempts") or 0) + 1
+        try:
+            window_label = f"{start_dt.strftime('%Y-%m-%d %H:00')}–{end_dt.strftime('%H:00')}"
+        except Exception:
+            window_label = f"{date_str} {hour_int:02d}:00–{(hour_int + 1) % 24:02d}:00"
+
+        log.info(
+            "🟦 FB COLLECTOR START aid=%s window=%s attempt=%s/%s allow_fb_api_calls=TRUE",
+            str(aid),
+            str(window_label),
+            str(attempt_next),
+            str(max_attempts),
+        )
+
         try:
             dl_raw = (snap or {}).get("deadline_at")
             dl = datetime.fromisoformat(str(dl_raw)) if dl_raw else deadline_dt
@@ -1105,7 +1138,7 @@ async def _heatmap_snapshot_collector_job(
 
             has_any = False
             try:
-                has_any = bool(snap.get("rows"))
+                has_any = bool(snap.get("rows")) and float(snap.get("spend") or 0.0) > 0.0
             except Exception:
                 has_any = False
 
@@ -1120,13 +1153,71 @@ async def _heatmap_snapshot_collector_job(
                 snap["reason"] = "rate_limit" if et == "rate_limit" else "snapshot_failed"
                 snap["error"] = err
             save_snapshot(snap)
+
+            hh = f"{int(hour_int):02d}"
+            snap_path = os.path.join(
+                str(os.getenv("DATA_DIR", "")) or "DATA_DIR",
+                "heatmap_snapshots",
+                str(aid),
+                str(date_str),
+                hh,
+                "snapshot.json",
+            )
+            log.info(
+                "🟦 SNAPSHOT SAVED aid=%s status=%s rows=%s spend=%s path=%s",
+                str(aid),
+                str(snap.get("status") or ""),
+                str(int(snap.get("rows_count") or 0)),
+                str(float(snap.get("spend") or 0.0)),
+                str(snap_path),
+            )
+            continue
+        try:
+            ntry = str((snap or {}).get("next_try_at") or "")
+            if ntry:
+                ntd = datetime.fromisoformat(ntry)
+                if not ntd.tzinfo:
+                    ntd = ALMATY_TZ.localize(ntd)
+                ntd = ntd.astimezone(ALMATY_TZ)
+                if now < ntd:
+                    mins = int(max(0.0, (ntd - now).total_seconds()) / 60.0)
+                    log.info(
+                        "🟦 FB COLLECTOR WAIT aid=%s until=%s in_min=%s",
+                        str(aid),
+                        str(ntd.isoformat()),
+                        str(mins),
+                    )
+                    continue
+        except Exception:
+            pass
+        try:
+            attempts_done = int((snap or {}).get("attempts") or 0)
+        except Exception:
+            attempts_done = 0
+        if attempts_done >= int(max_attempts):
+            snap["status"] = "collecting"
+            snap["reason"] = "snapshot_collecting"
+            snap["error"] = {"type": "attempts_exceeded"}
+            snap["last_try_at"] = snap.get("last_try_at")
+            snap["next_try_at"] = snap.get("deadline_at")
+            save_snapshot(snap)
+            log.info(
+                "🟦 FB COLLECTOR SKIP aid=%s reason=attempts_exceeded attempts=%s/%s",
+                str(aid),
+                str(attempts_done),
+                str(max_attempts),
+            )
             continue
 
         snap["status"] = "collecting"
         snap["reason"] = "snapshot_collecting"
         snap["last_try_at"] = now.isoformat()
         try:
-            snap["next_try_at"] = (now + timedelta(minutes=10)).isoformat()
+            delay_min = random.randint(2, 5)
+        except Exception:
+            delay_min = 3
+        try:
+            snap["next_try_at"] = (now + timedelta(minutes=int(delay_min))).isoformat()
         except Exception:
             snap["next_try_at"] = None
 
@@ -1140,6 +1231,15 @@ async def _heatmap_snapshot_collector_job(
             }
             snap["reason"] = "rate_limit"
             save_snapshot(snap)
+
+            try:
+                log.warning(
+                    "🟦 FB RATE LIMIT aid=%s retry_after=%ss",
+                    str(aid),
+                    str(rate_limit_retry_after_seconds()),
+                )
+            except Exception:
+                pass
             continue
 
         try:
@@ -1159,21 +1259,9 @@ async def _heatmap_snapshot_collector_job(
         except Exception:
             lead_action_type = None
 
-        adset_meta: dict[str, dict] = {}
         data = None
         with allow_fb_api_calls(reason="heatmap_snapshot_collector"):
             if max_calls > 0:
-                calls_used += 1
-                try:
-                    adsets = fetch_adsets(str(aid)) or []
-                except Exception:
-                    adsets = []
-                for a in (adsets or []):
-                    adset_id = str((a or {}).get("id") or "")
-                    if adset_id:
-                        adset_meta[adset_id] = a
-
-            if calls_used < max_calls:
                 calls_used += 1
                 try:
                     from facebook_business.adobjects.adaccount import AdAccount
@@ -1193,13 +1281,16 @@ async def _heatmap_snapshot_collector_job(
                         "clicks",
                         "frequency",
                         "adset_id",
+                        "adset_name",
                         "campaign_id",
+                        "campaign_name",
                     ]
                     data = safe_api_call(
                         acc.get_insights,
                         fields=fields,
                         params=params,
                         _meta={"endpoint": "insights/adset/hourly", "params": params},
+                        _caller="heatmap_snapshot_collector",
                     )
                 except Exception:
                     data = None
@@ -1223,14 +1314,14 @@ async def _heatmap_snapshot_collector_job(
                 adset_id = str((d or {}).get("adset_id") or "")
                 if not adset_id:
                     continue
-                meta = adset_meta.get(adset_id) or {}
                 total = int(parsed.get("total") or 0)
                 spend = float(parsed.get("spend") or 0.0)
                 rows_out.append(
                     {
                         "adset_id": adset_id,
-                        "name": meta.get("name"),
-                        "campaign_id": meta.get("campaign_id") or (d or {}).get("campaign_id"),
+                        "name": (d or {}).get("adset_name") or (d or {}).get("name"),
+                        "campaign_id": (d or {}).get("campaign_id"),
+                        "campaign_name": (d or {}).get("campaign_name"),
                         "spend": spend,
                         "msgs": int(parsed.get("msgs") or 0),
                         "leads": int(parsed.get("leads") or 0),
@@ -1241,6 +1332,16 @@ async def _heatmap_snapshot_collector_job(
                     }
                 )
 
+        try:
+            log.info(
+                "🟦 FB RESPONSE aid=%s rows=%s spend=%s",
+                str(aid),
+                str(int(len(rows_out or []))),
+                str(float(sum(float((r or {}).get("spend") or 0.0) for r in (rows_out or [])))),
+            )
+        except Exception:
+            pass
+
         snap["rows"] = rows_out
         snap["collected_rows"] = int(len(rows_out))
         snap["rows_count"] = int(len(rows_out))
@@ -1249,18 +1350,25 @@ async def _heatmap_snapshot_collector_job(
         except Exception:
             snap["spend"] = 0.0
 
-        ready = False
-        if int(snap.get("collected_rows") or 0) >= int(snap.get("min_rows_required") or min_rows_required):
-            ready = True
-        else:
-            try:
-                ready = bool(rows_out) and any(float((r or {}).get("spend") or 0.0) > 0 for r in rows_out)
-            except Exception:
-                ready = bool(rows_out)
+        try:
+            rows_cnt = int(len(rows_out or []))
+        except Exception:
+            rows_cnt = 0
+        try:
+            spend_total = float(snap.get("spend") or 0.0)
+        except Exception:
+            spend_total = 0.0
 
-        if ready:
+        min_rows = int(snap.get("min_rows_required") or min_rows_required)
+
+        if rows_cnt > 0 and spend_total > 0 and rows_cnt >= min_rows:
             snap["status"] = "ready"
             snap["reason"] = ""
+            snap["next_try_at"] = None
+            snap["error"] = None
+        elif rows_cnt > 0 and spend_total > 0:
+            snap["status"] = "ready_low_confidence"
+            snap["reason"] = "low_volume"
             snap["next_try_at"] = None
             snap["error"] = None
         else:
@@ -1280,9 +1388,35 @@ async def _heatmap_snapshot_collector_job(
 
         save_snapshot(snap)
 
+        hh = f"{int(hour_int):02d}"
+        snap_path = os.path.join(
+            str(os.getenv("DATA_DIR", "")) or "DATA_DIR",
+            "heatmap_snapshots",
+            str(aid),
+            str(date_str),
+            hh,
+            "snapshot.json",
+        )
+        log.info(
+            "🟦 SNAPSHOT SAVED aid=%s status=%s rows=%s spend=%s path=%s",
+            str(aid),
+            str(snap.get("status") or ""),
+            str(int(snap.get("rows_count") or 0)),
+            str(float(snap.get("spend") or 0.0)),
+            str(snap_path),
+        )
+
         if manual and manual_aid:
             # One attempt in manual mode.
             break
+
+
+async def run_heatmap_snapshot_collector_once(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    aid: str,
+) -> None:
+    await _heatmap_snapshot_collector_job(context, manual=True, manual_aid=str(aid))
 
 
 async def _autopilot_heatmap_job(context: ContextTypes.DEFAULT_TYPE):
@@ -2137,6 +2271,44 @@ def _resolve_account_cpa(alerts: dict) -> float:
     if old > 0:
         return old
     return 3.0
+
+
+def build_heatmap_status_text(*, aid: str, now: datetime | None = None) -> str:
+    now = now or datetime.now(ALMATY_TZ)
+    win = prev_full_hour_window(now=now) or {}
+    date_str = str(win.get("date") or "")
+    hour_int = int(win.get("hour") or 0)
+    window_label = f"{(win.get('window') or {}).get('start','')}–{(win.get('window') or {}).get('end','')}"
+
+    snap = load_snapshot(str(aid), date_str=date_str, hour=hour_int) or {}
+    status = str(snap.get("status") or "missing")
+    reason = str(snap.get("reason") or "no_snapshot")
+    attempts = int(snap.get("attempts") or 0)
+    rows = int(snap.get("rows_count") or 0)
+    spend = float(snap.get("spend") or 0.0)
+    last_try = str(snap.get("last_try_at") or "")
+    next_try = str(snap.get("next_try_at") or "")
+
+    fb_requests = "были" if attempts > 0 else "не были"
+    last_collector = "OK" if status in {"ready", "ready_low_confidence"} else "FAIL"
+
+    lines = [
+        "🟦 Heatmap Status",
+        f"aid={str(aid)}",
+        f"Окно: {date_str} {window_label}",
+        f"Последний collector запуск: {last_collector}",
+        f"FB запросы: {fb_requests}",
+        "Snapshot:",
+        f"  status={status}",
+        f"  reason={reason}",
+        f"  rows={rows}",
+        f"  spend={spend:.2f}",
+        f"  attempts={attempts}",
+        f"  last_try={last_try}",
+    ]
+    if next_try:
+        lines.append(f"  next_try={next_try}")
+    return "\n".join(lines)
 
 
 async def _cpa_alerts_job(context: ContextTypes.DEFAULT_TYPE):

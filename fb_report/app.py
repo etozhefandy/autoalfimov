@@ -70,7 +70,14 @@ from .insights import (
 from .creatives import fetch_instagram_active_ads_links, format_instagram_ads_links
 from .adsets import send_adset_report
 from .billing import send_billing, send_billing_forecast, billing_digest_job
-from .jobs import full_daily_scan_job, daily_report_job, schedule_cpa_alerts, _resolve_account_cpa
+from .jobs import (
+    full_daily_scan_job,
+    daily_report_job,
+    schedule_cpa_alerts,
+    _resolve_account_cpa,
+    build_heatmap_status_text,
+    run_heatmap_snapshot_collector_once,
+)
 from .autopilot_format import ap_action_text
 
 from services.analytics import analyze_campaigns, analyze_adsets, analyze_account, analyze_ads
@@ -203,12 +210,15 @@ def _autopilot_analysis_kb(aid: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("🔄 Обновить", callback_data=f"ap_analyze|{aid}")],
-            [InlineKeyboardButton("🛠 Предложить действия", callback_data=f"ap_suggest|{aid}")],
-            [InlineKeyboardButton("🧪 Прогнать сейчас (без применения)", callback_data=f"ap_dry|{aid}")],
-            [InlineKeyboardButton("🕒 Часы (тепловая карта)", callback_data=f"ap_hm|{aid}")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data=f"autopilot_acc|{aid}")],
-            [InlineKeyboardButton("⬅️ К аккаунтам", callback_data="autopilot_menu")],
-            [InlineKeyboardButton("⬅️ В меню", callback_data="menu")],
+            [
+                InlineKeyboardButton(
+                    "📌 Собрать слепок предыдущего часа",
+                    callback_data=f"hm_collect_prev|{aid}",
+                )
+            ],
+            [InlineKeyboardButton("💡 Подобрать действия", callback_data=f"ap_suggest|{aid}")],
+            [InlineKeyboardButton("🧪 Dry-run", callback_data=f"ap_dry|{aid}")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="ap_menu")],
         ]
     )
 
@@ -2147,6 +2157,12 @@ def monitoring_menu_kb() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
+                    "🟦 Статус теплокарты",
+                    callback_data="heatmap_status_menu",
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     "🔥 Тепловая карта",
                     callback_data="mon_heatmap_menu",
                 )
@@ -3008,6 +3024,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/sync_accounts — синхронизация BM\n"
         "/whoami — показать user_id/chat_id\n"
         "/heatmap <act_id> — тепловая карта адсетов за 7 дней\n"
+        "/heatmap_status <act_id> — статус слепка теплокарты за предыдущий полный час\n"
         "/version — показать текущую версию бота и краткое описание\n"
         "\n"
         "🚀 Функции автопилота:\n"
@@ -3067,6 +3084,25 @@ async def cmd_heatmap(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Выберите период тепловой карты для {get_account_name(aid)}:",
         reply_markup=heatmap_menu(aid),
     )
+
+
+async def cmd_heatmap_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _allowed(update):
+        return
+
+    parts = update.message.text.strip().split()
+    if len(parts) == 1:
+        await update.message.reply_text(
+            "Выберите аккаунт для статуса теплокарты:",
+            reply_markup=accounts_kb("heatmap_status_acc"),
+        )
+        return
+
+    aid = parts[1].strip()
+    if not aid.startswith("act_"):
+        aid = "act_" + aid
+    text = build_heatmap_status_text(aid=aid)
+    await update.message.reply_text(text)
 
 
 async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4014,6 +4050,35 @@ async def _on_cb_internal(
         )
         return
 
+    if data == "heatmap_status_menu":
+        await safe_edit_message(
+            q,
+            "Выберите аккаунт для статуса теплокарты:",
+            reply_markup=accounts_kb("heatmap_status_acc"),
+        )
+        return
+
+    if data.startswith("heatmap_status_acc|"):
+        aid = data.split("|", 1)[1]
+        text = build_heatmap_status_text(aid=aid)
+        await safe_edit_message(q, text, reply_markup=monitoring_menu_kb())
+        return
+
+    if data.startswith("hm_collect_prev|"):
+        aid = data.split("|", 1)[1]
+        await safe_edit_message(
+            q,
+            f"📌 Собираю слепок предыдущего часа для {get_account_name(aid)}…",
+            reply_markup=_autopilot_analysis_kb(aid),
+        )
+        try:
+            await run_heatmap_snapshot_collector_once(context, aid=str(aid))
+        except Exception:
+            pass
+        text = build_heatmap_status_text(aid=aid)
+        await safe_edit_message(q, text, reply_markup=_autopilot_analysis_kb(aid))
+        return
+
     if data == "focus_ai_menu":
         await safe_edit_message(
             q,
@@ -4258,159 +4323,178 @@ async def _on_cb_internal(
             mode,
         )
 
-        # Собираем данные по выбранному уровню и периоду.
-        from services.analytics import _make_period_for_mode  # локальный импорт, чтобы избежать циклов
+        win = prev_full_hour_window(now=datetime.now(ALMATY_TZ))
+        date_str = str(win.get("date") or "")
+        hour_int = int(win.get("hour") or 0)
+        window_label = f"{(win.get('window') or {}).get('start','')}–{(win.get('window') or {}).get('end','')}"
 
-        # Для custom пока используем fallback 7 дней, но передаём маркер в контекст.
-        mode_for_period = mode if mode in {"today", "yday", "7d", "30d"} else "7d"
-        period_dict = _make_period_for_mode(mode_for_period)
+        with deny_fb_api_calls(reason="ai_focus_now_dataset"):
+            ds, ds_status, ds_reason, ds_meta = get_heatmap_dataset(
+                str(aid),
+                date_str=date_str,
+                hours=[hour_int],
+            )
 
-        if level == "account":
-            try:
-                t0 = pytime.monotonic()
-                base_analysis = await asyncio.wait_for(
-                    asyncio.to_thread(analyze_account, aid, period=period_dict),
-                    timeout=FOCUS_AI_DATA_TIMEOUT_S,
-                )
-                log.info(
-                    "[focus_ai_now] analyze_account ok elapsed=%.2fs",
-                    pytime.monotonic() - t0,
-                )
-            except asyncio.TimeoutError:
-                log.warning("[focus_ai_now] analyze_account timeout")
-                await safe_edit_message(
-                    q,
-                    "⚠️ Фокус-ИИ: сбор данных занял слишком много времени. "
-                    "Попробуй период '7 дней' или повтори запрос позже.",
-                    reply_markup=focus_ai_main_kb(),
-                )
-                return
+        if ds_status != "ready" or not ds or not (ds.get("rows") or []):
+            attempts = (ds_meta or {}).get("attempts")
+            last_try_at = (ds_meta or {}).get("last_try_at")
+            next_try_at = (ds_meta or {}).get("next_try_at")
+            txt = (
+                "📊 Разовый отчёт Фокус-ИИ\n"
+                f"Объект: {get_account_name(aid)}\n"
+                f"Уровень: {level_human}\n"
+                f"Источник данных: heatmap cache\n"
+                f"Окно: {date_str} {window_label}\n"
+                f"Слепок: {ds_status} ({ds_reason})\n"
+            )
+            if attempts is not None:
+                txt += f"Попытки: {attempts}\n"
+            if last_try_at:
+                txt += f"Последняя попытка: {last_try_at}\n"
+            if next_try_at:
+                txt += f"Следующая попытка: {next_try_at}\n"
+            txt += "\nЕсли слепка нет или он собирается — нажми '📌 Собрать слепок предыдущего часа' и повтори."
 
-            # Теплокарта может быть тяжёлой — тоже под таймаут.
-            try:
-                t0 = pytime.monotonic()
-                heat = await asyncio.wait_for(
-                    asyncio.to_thread(build_heatmap_for_account, aid, get_account_name, mode="7"),
-                    timeout=FOCUS_AI_DATA_TIMEOUT_S,
-                )
-                log.info(
-                    "[focus_ai_now] build_heatmap_for_account ok elapsed=%.2fs",
-                    pytime.monotonic() - t0,
-                )
-            except asyncio.TimeoutError:
-                log.warning("[focus_ai_now] build_heatmap_for_account timeout")
-                heat = {}
+            await safe_edit_message(q, txt, reply_markup=focus_ai_main_kb())
+            return
 
-            data_for_analysis = {
-                "scope": "account",
-                "account_id": aid,
-                "account_name": get_account_name(aid),
-                "period_mode": mode,
-                "period_label": period_human,
-                "period": period_dict,
-                "metrics": base_analysis.get("metrics"),
-                "heatmap_7d": heat,
-            }
-        elif level == "campaign":
-            try:
-                t0 = pytime.monotonic()
-                camps = await asyncio.wait_for(
-                    asyncio.to_thread(analyze_campaigns, aid, period=period_dict),
-                    timeout=FOCUS_AI_DATA_TIMEOUT_S,
-                )
-                log.info(
-                    "[focus_ai_now] analyze_campaigns ok elapsed=%.2fs count=%s",
-                    pytime.monotonic() - t0,
-                    len(camps or []),
-                )
-            except asyncio.TimeoutError:
-                log.warning("[focus_ai_now] analyze_campaigns timeout")
-                await safe_edit_message(
-                    q,
-                    "⚠️ Фокус-ИИ: сбор данных по кампаниям занял слишком много времени. "
-                    "Попробуй период '7 дней' или повтори запрос позже.",
-                    reply_markup=focus_ai_main_kb(),
-                )
-                return
+        with deny_fb_api_calls(reason="ai_focus_now_dataset"):
+            rows = list(ds.get("rows") or [])
+            rows.sort(key=lambda x: float((x or {}).get("spend") or 0.0), reverse=True)
+            rows = rows[:FOCUS_AI_MAX_OBJECTS]
 
-            camps = (camps or [])[:FOCUS_AI_MAX_OBJECTS]
-            data_for_analysis = {
-                "scope": "campaign",
-                "account_id": aid,
-                "account_name": get_account_name(aid),
-                "period_mode": mode,
-                "period_label": period_human,
-                "period": period_dict,
-                "campaigns": camps,
-                "truncated": True if (camps and len(camps) >= FOCUS_AI_MAX_OBJECTS) else False,
-            }
-        elif level == "adset":
-            try:
-                t0 = pytime.monotonic()
-                adsets = await asyncio.wait_for(
-                    asyncio.to_thread(analyze_adsets, aid, period=period_dict),
-                    timeout=FOCUS_AI_DATA_TIMEOUT_S,
-                )
-                log.info(
-                    "[focus_ai_now] analyze_adsets ok elapsed=%.2fs count=%s",
-                    pytime.monotonic() - t0,
-                    len(adsets or []),
-                )
-            except asyncio.TimeoutError:
-                log.warning("[focus_ai_now] analyze_adsets timeout")
-                await safe_edit_message(
-                    q,
-                    "⚠️ Фокус-ИИ: сбор данных по адсетам занял слишком много времени. "
-                    "Попробуй период '7 дней' или повтори запрос позже.",
-                    reply_markup=focus_ai_main_kb(),
-                )
-                return
+            spend_sum = 0.0
+            msgs_sum = 0
+            leads_sum = 0
+            total_sum = 0
+            for r in rows:
+                try:
+                    spend_sum += float((r or {}).get("spend") or 0.0)
+                except Exception:
+                    pass
+                try:
+                    msgs_sum += int((r or {}).get("msgs") or 0)
+                except Exception:
+                    pass
+                try:
+                    leads_sum += int((r or {}).get("leads") or 0)
+                except Exception:
+                    pass
+                try:
+                    total_sum += int((r or {}).get("total") or 0)
+                except Exception:
+                    pass
 
-            adsets = (adsets or [])[:FOCUS_AI_MAX_OBJECTS]
-            data_for_analysis = {
-                "scope": "adset",
-                "account_id": aid,
-                "account_name": get_account_name(aid),
-                "period_mode": mode,
-                "period_label": period_human,
-                "period": period_dict,
-                "adsets": adsets,
-                "truncated": True if (adsets and len(adsets) >= FOCUS_AI_MAX_OBJECTS) else False,
-            }
-        elif level == "ad":
-            try:
-                t0 = pytime.monotonic()
-                ads = await asyncio.wait_for(
-                    asyncio.to_thread(analyze_ads, aid, period=period_dict),
-                    timeout=FOCUS_AI_DATA_TIMEOUT_S,
-                )
-                log.info(
-                    "[focus_ai_now] analyze_ads ok elapsed=%.2fs count=%s",
-                    pytime.monotonic() - t0,
-                    len(ads or []),
-                )
-            except asyncio.TimeoutError:
-                log.warning("[focus_ai_now] analyze_ads timeout")
-                await safe_edit_message(
-                    q,
-                    "⚠️ Фокус-ИИ: сбор данных по объявлениям занял слишком много времени. "
-                    "Попробуй период '7 дней' или повтори запрос позже.",
-                    reply_markup=focus_ai_main_kb(),
-                )
-                return
+            cpl_total = (spend_sum / float(total_sum)) if (total_sum > 0 and spend_sum > 0) else None
 
-            ads = (ads or [])[:FOCUS_AI_MAX_OBJECTS]
-            data_for_analysis = {
-                "scope": "ad",
-                "account_id": aid,
-                "account_name": get_account_name(aid),
-                "period_mode": mode,
-                "period_label": period_human,
-                "period": period_dict,
-                "ads": ads,
-                "truncated": True if (ads and len(ads) >= FOCUS_AI_MAX_OBJECTS) else False,
-            }
-        else:
+            if level == "account":
+                data_for_analysis = {
+                    "scope": "account",
+                    "account_id": aid,
+                    "account_name": get_account_name(aid),
+                    "requested_period_mode": mode,
+                    "requested_period_label": period_human,
+                    "source": "heatmap_cache",
+                    "snapshot": {
+                        "date": date_str,
+                        "hour": int(hour_int),
+                        "window": window_label,
+                        "status": ds_status,
+                        "reason": ds_reason,
+                        "meta": ds_meta,
+                    },
+                    "totals": {
+                        "spend": spend_sum,
+                        "msgs": msgs_sum,
+                        "leads": leads_sum,
+                        "total": total_sum,
+                        "cpl": cpl_total,
+                    },
+                    "adsets": rows,
+                }
+            elif level == "adset":
+                data_for_analysis = {
+                    "scope": "adset",
+                    "account_id": aid,
+                    "account_name": get_account_name(aid),
+                    "requested_period_mode": mode,
+                    "requested_period_label": period_human,
+                    "source": "heatmap_cache",
+                    "snapshot": {
+                        "date": date_str,
+                        "hour": int(hour_int),
+                        "window": window_label,
+                        "status": ds_status,
+                        "reason": ds_reason,
+                        "meta": ds_meta,
+                    },
+                    "adsets": rows,
+                }
+            elif level == "campaign":
+                by_camp = {}
+                for r in rows:
+                    cid = str((r or {}).get("campaign_id") or "")
+                    if not cid:
+                        continue
+                    it = by_camp.setdefault(
+                        cid,
+                        {
+                            "campaign_id": cid,
+                            "name": (r or {}).get("campaign_name") or cid,
+                            "spend": 0.0,
+                            "msgs": 0,
+                            "leads": 0,
+                            "total": 0,
+                        },
+                    )
+                    it["spend"] = float(it.get("spend") or 0.0) + float((r or {}).get("spend") or 0.0)
+                    it["msgs"] = int(it.get("msgs") or 0) + int((r or {}).get("msgs") or 0)
+                    it["leads"] = int(it.get("leads") or 0) + int((r or {}).get("leads") or 0)
+                    it["total"] = int(it.get("total") or 0) + int((r or {}).get("total") or 0)
+
+                camps = list(by_camp.values())
+                for c in camps:
+                    sp = float(c.get("spend") or 0.0)
+                    tot = int(c.get("total") or 0)
+                    c["cpl"] = (sp / float(tot)) if (tot > 0 and sp > 0) else None
+                camps.sort(key=lambda x: float((x or {}).get("spend") or 0.0), reverse=True)
+                camps = camps[:FOCUS_AI_MAX_OBJECTS]
+                data_for_analysis = {
+                    "scope": "campaign",
+                    "account_id": aid,
+                    "account_name": get_account_name(aid),
+                    "requested_period_mode": mode,
+                    "requested_period_label": period_human,
+                    "source": "heatmap_cache",
+                    "snapshot": {
+                        "date": date_str,
+                        "hour": int(hour_int),
+                        "window": window_label,
+                        "status": ds_status,
+                        "reason": ds_reason,
+                        "meta": ds_meta,
+                    },
+                    "campaigns": camps,
+                }
+            elif level == "ad":
+                data_for_analysis = None
+            else:
+                data_for_analysis = None
+
+            user_msg = json.dumps(data_for_analysis, ensure_ascii=False) if data_for_analysis else ""
+
+        if level == "ad":
+            await safe_edit_message(
+                q,
+                "📊 Разовый отчёт Фокус-ИИ\n"
+                f"Объект: {get_account_name(aid)}\n"
+                "Уровень: Объявления\n\n"
+                "Для уровня 'Объявления' сейчас нет данных в слепках (нет ad_id в heatmap cache).",
+                reply_markup=focus_ai_main_kb(),
+            )
+            return
+
+        if not user_msg:
             await safe_edit_message(
                 q,
                 "Неизвестный уровень для Фокус-ИИ.",
@@ -4436,7 +4520,7 @@ async def _on_cb_internal(
             "ФОРМАТ report_text:\n"
             "- После разделителя '────────────────────' дай блоки по объектам.\n"
             "- Каждый блок начинается с эмодзи из легенды + название объекта.\n"
-            "- Затем 1 строка метрик: Показы | Клики | Сообщения/Лиды (что есть) | Расход | CPA.\n"
+            "- Затем 1 строка метрик: Сообщения | Лиды | Всего (msgs+leads) | Расход $ | CPL.\n"
             "- Далее 2–3 коротких подпункта: 'Сильная сторона', 'Зона внимания' или 'Проблема/Риск' (по ситуации).\n"
             "- Затем строка: '👉 Что сделать' и 1 конкретное действие (например: оставить, увеличить бюджет на 20%, снизить бюджет на 20%, остановить).\n"
             "- Между объектами ставь '────────────────────'.\n"
@@ -4455,7 +4539,6 @@ async def _on_cb_internal(
             "}"
         )
 
-        user_msg = json.dumps(data_for_analysis, ensure_ascii=False)
 
         content = ""
         json_ok = False
@@ -4636,13 +4719,15 @@ async def _on_cb_internal(
         except Exception:
             conf = 0
 
-        period_label = data_for_analysis.get("period_label") or period_human
+        period_label = data_for_analysis.get("requested_period_label") or period_human
 
         header_lines = [
             "📊 Разовый отчёт Фокус-ИИ",
             f"Объект: {get_account_name(aid)}",
             f"Уровень: {level_human}",
             f"Период: {period_label}",
+            "Источник данных: heatmap cache",
+            f"Окно: {date_str} {window_label}",
             "",
         ]
 
@@ -4672,137 +4757,6 @@ async def _on_cb_internal(
             text_out,
             reply_markup=reply_markup,
         )
-
-        # ====== Управляемые действия (кнопки) ======
-        reasons = context.user_data.get("ai_action_reasons")
-        if not isinstance(reasons, dict):
-            reasons = {}
-        context.user_data["ai_action_reasons"] = reasons
-
-        try:
-            adsets_map = _get_adset_budget_map(aid)
-        except Exception:
-            adsets_map = {}
-
-        # Бюджеты: всегда применяем на уровне adset.
-        if isinstance(budget_actions, list):
-            for act in budget_actions:
-                if not isinstance(act, dict):
-                    continue
-                if str(act.get("level") or "").lower() != "adset":
-                    continue
-                adset_id = str(act.get("adset_id") or "").strip()
-                if not adset_id:
-                    continue
-
-                try:
-                    new_budget = float(act.get("new_budget"))
-                except Exception:
-                    continue
-
-                row = adsets_map.get(adset_id) or {}
-                adset_name = row.get("name") or adset_id
-                current_budget = row.get("daily_budget")
-                try:
-                    current_budget = float(current_budget) if current_budget is not None else None
-                except Exception:
-                    current_budget = None
-
-                reason = str(act.get("reason") or "").strip()
-                cents = int(round(new_budget * 100))
-                reasons[f"bud:{aid}:{adset_id}:{cents}"] = reason
-
-                lines = [
-                    f"<b>{adset_name}</b>",
-                ]
-                if current_budget is not None:
-                    lines.append(f"Текущий бюджет: ${current_budget:.2f}")
-                lines.extend(
-                    [
-                        "",
-                        "Рекомендация ИИ:",
-                        f"— установить бюджет: ${new_budget:.2f}",
-                    ]
-                )
-                if reason:
-                    lines.append(f"— причина: {reason}")
-
-                await context.bot.send_message(
-                    chat_id,
-                    "\n".join(lines),
-                    parse_mode="HTML",
-                    reply_markup=_ai_budget_kb(aid, adset_id, new_budget, current_budget),
-                )
-
-        # Объявления: кнопка PAUSE (если не единственное).
-        if isinstance(ads_actions, list):
-            for act in ads_actions:
-                if not isinstance(act, dict):
-                    continue
-                a_type = str(act.get("type") or "").strip()
-                ad_id = str(act.get("ad_id") or "").strip()
-                adset_id = str(act.get("adset_id") or "").strip()
-                if not ad_id:
-                    continue
-
-                reason = str(act.get("reason") or "").strip()
-                try:
-                    conf01 = float(act.get("confidence"))
-                except Exception:
-                    conf01 = None
-
-                if a_type == "notify_only":
-                    txt = reason or "ℹ️ Действие только для уведомления."
-                    await context.bot.send_message(chat_id, txt)
-                    continue
-
-                if a_type != "pause_ad":
-                    continue
-
-                # Safety: если единственное активное объявление в adset — не показываем кнопку.
-                allow_pause = True
-                if adset_id:
-                    try:
-                        active_cnt = _count_active_ads_in_adset(aid, adset_id)
-                        allow_pause = active_cnt > 1
-                    except Exception:
-                        allow_pause = False
-
-                ads_map = {}
-                try:
-                    ads_map = _get_ads_map(aid)
-                except Exception:
-                    ads_map = {}
-                ad_name = (ads_map.get(ad_id) or {}).get("name") or ad_id
-
-                lines = [f"🔴 Объявление: <b>{ad_name}</b>"]
-                if adset_id:
-                    lines.append(f"Adset: <code>{adset_id}</code>")
-                if reason:
-                    lines.append("")
-                    lines.append("Почему отключить:")
-                    lines.append(f"— {reason}")
-                if conf01 is not None:
-                    lines.append(f"\nУверенность: {conf01:.2f}")
-
-                key = f"adpause:{aid}:{ad_id}:{adset_id}"
-                reasons[key] = reason
-
-                if allow_pause and adset_id:
-                    await context.bot.send_message(
-                        chat_id,
-                        "\n".join(lines),
-                        parse_mode="HTML",
-                        reply_markup=_ai_ad_pause_kb(aid, ad_id, adset_id),
-                    )
-                else:
-                    await context.bot.send_message(
-                        chat_id,
-                        "\n".join(lines)
-                        + "\n\nℹ️ Единственное объявление в adset — отключение не рекомендовано",
-                        parse_mode="HTML",
-                    )
-
         return
 
     if data.startswith("ai_bud_apply|"):
@@ -4818,7 +4772,8 @@ async def _on_cb_internal(
         reasons = context.user_data.get("ai_action_reasons") or {}
         reason = reasons.get(f"bud:{aid}:{adset_id}:{cents}") or ""
 
-        res = set_adset_budget(adset_id, new_budget)
+        with allow_fb_api_calls(reason="ai_focus_apply_budget"):
+            res = set_adset_budget(adset_id, new_budget)
         if res.get("status") != "ok":
             msg = res.get("message") or ""
             await context.bot.send_message(chat_id, f"❌ Не удалось применить действие: {msg}")
@@ -4852,11 +4807,6 @@ async def _on_cb_internal(
             return
 
         cur = None
-        try:
-            cur = (_get_adset_budget_map(aid).get(adset_id) or {}).get("daily_budget")
-            cur = float(cur) if cur is not None else None
-        except Exception:
-            cur = None
 
         context.user_data["await_ai_budget_for"] = {"aid": aid, "adset_id": adset_id}
         suffix = f" Текущий: ${cur:.2f}." if cur is not None else ""
@@ -4874,23 +4824,11 @@ async def _on_cb_internal(
             await q.answer("Некорректные данные.", show_alert=True)
             return
 
-        # Safety-check перед применением
-        try:
-            active_cnt = _count_active_ads_in_adset(aid, adset_id)
-        except Exception:
-            active_cnt = 0
-
-        if active_cnt <= 1:
-            await context.bot.send_message(
-                chat_id,
-                "❌ Не удалось применить действие: единственное активное объявление в adset — отключение запрещено.",
-            )
-            return
-
         reasons = context.user_data.get("ai_action_reasons") or {}
         reason = reasons.get(f"adpause:{aid}:{ad_id}:{adset_id}") or ""
 
-        res = pause_ad(ad_id)
+        with allow_fb_api_calls(reason="ai_focus_pause_ad"):
+            res = pause_ad(ad_id)
         if res.get("status") != "ok":
             msg = res.get("message") or res.get("exception") or ""
             await context.bot.send_message(chat_id, f"❌ Не удалось применить действие: {msg}")
@@ -5000,7 +4938,8 @@ async def _on_cb_internal(
         if action == "dec" and delta_val > 0:
             delta_val = -delta_val
 
-        res = apply_budget_change(obj_id, delta_val)
+        with allow_fb_api_calls(reason="ai_focus_apply_budget"):
+            res = apply_budget_change(obj_id, delta_val)
         status = res.get("status")
         msg = res.get("message") or "Бюджет обновлён."
 
@@ -7166,7 +7105,8 @@ async def on_text_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["await_ai_budget_for"] = payload
             return
 
-        res = set_adset_budget(str(adset_id), float(val))
+        with allow_fb_api_calls(reason="ai_focus_apply_budget"):
+            res = set_adset_budget(str(adset_id), float(val))
         if res.get("status") != "ok":
             msg = res.get("message") or ""
             await update.message.reply_text(f"❌ Не удалось применить действие: {msg}")
@@ -7547,6 +7487,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("billing", cmd_billing))
     app.add_handler(CommandHandler("sync_accounts", cmd_sync))
     app.add_handler(CommandHandler("heatmap", cmd_heatmap))
+    app.add_handler(CommandHandler("heatmap_status", cmd_heatmap_status))
 
     app.add_handler(CallbackQueryHandler(on_cb))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_any))

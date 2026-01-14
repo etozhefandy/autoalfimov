@@ -8,6 +8,7 @@ import random
 import os
 import threading
 import contextlib
+import logging
 
 from facebook_business.api import FacebookAdsApi
 from facebook_business.adobjects.adaccount import AdAccount
@@ -34,6 +35,14 @@ _FB_API_ALLOW_REASON: Optional[str] = None
 
 _FB_API_DENY_DEPTH: int = 0
 _FB_API_DENY_REASON: Optional[str] = None
+
+_FB_API_DEFAULT_DENY: bool = str(os.getenv("FB_API_DEFAULT_DENY", "1") or "1").strip() not in {
+    "0",
+    "false",
+    "False",
+    "no",
+    "NO",
+}
 
 
 @contextlib.contextmanager
@@ -187,6 +196,11 @@ def safe_api_call(fn, *args, **kwargs):
     allow = kwargs.pop("_allow_fb_api", None)
     caller = kwargs.pop("_caller", None)
 
+    effective_caller = str(caller or "")
+    if not effective_caller:
+        # Prefer deny reason (where the protection boundary is defined), then allow reason.
+        effective_caller = str(_FB_API_DENY_REASON or _FB_API_ALLOW_REASON or "")
+
     deny_active = int(_FB_API_DENY_DEPTH or 0) > 0
     allow_active = int(_FB_API_ALLOW_DEPTH or 0) > 0
 
@@ -197,7 +211,10 @@ def safe_api_call(fn, *args, **kwargs):
         effective_allow = False
     else:
         # allow is None: default depends on deny context.
-        effective_allow = False if deny_active else True
+        if deny_active:
+            effective_allow = False
+        else:
+            effective_allow = False if _FB_API_DEFAULT_DENY else True
 
     if (not effective_allow) and (not allow_active):
         info = {
@@ -209,9 +226,9 @@ def safe_api_call(fn, *args, **kwargs):
         _set_last_error_info(info)
         try:
             logging.getLogger(__name__).warning(
-                "[facebook_api] blocked_by_policy endpoint=%s caller=%s reason=%s deny_reason=%s",
+                "🟦 FB BLOCKED BY POLICY endpoint=%s caller=%s allow_reason=%s deny_reason=%s",
                 str(endpoint),
-                str(caller or ""),
+                str(effective_caller or ""),
                 str(_FB_API_ALLOW_REASON or ""),
                 str(_FB_API_DENY_REASON or ""),
             )
@@ -220,6 +237,14 @@ def safe_api_call(fn, *args, **kwargs):
         return None
 
     if is_rate_limited_now():
+        try:
+            logging.getLogger(__name__).warning(
+                "🟦 FB RATE LIMIT endpoint=%s retry_after=%ss",
+                str(endpoint),
+                str(rate_limit_retry_after_seconds()),
+            )
+        except Exception:
+            pass
         _set_last_error_info(
             {
                 "code": 17,
@@ -230,8 +255,32 @@ def safe_api_call(fn, *args, **kwargs):
         )
         return None
     try:
+        try:
+            logging.getLogger(__name__).info(
+                "🟦 FB REQUEST endpoint=%s caller=%s allow_ctx=%s deny_ctx=%s",
+                str(endpoint),
+                str(effective_caller or ""),
+                "TRUE" if allow_active else "FALSE",
+                "TRUE" if deny_active else "FALSE",
+            )
+        except Exception:
+            pass
         _rate_limit_wait()
-        return fn(*args, **kwargs)
+        res = fn(*args, **kwargs)
+        try:
+            n = None
+            try:
+                n = len(res)  # type: ignore[arg-type]
+            except Exception:
+                n = None
+            logging.getLogger(__name__).info(
+                "🟦 FB RESPONSE endpoint=%s ok=TRUE items=%s",
+                str(endpoint),
+                str(n) if n is not None else "?",
+            )
+        except Exception:
+            pass
+        return res
     except FacebookRequestError as e:
         code = None
         subcode = None
@@ -282,7 +331,27 @@ def safe_api_call(fn, *args, **kwargs):
             minutes = random.randint(base_min, max(base_min, base_max)) + jitter_m
             _mark_rate_limited_for(float(minutes) * 60.0)
 
-        print(f"[facebook_api] Error: {e}")
+            try:
+                logging.getLogger(__name__).warning(
+                    "🟦 FB RATE LIMIT endpoint=%s retry_after=%ss fb_code=%s fb_subcode=%s",
+                    str(endpoint),
+                    str(rate_limit_retry_after_seconds()),
+                    str(code),
+                    str(subcode),
+                )
+            except Exception:
+                pass
+
+        try:
+            logging.getLogger(__name__).warning(
+                "🟦 FB ERROR endpoint=%s fb_code=%s fb_subcode=%s message=%s",
+                str(endpoint),
+                str(code),
+                str(subcode),
+                str(_LAST_API_ERROR or ""),
+            )
+        except Exception:
+            pass
         return None
     except Exception as e:
         try:
@@ -294,7 +363,14 @@ def safe_api_call(fn, *args, **kwargs):
         except Exception:
             _LAST_API_ERROR_AT = None
         _set_last_error_info({"kind": "exception", "message": _LAST_API_ERROR})
-        print(f"[facebook_api] Error: {e}")
+        try:
+            logging.getLogger(__name__).warning(
+                "🟦 FB ERROR endpoint=%s message=%s",
+                str(endpoint),
+                str(_LAST_API_ERROR or ""),
+            )
+        except Exception:
+            pass
         return None
 
 
