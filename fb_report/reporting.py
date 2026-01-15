@@ -1,11 +1,10 @@
 # fb_report/reporting.py
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 import re
 from typing import Any
 
-from facebook_business.adobjects.adaccount import AdAccount
 from telegram.ext import ContextTypes
 
 from .constants import (
@@ -28,8 +27,8 @@ from .insights import (
     _blend_totals,
 )
 
-from services.analytics import analyze_campaigns, analyze_adsets, analyze_ads
-from services.analytics import lead_cost_and_count
+from services.heatmap_store import load_snapshot, list_snapshot_hours
+from services.facebook_api import deny_fb_api_calls
 
 
 # ========= Утилиты форматирования =========
@@ -40,35 +39,6 @@ def fmt_int(n) -> str:
         return "0"
 
 
-# ========= КЕШ ОТЧЁТОВ =========
-def _load_report_cache() -> dict:
-    try:
-        with open(REPORT_CACHE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-
-def _save_report_cache(d: dict):
-    # локальный импорт, чтобы не создавать циклы
-    from .storage import _atomic_write_json
-
-    _atomic_write_json(REPORT_CACHE_FILE, d)
-
-
-def period_key(period) -> str:
-    """
-    Единый ключ для любых периодов:
-    - dict с since/until → range:YYYY-MM-DD:YYYY-MM-DD
-    - пресет ("today", "yesterday", "last_7d" etc) → preset:NAME
-    """
-    if isinstance(period, dict):
-        since = period.get("since", "")
-        until = period.get("until", "")
-        return f"range:{since}:{until}"
-    return f"preset:{str(period)}"
-
-
 # ========== ИНСАЙТЫ (сырые данные) ==========
 def fetch_insight(aid: str, period):
     """
@@ -76,9 +46,6 @@ def fetch_insight(aid: str, period):
     - сначала из локального кэша (load_local_insights)
     - если нет — запрашивает у Facebook
     - важно: ВСЕГДА приводим AdsInsights к обычному dict
-
-    ВНИМАНИЕ: тут НЕТ полей link_clicks / link_ctr / results / cost_per_result,
-    чтобы не ловить (#100) от Graph API.
     """
     store = load_local_insights(aid) or {}
     key = period_key(period)
@@ -91,35 +58,102 @@ def fetch_insight(aid: str, period):
         name = get_account_name(aid)
         return name, store[key]
 
-    acc = AdAccount(aid)
-    # минимальный набор полей, с которыми у нас всё работает
-    fields = [
-        "impressions",
-        "cpm",
-        "clicks",
-        "cpc",
-        "spend",
-        "actions",
-        "cost_per_action_type",
-    ]
-
-    params: dict[str, Any] = {"level": "account"}
+    now = datetime.now(ALMATY_TZ)
+    dates: list[str] = []
     if isinstance(period, dict):
-        params["time_range"] = period
+        since = str(period.get("since") or "")
+        until = str(period.get("until") or "")
+        if since and until and since <= until:
+            try:
+                d1 = datetime.strptime(since, "%Y-%m-%d").date()
+                d2 = datetime.strptime(until, "%Y-%m-%d").date()
+                cur = d1
+                while cur <= d2:
+                    dates.append(cur.strftime("%Y-%m-%d"))
+                    cur = cur + timedelta(days=1)
+            except Exception:
+                dates = []
     else:
-        params["date_preset"] = period
+        p = str(period or "")
+        if p == "today":
+            dates = [now.strftime("%Y-%m-%d")]
+        elif p == "yesterday":
+            dates = [(now - timedelta(days=1)).strftime("%Y-%m-%d")]
+        elif p.startswith("last_") and p.endswith("d"):
+            try:
+                n = int(p.replace("last_", "").replace("d", ""))
+            except Exception:
+                n = 0
+            if n > 0:
+                end = (now - timedelta(days=1)).date()
+                start = end - timedelta(days=max(0, n - 1))
+                cur = start
+                while cur <= end:
+                    dates.append(cur.strftime("%Y-%m-%d"))
+                    cur = cur + timedelta(days=1)
 
-    data = acc.get_insights(fields=fields, params=params)
-    name = acc.api_get(fields=["name"]).get("name", get_account_name(aid))
+    spend = 0.0
+    msgs = 0
+    leads = 0
+    total = 0
+    impressions = 0
+    clicks = 0
 
-    if not data:
-        ins_dict = None
-    else:
-        raw = data[0]
-        if hasattr(raw, "export_all_data"):
-            ins_dict = raw.export_all_data()
-        else:
-            ins_dict = dict(raw)
+    with deny_fb_api_calls(reason="reporting_fetch_insight"):
+        for d in dates:
+            for h in list_snapshot_hours(str(aid), date_str=str(d)):
+                snap = load_snapshot(str(aid), date_str=str(d), hour=int(h)) or {}
+                if str(snap.get("status") or "") not in {"ready", "ready_low_confidence"}:
+                    continue
+                for r in (snap.get("rows") or []):
+                    if not isinstance(r, dict):
+                        continue
+                    try:
+                        spend += float(r.get("spend") or 0.0)
+                    except Exception:
+                        pass
+                    try:
+                        msgs += int(r.get("msgs") or 0)
+                    except Exception:
+                        pass
+                    try:
+                        leads += int(r.get("leads") or 0)
+                    except Exception:
+                        pass
+                    try:
+                        t = r.get("total")
+                        if t is None:
+                            t = int(r.get("msgs") or 0) + int(r.get("leads") or 0)
+                        total += int(t or 0)
+                    except Exception:
+                        pass
+                    try:
+                        impressions += int(r.get("impressions") or 0)
+                    except Exception:
+                        pass
+                    try:
+                        clicks += int(r.get("clicks") or 0)
+                    except Exception:
+                        pass
+
+    cpm = (float(spend) / (float(impressions) / 1000.0)) if impressions > 0 and spend > 0 else 0.0
+    cpc = (float(spend) / float(clicks)) if clicks > 0 and spend > 0 else 0.0
+
+    ins_dict = {
+        "impressions": int(impressions),
+        "cpm": float(cpm),
+        "clicks": int(clicks),
+        "cpc": float(cpc),
+        "spend": float(spend),
+        "actions": [
+            {"action_type": "onsite_conversion.messaging_conversation_started_7d", "value": int(msgs)},
+            {"action_type": "lead", "value": int(leads)},
+            {"action_type": "link_click", "value": 0},
+        ],
+        "cost_per_action_type": [],
+    }
+
+    name = get_account_name(aid)
 
     store[key] = ins_dict
     save_local_insights(aid, store)
@@ -208,12 +242,7 @@ def build_report(aid: str, period, label: str = "") -> str:
     if msgs <= 0:
         msg_cpa = None
 
-    leads_count_total, leads_cost_total = lead_cost_and_count(acts, costs, aid=aid)
-    lead_cpa = (
-        (leads_cost_total / float(leads_count_total))
-        if leads_count_total > 0 and leads_cost_total > 0
-        else None
-    )
+    lead_cpa = None
 
     body = []
     body.append(f"👁 Показы: {fmt_int(impressions)}")
@@ -420,7 +449,7 @@ def build_account_report(
     level: str,
     label: str = "",
     top_n: int = 5,
-) -> str:
+):
     lvl = str(level or "ACCOUNT").upper()
     if lvl == "OFF":
         return ""
@@ -460,11 +489,84 @@ def build_account_report(
 
     chunks: list[str] = []
 
-    camps: list[dict] = []
-    try:
-        camps = analyze_campaigns(aid, period=period) or []
-    except Exception:
-        camps = []
+    now = datetime.now(ALMATY_TZ)
+    dates: list[str] = []
+    if isinstance(period, dict):
+        since = str(period.get("since") or "")
+        until = str(period.get("until") or "")
+        if since and until and since <= until:
+            try:
+                d1 = datetime.strptime(since, "%Y-%m-%d").date()
+                d2 = datetime.strptime(until, "%Y-%m-%d").date()
+                cur = d1
+                while cur <= d2:
+                    dates.append(cur.strftime("%Y-%m-%d"))
+                    cur = cur + timedelta(days=1)
+            except Exception:
+                dates = []
+    else:
+        p = str(period or "")
+        if p == "today":
+            dates = [now.strftime("%Y-%m-%d")]
+        elif p == "yesterday":
+            dates = [(now - timedelta(days=1)).strftime("%Y-%m-%d")]
+        elif p.startswith("last_") and p.endswith("d"):
+            try:
+                n = int(p.replace("last_", "").replace("d", ""))
+            except Exception:
+                n = 0
+            if n > 0:
+                end = (now - timedelta(days=1)).date()
+                start = end - timedelta(days=max(0, n - 1))
+                cur = start
+                while cur <= end:
+                    dates.append(cur.strftime("%Y-%m-%d"))
+                    cur = cur + timedelta(days=1)
+
+    all_rows: list[dict] = []
+    with deny_fb_api_calls(reason="reporting_entities"):
+        for d in dates:
+            for h in list_snapshot_hours(str(aid), date_str=str(d)):
+                snap = load_snapshot(str(aid), date_str=str(d), hour=int(h)) or {}
+                if str(snap.get("status") or "") not in {"ready", "ready_low_confidence"}:
+                    continue
+                for r in (snap.get("rows") or []):
+                    if isinstance(r, dict):
+                        all_rows.append(r)
+
+    def _group_rows(key_field: str, name_field: str) -> list[dict]:
+        agg: dict[str, dict] = {}
+        for r in all_rows:
+            k = str((r or {}).get(key_field) or "")
+            if not k:
+                continue
+            nm = str((r or {}).get(name_field) or (r or {}).get("name") or k)
+            a = agg.setdefault(
+                k,
+                {"id": k, "name": nm, "spend": 0.0, "msgs": 0, "leads": 0, "total": 0, "msg_cpa": None, "lead_cpa": None},
+            )
+            try:
+                a["spend"] = float(a.get("spend") or 0.0) + float((r or {}).get("spend") or 0.0)
+            except Exception:
+                pass
+            try:
+                a["msgs"] = int(a.get("msgs") or 0) + int((r or {}).get("msgs") or 0)
+            except Exception:
+                pass
+            try:
+                a["leads"] = int(a.get("leads") or 0) + int((r or {}).get("leads") or 0)
+            except Exception:
+                pass
+            try:
+                t = (r or {}).get("total")
+                if t is None:
+                    t = int((r or {}).get("msgs") or 0) + int((r or {}).get("leads") or 0)
+                a["total"] = int(a.get("total") or 0) + int(t or 0)
+            except Exception:
+                pass
+        return list(agg.values())
+
+    camps = _group_rows("campaign_id", "campaign_name")
 
     # Единственный обязательный фильтр: spend > 0
     camps_spend = [c for c in (camps or []) if float((c or {}).get("spend", 0.0) or 0.0) > 0]
@@ -484,11 +586,8 @@ def build_account_report(
             current_chars += len(sep) + len(acc_blended_after_sections)
 
     if lvl == "ADSET":
-        adsets: list[dict] = []
-        try:
-            adsets = analyze_adsets(aid, period=period) or []
-        except Exception:
-            adsets = []
+        # Snapshot collector stores adset name under row["name"].
+        adsets = _group_rows("adset_id", "name")
 
         # Единственный обязательный фильтр: spend > 0
         adsets_spend = [a for a in (adsets or []) if float((a or {}).get("spend", 0.0) or 0.0) > 0]
@@ -508,11 +607,9 @@ def build_account_report(
                 current_chars += len(sep) + len(acc_blended_after_sections)
 
     if lvl == "AD":
+        # We don't collect ad-level rows in heatmap snapshots.
+        # Keep the signature stable and show an empty/"нет данных" block.
         ads: list[dict] = []
-        try:
-            ads = analyze_ads(aid, period=period) or []
-        except Exception:
-            ads = []
 
         # Единственный обязательный фильтр: spend > 0
         ads_spend = [a for a in (ads or []) if float((a or {}).get("spend", 0.0) or 0.0) > 0]

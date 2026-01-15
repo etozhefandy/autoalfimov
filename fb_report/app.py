@@ -71,8 +71,6 @@ from .creatives import fetch_instagram_active_ads_links, format_instagram_ads_li
 from .adsets import send_adset_report
 from .billing import send_billing, send_billing_forecast, billing_digest_job
 from .jobs import (
-    full_daily_scan_job,
-    daily_report_job,
     schedule_cpa_alerts,
     _resolve_account_cpa,
     build_heatmap_status_text,
@@ -80,13 +78,8 @@ from .jobs import (
 )
 from .autopilot_format import ap_action_text
 
-from services.analytics import analyze_campaigns, analyze_adsets, analyze_account, analyze_ads
 from services.facebook_api import (
     pause_ad,
-    fetch_adsets,
-    fetch_ads,
-    fetch_insights,
-    fetch_campaigns,
     get_last_api_error_info,
     is_rate_limited_now,
     rate_limit_retry_after_seconds,
@@ -96,7 +89,13 @@ from services.facebook_api import (
 )
 from services.ai_focus import get_focus_comment, ask_deepseek, sanitize_ai_text
 from fb_report.cpa_monitoring import build_anomaly_messages_for_account
-from services.heatmap_store import get_heatmap_dataset, prev_full_hour_window, sum_ready_spend_for_date
+from services.heatmap_store import (
+    get_heatmap_dataset,
+    prev_full_hour_window,
+    sum_ready_spend_for_date,
+    load_snapshot,
+    list_snapshot_hours,
+)
 import json
 import asyncio
 import time as pytime
@@ -1485,36 +1484,34 @@ def _autopilot_group_campaigns_kb_active_only(
 ) -> tuple[InlineKeyboardMarkup, set[str]]:
     grp = _autopilot_group_get(aid, gid)
     selected = set(str(x) for x in (grp.get("campaign_ids") or []) if x)
-    try:
-        fb_campaigns = fetch_campaigns(aid) or []
-    except Exception:
-        fb_campaigns = []
 
-    active = []
-    active_ids: set[str] = set()
-    for c in fb_campaigns:
+    opts = _campaign_options_from_snapshots(aid)
+    active_ids = set(str((c or {}).get("id") or "") for c in (opts or []) if (c or {}).get("id"))
+
+    rows = []
+    for c in (opts or []):
         cid = str((c or {}).get("id") or "")
         if not cid:
             continue
-        st = str((c or {}).get("effective_status") or (c or {}).get("status") or "").upper()
-        if st != "ACTIVE":
-            continue
-        active_ids.add(cid)
-        active.append((cid, (c or {}).get("name") or cid))
-
-    rows = []
-    for cid, name in active:
+        name = (c or {}).get("name") or cid
         prefix = "✅ " if cid in selected else ""
-        try:
-            tok = _campaign_id_to_token(cid)
-        except Exception:
-            continue
+        tok = _campaign_id_to_token(cid)
         rows.append(
-            [InlineKeyboardButton(prefix + str(name), callback_data=f"ap_group_camp_toggle|{aid}|{gid}|{tok}")]
+            [
+                InlineKeyboardButton(
+                    prefix + str(name),
+                    callback_data=f"ap_group_camp_toggle|{aid}|{gid}|{tok}",
+                )
+            ]
         )
 
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"ap_group_open|{aid}|{gid}")])
     return InlineKeyboardMarkup(rows), active_ids
+
+
+def _autopilot_group_campaigns_kb(aid: str, gid: str) -> InlineKeyboardMarkup:
+    kb, _active_ids = _autopilot_group_campaigns_kb_active_only(aid, gid)
+    return kb
 
 
 def _autopilot_human_mode(mode: str) -> str:
@@ -1708,12 +1705,35 @@ def _autopilot_period_kb(aid: str) -> InlineKeyboardMarkup:
 def _discover_actions_for_account(aid: str) -> list[dict]:
     now = datetime.now(ALMATY_TZ)
     yday = (now - timedelta(days=1)).date()
-    period = {
-        "since": yday.strftime("%Y-%m-%d"),
-        "until": yday.strftime("%Y-%m-%d"),
-    }
-    ins = fetch_insights(aid, period) or {}
-    actions = (ins or {}).get("actions") or []
+    date_str = yday.strftime("%Y-%m-%d")
+
+    # Snapshots-only: derive action_types from hourly heatmap snapshots.
+    actions_map: dict[str, float] = {}
+    with deny_fb_api_calls(reason="lead_metric_discover_actions"):
+        for h in list_snapshot_hours(str(aid), date_str=str(date_str)):
+            snap = load_snapshot(str(aid), date_str=str(date_str), hour=int(h)) or {}
+            if str(snap.get("status") or "") not in {"ready", "ready_low_confidence"}:
+                continue
+            for r in (snap.get("rows") or []):
+                if not isinstance(r, dict):
+                    continue
+                # We only know msgs/leads from snapshots; map to pseudo action_types.
+                try:
+                    v = float(r.get("msgs") or 0)
+                    if v > 0:
+                        actions_map["onsite_conversion.messaging_conversation_started_7d"] = (
+                            actions_map.get("onsite_conversion.messaging_conversation_started_7d", 0.0) + v
+                        )
+                except Exception:
+                    pass
+                try:
+                    v = float(r.get("leads") or 0)
+                    if v > 0:
+                        actions_map["lead"] = actions_map.get("lead", 0.0) + v
+                except Exception:
+                    pass
+
+    actions = [{"action_type": k, "value": v} for k, v in actions_map.items()]
 
     out: list[dict] = []
     seen = set()
@@ -1813,21 +1833,8 @@ def _discover_lead_metrics_for_account(aid: str) -> list[dict]:
             continue
 
         if at.startswith("offsite_conversion.custom"):
-            suffix = at.split(".")[-1]
-            if not suffix.isdigit():
-                continue
-            try:
-                from facebook_business.adobjects.customconversion import CustomConversion
-
-                name = CustomConversion(suffix).api_get(fields=["name"]).get("name")
-            except Exception:
-                name = None
-
-            if not _is_site_lead_custom_conversion_name(name or ""):
-                continue
-
-            label = f"Заявка с сайта — {name}" if name else "Заявка с сайта"
-            out.append({"action_type": at, "label": label})
+            # Legacy: required FB API lookup for CustomConversion name.
+            # Snapshots-only policy: skip these options.
             continue
 
         if at not in whitelist_exact_mixed and at_lower not in whitelist_exact_lower:
@@ -1837,6 +1844,61 @@ def _discover_lead_metrics_for_account(aid: str) -> list[dict]:
 
     out.sort(key=lambda x: (x.get("label") or x.get("action_type") or ""))
     return out
+
+
+def _snapshot_rows_last_7d(aid: str) -> list[dict]:
+    now = datetime.now(ALMATY_TZ)
+    end = (now - timedelta(days=1)).date()
+    start = end - timedelta(days=6)
+    all_rows: list[dict] = []
+    with deny_fb_api_calls(reason="snapshot_rows_last_7d"):
+        cur = start
+        while cur <= end:
+            d = cur.strftime("%Y-%m-%d")
+            for h in list_snapshot_hours(str(aid), date_str=str(d)):
+                snap = load_snapshot(str(aid), date_str=str(d), hour=int(h)) or {}
+                if str(snap.get("status") or "") not in {"ready", "ready_low_confidence"}:
+                    continue
+                for r in (snap.get("rows") or []):
+                    if isinstance(r, dict):
+                        all_rows.append(r)
+            cur = cur + timedelta(days=1)
+    return all_rows
+
+
+def _campaign_options_from_snapshots(aid: str) -> list[dict]:
+    all_rows = _snapshot_rows_last_7d(aid)
+    seen: dict[str, str] = {}
+    for r in all_rows:
+        cid = str((r or {}).get("campaign_id") or "")
+        if not cid:
+            continue
+        nm = str((r or {}).get("campaign_name") or cid)
+        if cid not in seen:
+            seen[cid] = nm
+    out = [{"id": cid, "name": nm} for cid, nm in seen.items()]
+    out.sort(key=lambda x: str((x or {}).get("name") or ""))
+    return out
+
+
+def _campaign_name_from_snapshots(aid: str, campaign_id: str) -> str:
+    cid = str(campaign_id or "")
+    if not cid:
+        return ""
+    for r in _snapshot_rows_last_7d(aid):
+        if str((r or {}).get("campaign_id") or "") == cid:
+            return str((r or {}).get("campaign_name") or cid)
+    return cid
+
+
+def _adset_name_from_snapshots(aid: str, adset_id: str) -> str:
+    sid = str(adset_id or "")
+    if not sid:
+        return ""
+    for r in _snapshot_rows_last_7d(aid):
+        if str((r or {}).get("adset_id") or "") == sid:
+            return str((r or {}).get("name") or sid)
+    return sid
 
 
 def heatmap_monitoring_accounts_kb() -> InlineKeyboardMarkup:
@@ -1897,33 +1959,15 @@ def _ai_ad_pause_kb(aid: str, ad_id: str, adset_id: str, spent: float | None = N
 
 
 def _get_adset_budget_map(aid: str) -> dict:
-    out = {}
-    for row in fetch_adsets(aid) or []:
-        adset_id = row.get("id")
-        if not adset_id:
-            continue
-        out[str(adset_id)] = row
-    return out
+    return {}
 
 
 def _get_ads_map(aid: str) -> dict:
-    out = {}
-    for row in fetch_ads(aid) or []:
-        ad_id = row.get("id")
-        if not ad_id:
-            continue
-        out[str(ad_id)] = row
-    return out
+    return {}
 
 
 def _count_active_ads_in_adset(aid: str, adset_id: str) -> int:
-    cnt = 0
-    for row in fetch_ads(aid) or []:
-        if str(row.get("adset_id") or "") != str(adset_id):
-            continue
-        if str(row.get("status") or "").upper() == "ACTIVE":
-            cnt += 1
-    return int(cnt)
+    return 0
 
 
 async def _send_comparison_for_all(
@@ -2529,23 +2573,44 @@ def cpa_campaigns_kb(aid: str) -> InlineKeyboardMarkup:
     alerts = row.get("alerts", {}) or {}
     campaign_alerts = alerts.get("campaign_alerts", {}) or {}
 
-    try:
-        fb_campaigns = fetch_campaigns(aid) or []
-    except Exception:
-        fb_campaigns = []
+    def _campaign_rows_from_snapshots() -> list[dict]:
+        all_rows = _snapshot_rows_last_7d(aid)
 
-    allowed_campaign_ids = {
-        str(r.get("id"))
-        for r in fb_campaigns
-        if str((r or {}).get("effective_status") or (r or {}).get("status") or "").upper()
-        in {"ACTIVE", "SCHEDULED"}
-        and r.get("id")
-    }
+        agg: dict[str, dict] = {}
+        for r in all_rows:
+            cid = str((r or {}).get("campaign_id") or "")
+            if not cid:
+                continue
+            it = agg.setdefault(
+                cid,
+                {"campaign_id": cid, "name": (r or {}).get("campaign_name") or cid, "spend": 0.0, "msgs": 0, "leads": 0, "total": 0},
+            )
+            try:
+                it["spend"] = float(it.get("spend") or 0.0) + float((r or {}).get("spend") or 0.0)
+            except Exception:
+                pass
+            try:
+                it["msgs"] = int(it.get("msgs") or 0) + int((r or {}).get("msgs") or 0)
+            except Exception:
+                pass
+            try:
+                it["leads"] = int(it.get("leads") or 0) + int((r or {}).get("leads") or 0)
+            except Exception:
+                pass
+            try:
+                t = (r or {}).get("total")
+                if t is None:
+                    t = int((r or {}).get("msgs") or 0) + int((r or {}).get("leads") or 0)
+                it["total"] = int(it.get("total") or 0) + int(t or 0)
+            except Exception:
+                pass
 
-    try:
-        camps = analyze_campaigns(aid, days=7) or []
-    except Exception:
-        camps = []
+        out = list(agg.values())
+        out.sort(key=lambda x: float((x or {}).get("spend") or 0.0), reverse=True)
+        return out
+
+    camps = _campaign_rows_from_snapshots()
+    allowed_campaign_ids = {str((c or {}).get("campaign_id") or "") for c in camps if (c or {}).get("campaign_id")}
 
     kb_rows = []
     for camp in camps:
@@ -2592,22 +2657,19 @@ def cpa_adsets_kb(aid: str) -> InlineKeyboardMarkup:
     alerts = row.get("alerts", {}) or {}
     adset_alerts = alerts.get("adset_alerts", {}) or {}
 
-    from .adsets import list_adsets_for_account
+    def _adsets_from_snapshots() -> list[dict]:
+        seen: dict[str, str] = {}
+        for r in _snapshot_rows_last_7d(aid):
+            adset_id = str((r or {}).get("adset_id") or "")
+            if not adset_id:
+                continue
+            nm = (r or {}).get("name") or adset_id
+            if adset_id not in seen:
+                seen[adset_id] = str(nm)
+        return [{"id": i, "name": n} for i, n in seen.items()]
 
-    adsets = list_adsets_for_account(aid)
-
-    try:
-        fb_adsets = fetch_adsets(aid) or []
-    except Exception:
-        fb_adsets = []
-
-    active_adset_ids = {
-        str(r.get("id"))
-        for r in fb_adsets
-        if str((r or {}).get("effective_status") or (r or {}).get("status") or "").upper()
-        in {"ACTIVE", "SCHEDULED"}
-        and r.get("id")
-    }
+    adsets = _adsets_from_snapshots()
+    active_adset_ids = {str((r or {}).get("id") or "") for r in adsets if (r or {}).get("id")}
 
     kb_rows = []
     for it in adsets:
@@ -2652,35 +2714,11 @@ def cpa_ads_kb(aid: str) -> InlineKeyboardMarkup:
     alerts = row.get("alerts", {}) or {}
     ad_alerts = alerts.get("ad_alerts", {}) or {}
 
-    try:
-        ads = analyze_ads(aid, days=7) or []
-    except Exception:
-        ads = []
-
-    try:
-        fb_ads = fetch_ads(aid) or []
-    except Exception:
-        fb_ads = []
-
+    # No ad-level rows in snapshots. Keep UI stable: show an empty list.
+    ads: list[dict] = []
+    active_adset_ids: set[str] = set()
     ad_status: dict[str, str] = {}
     ad_to_adset: dict[str, str] = {}
-    for r in fb_ads:
-        ad_id_raw = str(r.get("id") or "")
-        if not ad_id_raw:
-            continue
-        ad_status[ad_id_raw] = r.get("status") or ""
-        ad_to_adset[ad_id_raw] = str(r.get("adset_id") or "")
-
-    try:
-        fb_adsets = fetch_adsets(aid) or []
-    except Exception:
-        fb_adsets = []
-
-    active_adset_ids = {
-        str(r.get("id"))
-        for r in fb_adsets
-        if (r or {}).get("status") == "ACTIVE" and r.get("id")
-    }
 
     kb_rows = []
     for ad in ads:
@@ -3389,19 +3427,13 @@ async def _on_cb_internal(
         if str(cid) in cur:
             cur.remove(str(cid))
         else:
-            try:
-                fb_campaigns = fetch_campaigns(aid) or []
-            except Exception:
-                fb_campaigns = []
-            is_active = False
-            for c in fb_campaigns:
-                if str((c or {}).get("id") or "") == str(cid):
-                    st = str((c or {}).get("effective_status") or (c or {}).get("status") or "").upper()
-                    if st == "ACTIVE":
-                        is_active = True
-                    break
-            if not is_active:
-                await q.answer("Можно выбрать только активные кампании.", show_alert=True)
+            _kb_tmp, active_ids = _autopilot_group_campaigns_kb_active_only(aid, gid)
+            if str(cid) not in set(str(x) for x in (active_ids or set()) if x):
+                await q.answer(
+                    "Кампания недоступна в слепках за 7 дней. "
+                    "Собери слепок и открой список ещё раз.",
+                    show_alert=True,
+                )
                 return
             cur.add(str(cid))
         grp["campaign_ids"] = sorted(cur)
@@ -6079,27 +6111,12 @@ async def _on_cb_internal(
         alerts = row.get("alerts", {}) or {}
         campaign_alerts = alerts.get("campaign_alerts", {}) or {}
 
-        try:
-            fb_campaigns = fetch_campaigns(aid) or []
-        except Exception:
-            fb_campaigns = []
-
-        allowed_campaign_ids = {
-            str(r.get("id"))
-            for r in fb_campaigns
-            if str((r or {}).get("effective_status") or (r or {}).get("status") or "").upper()
-            in {"ACTIVE", "SCHEDULED"}
-            and r.get("id")
-        }
-
         kb_rows = []
-        for camp in fb_campaigns:
-            cid = camp.get("id")
+        for camp in _campaign_options_from_snapshots(aid):
+            cid = (camp or {}).get("id")
             if not cid:
                 continue
-            if str(cid) not in allowed_campaign_ids:
-                continue
-            name = camp.get("name") or cid
+            name = (camp or {}).get("name") or cid
             cfg_c = (campaign_alerts.get(cid) or {}) if cid in campaign_alerts else {}
             target = float(cfg_c.get("target_cpa") or 0.0)
             label_suffix = (
@@ -6144,16 +6161,7 @@ async def _on_cb_internal(
         campaign_alerts = alerts.setdefault("campaign_alerts", {})
         cfg = campaign_alerts.get(campaign_id) or {}
 
-        try:
-            camps = analyze_campaigns(aid, days=7) or []
-        except Exception:
-            camps = []
-
-        camp_name = campaign_id
-        for camp in camps:
-            if camp.get("campaign_id") == campaign_id:
-                camp_name = camp.get("name") or campaign_id
-                break
+        camp_name = _campaign_name_from_snapshots(aid, campaign_id) or campaign_id
 
         account_cpa = _resolve_account_cpa(alerts)
         target_cpa = float(cfg.get("target_cpa") or 0.0)
@@ -6343,70 +6351,8 @@ async def _on_cb_internal(
     if data.startswith("cpa_adsets|"):
         aid = data.split("|", 1)[1]
 
-        st = load_accounts()
-        row = st.get(aid, {"alerts": {}})
-        alerts = row.get("alerts", {}) or {}
-        adset_alerts = alerts.get("adset_alerts", {}) or {}
-
-        # Для списка адсетов переиспользуем send_adset_report-источник:
-        # модуль adsets уже работает с актуальными данными, здесь берём
-        # только имена/ID через вспомогательную функцию.
-        from .adsets import list_adsets_for_account
-
-        adsets = list_adsets_for_account(aid)
-
-        # Берём статусы адсетов из Facebook API, чтобы понимать активность.
-        try:
-            fb_adsets = fetch_adsets(aid) or []
-        except Exception:
-            fb_adsets = []
-
-        allowed_adset_ids = {
-            str(row.get("id"))
-            for row in fb_adsets
-            if str((row or {}).get("effective_status") or (row or {}).get("status") or "").upper()
-            in {"ACTIVE", "SCHEDULED"}
-            and row.get("id")
-        }
-
-        kb_rows = []
-        for it in adsets:
-            adset_id = it.get("id")
-            name = it.get("name", adset_id)
-            if adset_id not in allowed_adset_ids:
-                continue
-            cfg = (adset_alerts.get(adset_id) or {}) if adset_id else {}
-
-            target = float(cfg.get("target_cpa") or 0.0)
-            label_suffix = (
-                f"[CPA {target:.2f}$]" if target > 0 else "[CPA аккаунта]"
-            )
-            enabled_a = bool(cfg.get("enabled", False))
-            indicator = "⚠️ " if enabled_a else ""
-            text_btn = f"{indicator}{name} {label_suffix}".strip()
-
-            kb_rows.append(
-                [
-                    InlineKeyboardButton(
-                        text_btn, callback_data=f"cpa_adset|{aid}|{adset_id}"
-                    )
-                ]
-            )
-
-        kb_rows.append(
-            [
-                InlineKeyboardButton(
-                    "⬅️ Назад", callback_data=f"cpa_settings|{aid}"
-                )
-            ]
-        )
-
         text = "Выбери адсет для настройки CPA-алёртов."
-        await safe_edit_message(
-            q,
-            text,
-            reply_markup=InlineKeyboardMarkup(kb_rows),
-        )
+        await safe_edit_message(q, text, reply_markup=cpa_adsets_kb(aid))
         return
 
     if data.startswith("cpa_adset|"):
@@ -6418,9 +6364,7 @@ async def _on_cb_internal(
         adset_alerts = alerts.setdefault("adset_alerts", {})
         cfg = adset_alerts.get(adset_id) or {}
 
-        from .adsets import get_adset_name
-
-        adset_name = get_adset_name(aid, adset_id)
+        adset_name = _adset_name_from_snapshots(aid, adset_id) or adset_id
 
         account_cpa = float(
             alerts.get("account_cpa", alerts.get("target_cpl", 0.0)) or 0.0
@@ -6509,40 +6453,11 @@ async def _on_cb_internal(
         alerts = row.get("alerts", {}) or {}
         ad_alerts = alerts.get("ad_alerts", {}) or {}
 
-        # Метрики по объявлениям для CPA и названий
-        try:
-            ads = analyze_ads(aid, days=7) or []
-        except Exception:
-            ads = []
-
-        # Метаданные объявлений и адсетов для статуса активности
-        try:
-            fb_ads = fetch_ads(aid) or []
-        except Exception:
-            fb_ads = []
-
+        # No ad-level rows in snapshots.
+        ads: list[dict] = []
         ad_status: dict[str, str] = {}
         ad_to_adset: dict[str, str] = {}
-        for row in fb_ads:
-            ad_id_raw = str(row.get("id") or "")
-            if not ad_id_raw:
-                continue
-            ad_status[ad_id_raw] = row.get("effective_status") or row.get("status") or ""
-            ad_to_adset[ad_id_raw] = str(row.get("adset_id") or "")
-
-        # Статусы адсетов
-        try:
-            fb_adsets = fetch_adsets(aid) or []
-        except Exception:
-            fb_adsets = []
-
-        allowed_adset_ids = {
-            str(row.get("id"))
-            for row in fb_adsets
-            if str((row or {}).get("effective_status") or (row or {}).get("status") or "").upper()
-            in {"ACTIVE", "SCHEDULED"}
-            and row.get("id")
-        }
+        allowed_adset_ids: set[str] = set()
 
         kb_rows = []
         for ad in ads:
@@ -6607,16 +6522,7 @@ async def _on_cb_internal(
         ad_alerts = alerts.setdefault("ad_alerts", {})
         cfg = ad_alerts.get(ad_id) or {}
 
-        try:
-            ads = analyze_ads(aid, days=7) or []
-        except Exception:
-            ads = []
-
         ad_name = ad_id
-        for ad in ads:
-            if (ad.get("ad_id") or ad.get("id")) == ad_id:
-                ad_name = ad.get("name") or ad_id
-                break
 
         enabled = bool(cfg.get("enabled", True))
         target_cpa = float(cfg.get("target_cpa") or 0.0)
@@ -7491,11 +7397,6 @@ def build_app() -> Application:
 
     app.add_handler(CallbackQueryHandler(on_cb))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_any))
-
-    app.job_queue.run_daily(
-        daily_report_job,
-        time=time(hour=9, minute=30, tzinfo=ALMATY_TZ),
-    )
 
     app.job_queue.run_daily(
         billing_digest_job,

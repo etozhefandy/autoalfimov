@@ -1,19 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from fb_report.constants import ALMATY_TZ
-from fb_report.insights import extract_actions, extract_costs
 from fb_report.storage import get_account_name
-from services.analytics import analyze_adsets
-from services.analytics import fetch_insights_by_level
-from services.analytics import lead_cost_and_count
-from services.facebook_api import fetch_insights
-
-
-MSG_ACTION = "onsite_conversion.messaging_conversation_started_7d"
+from services.facebook_api import deny_fb_api_calls
+from services.heatmap_store import find_latest_ready_snapshots, get_heatmap_dataset, prev_full_hour_window
 
 
 def _build_day_period(day: datetime) -> Dict[str, str]:
@@ -29,39 +22,97 @@ def _iter_last_days(days: int) -> List[Dict[str, str]]:
 
 
 def compute_effective_cpa(insight: Dict[str, Any], *, aid: str) -> Tuple[Optional[float], int]:
-    """CPA по cost_per_action_type для (переписки + лиды).
-
-    Возвращает (cpa, total_actions). Если total_actions=0 или нет cost-данных → (None, total_actions).
-    """
-
     if not insight:
         return None, 0
 
-    acts = extract_actions(insight)
-    costs = extract_costs(insight)
+    try:
+        spend = float((insight or {}).get("spend") or 0.0)
+    except Exception:
+        spend = 0.0
 
-    total_actions = 0
-    total_cost = 0.0
-
-    msg_cnt = int(acts.get(MSG_ACTION, 0) or 0)
-    if msg_cnt > 0:
-        total_actions += msg_cnt
-        msg_cpa = costs.get(MSG_ACTION)
-        if msg_cpa is not None and float(msg_cpa) > 0:
-            total_cost += float(msg_cpa) * float(msg_cnt)
-
-    lead_cnt, lead_cost = lead_cost_and_count(acts, costs, aid=aid)
-    if lead_cnt > 0:
-        total_actions += int(lead_cnt)
-        total_cost += float(lead_cost)
+    try:
+        total = (insight or {}).get("total")
+        if total is None:
+            total = int((insight or {}).get("msgs") or 0) + int((insight or {}).get("leads") or 0)
+        total_actions = int(total or 0)
+    except Exception:
+        total_actions = 0
 
     if total_actions <= 0:
         return None, 0
-
-    if total_cost <= 0:
+    if spend <= 0:
         return None, total_actions
+    return float(spend) / float(total_actions), total_actions
 
-    return total_cost / float(total_actions), total_actions
+
+def _sum_row_metrics(rows: List[Dict[str, Any]]) -> Tuple[float, int, int, int]:
+    spend = 0.0
+    msgs = 0
+    leads = 0
+    total = 0
+    for r in rows or []:
+        if not isinstance(r, dict):
+            continue
+        try:
+            spend += float(r.get("spend") or 0.0)
+        except Exception:
+            pass
+        try:
+            msgs += int(r.get("msgs") or 0)
+        except Exception:
+            pass
+        try:
+            leads += int(r.get("leads") or 0)
+        except Exception:
+            pass
+        try:
+            t = r.get("total")
+            if t is None:
+                t = int(r.get("msgs") or 0) + int(r.get("leads") or 0)
+            total += int(t or 0)
+        except Exception:
+            pass
+    return float(spend), int(msgs), int(leads), int(total)
+
+
+def _filter_rows_for_scope(
+    rows: List[Dict[str, Any]],
+    *,
+    lvl: str,
+    entity_id: Optional[str],
+) -> List[Dict[str, Any]]:
+    if lvl == "account":
+        return list(rows or [])
+    if not entity_id:
+        return []
+    eid = str(entity_id)
+    if lvl == "campaign":
+        return [r for r in (rows or []) if str((r or {}).get("campaign_id") or "") == eid]
+    if lvl == "adset":
+        return [r for r in (rows or []) if str((r or {}).get("adset_id") or "") == eid]
+    return []
+
+
+def _aggregate_day_from_snapshots(
+    snaps: List[Dict[str, Any]],
+    *,
+    lvl: str,
+    entity_id: Optional[str],
+) -> Dict[str, Any]:
+    day_rows: List[Dict[str, Any]] = []
+    for snap in snaps or []:
+        rows = (snap or {}).get("rows") or []
+        if not isinstance(rows, list):
+            continue
+        day_rows.extend(_filter_rows_for_scope(rows, lvl=lvl, entity_id=entity_id))
+
+    spend, msgs, leads, total = _sum_row_metrics(day_rows)
+    return {
+        "spend": spend,
+        "msgs": msgs,
+        "leads": leads,
+        "total": total,
+    }
 
 
 def _delta_pct(first: Optional[float], last: Optional[float]) -> Optional[int]:
@@ -106,29 +157,41 @@ def build_monitor_snapshot(
     lvl = str(level or "account").lower()
     periods = list(reversed(_iter_last_days(history_days)))
 
+    now = datetime.now(ALMATY_TZ)
+    max_hours = max(1, int(history_days) * 24 + 48)
+    with deny_fb_api_calls(reason="anomalies_snapshot_series"):
+        snaps = find_latest_ready_snapshots(str(aid), max_hours=max_hours, now=now)
+
+    snaps_by_date: Dict[str, List[Dict[str, Any]]] = {}
+    for s in snaps or []:
+        d = str((s or {}).get("date") or "")
+        if not d:
+            continue
+        snaps_by_date.setdefault(d, []).append(s)
+
+    for d, items in snaps_by_date.items():
+        try:
+            items.sort(key=lambda x: int((x or {}).get("hour") or 0))
+        except Exception:
+            pass
+
     series: List[Optional[float]] = []
     totals: List[int] = []
     spend_series: List[float] = []
     freq_series: List[Optional[float]] = []
 
     for p in periods:
-        ins: Dict[str, Any] | None
-        if lvl == "account":
-            ins = fetch_insights(aid, p)
-        else:
-            if not entity_id:
-                ins = None
-            else:
-                ins = fetch_insights_by_level(aid, str(entity_id), p, level=lvl)
-
-        cpa, total_actions = compute_effective_cpa(ins or {}, aid=aid)
+        date_str = str((p or {}).get("since") or "")
+        daily = _aggregate_day_from_snapshots(
+            snaps_by_date.get(date_str, []),
+            lvl=lvl,
+            entity_id=str(entity_id) if entity_id is not None else None,
+        )
+        cpa, total_actions = compute_effective_cpa(daily or {}, aid=aid)
         series.append(cpa)
         totals.append(int(total_actions or 0))
-        spend_series.append(float((ins or {}).get("spend", 0.0) or 0.0))
-        try:
-            freq_series.append(float((ins or {}).get("frequency", 0.0) or 0.0))
-        except Exception:
-            freq_series.append(None)
+        spend_series.append(float((daily or {}).get("spend", 0.0) or 0.0))
+        freq_series.append(None)
 
     first = next((v for v in series if v is not None), None)
     last = next((v for v in reversed(series) if v is not None), None)
@@ -252,22 +315,41 @@ def build_anomaly_messages_for_account(aid: str) -> List[str]:
     monitor_anomalies.py должен быть только wrapper.
     """
 
-    try:
-        now = datetime.now(ALMATY_TZ)
-        period_dict = {
-            "since": now.strftime("%Y-%m-%d"),
-            "until": now.strftime("%Y-%m-%d"),
-        }
-        rows = analyze_adsets(aid, period=period_dict) or []
-    except Exception:
-        rows = []
+    win = prev_full_hour_window(now=datetime.now(ALMATY_TZ))
+    date_str = str(win.get("date") or "")
+    hour_int = int(win.get("hour") or 0)
+    with deny_fb_api_calls(reason="anomalies_list_adsets"):
+        ds, st, reason, meta = get_heatmap_dataset(str(aid), date_str=date_str, hours=[hour_int])
+    rows = list((ds or {}).get("rows") or []) if (st == "ready" and ds) else []
+
+    if st != "ready" or not rows:
+        window_label = f"{(win.get('window') or {}).get('start','')}–{(win.get('window') or {}).get('end','')}"
+        attempts = (meta or {}).get("attempts")
+        last_try_at = (meta or {}).get("last_try_at")
+        next_try_at = (meta or {}).get("next_try_at")
+
+        txt = (
+            "⚠️ Анализ аномалий (CPA)\n"
+            f"Аккаунт: {get_account_name(aid)}\n"
+            "Источник данных: heatmap cache\n"
+            f"Окно: {date_str} {window_label}\n"
+            f"Слепок: {st} ({reason})\n"
+        )
+        if attempts is not None:
+            txt += f"Попытки: {attempts}\n"
+        if last_try_at:
+            txt += f"Последняя попытка: {last_try_at}\n"
+        if next_try_at:
+            txt += f"Следующая попытка: {next_try_at}\n"
+        txt += "\nЕсли слепка нет или он собирается — нажми '📌 Собрать слепок предыдущего часа' и повтори."
+        return [txt]
 
     items: List[Tuple[str, str]] = []
     for r in rows:
         adset_id = str(r.get("adset_id") or r.get("id") or "")
         if not adset_id:
             continue
-        name = str(r.get("name") or adset_id)
+        name = str(r.get("adset_name") or r.get("name") or adset_id)
         items.append((adset_id, name))
 
     messages: List[str] = []

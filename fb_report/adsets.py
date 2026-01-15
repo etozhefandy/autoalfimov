@@ -1,7 +1,6 @@
 # fb_report/adsets.py
 from datetime import datetime, timedelta
 
-from facebook_business.adobjects.adaccount import AdAccount
 from telegram import InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ContextTypes
 
@@ -17,93 +16,11 @@ def fetch_adset_insights_7d(aid: str):
     - campaigns: список кампаний с метриками и вложенными адсетами
     - since, until: даты периода
     """
-    acc = AdAccount(aid)
-
     until = (datetime.now(ALMATY_TZ) - timedelta(days=1)).date()
     since = until - timedelta(days=6)
 
-    params = {
-        "level": "adset",
-        "time_range": {
-            "since": since.strftime("%Y-%m-%d"),
-            "until": until.strftime("%Y-%m-%d"),
-        },
-    }
-    fields = [
-        "campaign_id",
-        "campaign_name",
-        "adset_id",
-        "adset_name",
-        "impressions",
-        "clicks",
-        "spend",
-        "actions",
-    ]
-
-    try:
-        data = acc.get_insights(fields=fields, params=params)
-    except Exception as e:
-        print(f"[adset_report] error for {aid}: {e}")
-        return [], since, until
-
-    campaigns: dict[str, dict] = {}
-
-    for row in data:
-        cid = row.get("campaign_id") or "unknown"
-        cname = row.get("campaign_name") or "(без названия)"
-        adset_id = row.get("adset_id")
-        adset_name = row.get("adset_name") or adset_id or "(adset)"
-
-        spend, msgs, leads, total, blended = _blend_totals(row, aid=aid)
-        impr = int(row.get("impressions", 0) or 0)
-        clicks = int(row.get("clicks", 0) or 0)
-
-        camp = campaigns.setdefault(
-            cid,
-            {
-                "id": cid,
-                "name": cname,
-                "spend": 0.0,
-                "impr": 0,
-                "clicks": 0,
-                "msgs": 0,
-                "leads": 0,
-                "total": 0,
-                "cpa": None,
-                "adsets": [],
-            },
-        )
-
-        camp["spend"] += spend
-        camp["impr"] += impr
-        camp["clicks"] += clicks
-        camp["msgs"] += msgs
-        camp["leads"] += leads
-        camp["total"] += total
-
-        camp["adsets"].append(
-            {
-                "id": adset_id,
-                "name": adset_name,
-                "spend": spend,
-                "impr": impr,
-                "clicks": clicks,
-                "msgs": msgs,
-                "leads": leads,
-                "total": total,
-                "cpa": blended,
-                "campaign_id": cid,
-                "campaign_name": cname,
-            }
-        )
-
-    for camp in campaigns.values():
-        if camp["total"] > 0:
-            camp["cpa"] = camp["spend"] / camp["total"]
-        else:
-            camp["cpa"] = None
-
-    return list(campaigns.values()), since, until
+    # Legacy FB-read path removed (collector-only policy).
+    return [], since, until
 
 
 def list_adsets_for_account(aid: str) -> list[dict]:
@@ -113,17 +30,7 @@ def list_adsets_for_account(aid: str) -> list[dict]:
     Берём последние 7 дней и собираем уникальные пары (id, name).
     """
 
-    campaigns, _since, _until = fetch_adset_insights_7d(aid)
-    seen: dict[str, str] = {}
-    for camp in campaigns:
-        for ad in camp.get("adsets", []) or []:
-            adset_id = ad.get("id")
-            if not adset_id:
-                continue
-            name = ad.get("name") or adset_id
-            if adset_id not in seen:
-                seen[adset_id] = name
-    return [{"id": i, "name": n} for i, n in seen.items()]
+    return []
 
 
 def get_adset_name(aid: str, adset_id: str) -> str:
@@ -132,23 +39,16 @@ def get_adset_name(aid: str, adset_id: str) -> str:
     Используется в экране настроек CPA-алёртов для конкретного адсета.
     """
 
-    if not adset_id:
-        return "(adset)"
-    for it in list_adsets_for_account(aid):
-        if it.get("id") == adset_id:
-            return it.get("name", adset_id)
-    return adset_id
+    return adset_id or "(adset)"
 
 
 async def send_adset_report(ctx: ContextTypes.DEFAULT_TYPE, chat_id: str, aid: str):
-    campaigns, since, until = fetch_adset_insights_7d(aid)
-    if not campaigns:
-        await ctx.bot.send_message(
-            chat_id,
-            f"По {get_account_name(aid)} нет данных по адсетам за последние 7 дней.",
-            parse_mode="HTML",
-        )
-        return
+    await ctx.bot.send_message(
+        chat_id,
+        f"По {get_account_name(aid)} нет данных по адсетам за последние 7 дней.",
+        parse_mode="HTML",
+    )
+    return
 
     period_label = f"{since.strftime('%d.%m.%Y')}–{until.strftime('%d.%m.%Y')}"
     flags = metrics_flags(aid)

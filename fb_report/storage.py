@@ -4,7 +4,6 @@ import os
 import shutil
 from datetime import datetime
 
-from facebook_business.adobjects.adaccount import AdAccount
 from facebook_business.adobjects.user import User
 
 from .constants import (
@@ -484,10 +483,29 @@ def clear_lead_metric_for_account(aid: str) -> None:
 
 def is_active(aid: str) -> bool:
     try:
-        st = AdAccount(aid).api_get(fields=["account_status"])["account_status"]
-        return st == 1
+        # We treat disabled accounts as inactive for UI badges.
+        row = (load_accounts() or {}).get(str(aid)) or {}
+        if not bool(row.get("enabled", True)):
+            return False
     except Exception:
-        return False
+        pass
+
+    try:
+        from services.heatmap_store import find_latest_ready_snapshots
+        from services.facebook_api import deny_fb_api_calls
+
+        with deny_fb_api_calls(reason="storage_is_active"):
+            snaps = find_latest_ready_snapshots(str(aid), max_hours=48)
+    except Exception:
+        snaps = []
+
+    for s in (snaps or []):
+        try:
+            if float((s or {}).get("spend") or 0.0) > 0.0:
+                return True
+        except Exception:
+            continue
+    return False
 
 
 # ========= Настройки Фокус-ИИ =========

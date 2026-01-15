@@ -3,12 +3,13 @@
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional, Any
 
-from services.facebook_api import fetch_insights
 from services.storage import (
     load_local_insights as _load_local_insights,
     save_local_insights as _save_local_insights,
-    load_hourly_stats,
 )
+
+from services.heatmap_store import load_snapshot, list_snapshot_hours
+from services.facebook_api import deny_fb_api_calls
 
 from .constants import ALMATY_TZ
 from .storage import get_account_name
@@ -132,13 +133,9 @@ def _iter_days_for_mode(mode: str) -> List[datetime]:
 
 def _fetch_daily_insight(aid: str, day: datetime) -> Optional[dict]:
     """
-    Точечный запрос инсайта за один день для аккаунта.
-    Использует общий fetch_insights из services.facebook_api,
-    который сам работает с локальным кешем инсайтов.
+    Legacy stub (FB API reads removed).
     """
-    since_until = day.strftime("%Y-%m-%d")
-    period = {"since": since_until, "until": since_until}
-    return fetch_insights(aid, period)
+    return None
 
 
 def _load_daily_totals_for_account(
@@ -156,17 +153,10 @@ def _load_daily_totals_for_account(
     result: List[Dict[str, Optional[float]]] = []
 
     for day in days:
-        # 1) Пытаемся взять агрегаты из почасового кэша
-        daily_from_hourly = _get_daily_stats_from_hourly(aid, day)
-
-        if daily_from_hourly is not None:
-            result.append(daily_from_hourly)
-            continue
-
-        # 2) Фолбэк в старое поведение через fetch_insights
-        ins = _fetch_daily_insight(aid, day)
-
-        if not ins:
+        daily_from_snapshots = _get_daily_stats_from_snapshots(aid, day)
+        if daily_from_snapshots is not None:
+            result.append(daily_from_snapshots)
+        else:
             result.append(
                 {
                     "date": day,
@@ -176,69 +166,56 @@ def _load_daily_totals_for_account(
                     "spend": 0.0,
                 }
             )
-            continue
-
-        spend, msgs, leads, total, _ = _blend_totals(ins, aid=aid)
-        result.append(
-            {
-                "date": day,
-                "messages": msgs,
-                "leads": leads,
-                "total_conversions": total,
-                "spend": spend,
-            }
-        )
 
     return result
 
 
-def _get_daily_stats_from_hourly(aid: str, day: datetime) -> Optional[Dict[str, Any]]:
-    """Возвращает агрегацию за день из hourly_stats, если день полный (00–23).
-
-    Формат возвращаемого словаря совместим с _load_daily_totals_for_account:
-    {
-        "date": datetime,
-        "messages": int,
-        "leads": int,
-        "total_conversions": int,
-        "spend": float,
-    }
-    """
-
-    stats = load_hourly_stats() or {}
-    acc_stats = stats.get(aid) or {}
-    if not isinstance(acc_stats, dict):
-        return None
-
-    day_key = day.strftime("%Y-%m-%d")
-    day_stats = acc_stats.get(day_key)
-    if not isinstance(day_stats, dict):
-        return None
-
-    # Требование «все часы 00–23 хотя бы с нулевыми значениями» интерпретируем как
-    # наличие явных бакетов для каждого часа суток.
-    hours = [f"{h:02d}" for h in range(24)]
-    if not all(h in day_stats for h in hours):
-        return None
+def _get_daily_stats_from_snapshots(aid: str, day: datetime) -> Optional[Dict[str, Any]]:
+    date_str = day.strftime("%Y-%m-%d")
 
     msgs = 0
     leads = 0
     total = 0
     spend = 0.0
+    any_ready = False
 
-    for h in hours:
-        bucket = day_stats.get(h) or {}
-        msgs += int(bucket.get("messages", 0) or 0)
-        leads += int(bucket.get("leads", 0) or 0)
-        total += int(bucket.get("total", 0) or 0)
-        spend += float(bucket.get("spend", 0.0) or 0.0)
+    with deny_fb_api_calls(reason="insights_daily_from_snapshots"):
+        for h in list_snapshot_hours(str(aid), date_str=str(date_str)):
+            snap = load_snapshot(str(aid), date_str=str(date_str), hour=int(h)) or {}
+            if str(snap.get("status") or "") not in {"ready", "ready_low_confidence"}:
+                continue
+            any_ready = True
+            for r in (snap.get("rows") or []):
+                if not isinstance(r, dict):
+                    continue
+                try:
+                    msgs += int(r.get("msgs") or 0)
+                except Exception:
+                    pass
+                try:
+                    leads += int(r.get("leads") or 0)
+                except Exception:
+                    pass
+                try:
+                    t = r.get("total")
+                    if t is None:
+                        t = int(r.get("msgs") or 0) + int(r.get("leads") or 0)
+                    total += int(t or 0)
+                except Exception:
+                    pass
+                try:
+                    spend += float(r.get("spend") or 0.0)
+                except Exception:
+                    pass
 
+    if not any_ready:
+        return None
     return {
         "date": day,
-        "messages": msgs,
-        "leads": leads,
-        "total_conversions": total,
-        "spend": spend,
+        "messages": int(msgs or 0),
+        "leads": int(leads or 0),
+        "total_conversions": int(total or 0),
+        "spend": float(spend or 0.0),
     }
 
 
@@ -274,7 +251,7 @@ def build_hourly_heatmap_for_account(
     get_account_name_fn=get_account_name,
     mode: str = "7d",
 ) -> Tuple[str, Dict[str, Any]]:
-    """Строит почасовую тепловую карту для аккаунта на базе hourly_stats.
+    """Строит почасовую тепловую карту для аккаунта на базе heatmap snapshots.
 
     Возвращает:
       - готовый текст для Telegram
@@ -284,23 +261,53 @@ def build_hourly_heatmap_for_account(
     acc_name = get_account_name_fn(aid)
     mode_label = _hourly_mode_label(mode)
 
-    stats = load_hourly_stats() or {}
-    acc_stats = stats.get(aid) or {}
-    if not isinstance(acc_stats, dict):
-        acc_stats = {}
+    def _get_hour_bucket(date_str: str, hour_key: str) -> dict:
+        try:
+            h_int = int(str(hour_key))
+        except Exception:
+            return {}
+
+        with deny_fb_api_calls(reason="insights_hour_bucket"):
+            snap = load_snapshot(str(aid), date_str=str(date_str), hour=int(h_int)) or {}
+        if str(snap.get("status") or "") not in {"ready", "ready_low_confidence"}:
+            return {}
+
+        msgs = 0
+        leads = 0
+        total = 0
+        spend = 0.0
+        for r in (snap.get("rows") or []):
+            if not isinstance(r, dict):
+                continue
+            try:
+                msgs += int(r.get("msgs") or 0)
+            except Exception:
+                pass
+            try:
+                leads += int(r.get("leads") or 0)
+            except Exception:
+                pass
+            try:
+                t = r.get("total")
+                if t is None:
+                    t = int(r.get("msgs") or 0) + int(r.get("leads") or 0)
+                total += int(t or 0)
+            except Exception:
+                pass
+            try:
+                spend += float(r.get("spend") or 0.0)
+            except Exception:
+                pass
+
+        return {
+            "messages": int(msgs or 0),
+            "leads": int(leads or 0),
+            "total": int(total or 0),
+            "spend": float(spend or 0.0),
+        }
 
     days = _iter_days_for_hourly_mode(mode)
     hours = [f"{h:02d}" for h in range(24)]
-
-    def _get_bucket(day_stats: dict, hour_key: str) -> dict:
-        b = (day_stats or {}).get(hour_key)
-        if b:
-            return b
-        try:
-            alt = str(int(hour_key))
-        except Exception:
-            alt = hour_key
-        return (day_stats or {}).get(alt) or {}
 
     matrix: List[Dict[str, Any]] = []
     max_convs = 0
@@ -309,9 +316,6 @@ def build_hourly_heatmap_for_account(
 
     for day in days:
         day_key = day.strftime("%Y-%m-%d")
-        day_stats = acc_stats.get(day_key) or {}
-        if not isinstance(day_stats, dict):
-            day_stats = {}
 
         row_totals: List[int] = []
         row_spends: List[float] = []
@@ -319,7 +323,7 @@ def build_hourly_heatmap_for_account(
         day_spend = 0.0
 
         for h in hours:
-            bucket = _get_bucket(day_stats, h)
+            bucket = _get_hour_bucket(day_key, h)
             val = int(bucket.get("total", 0) or 0)
             sp = float(bucket.get("spend", 0.0) or 0.0)
             row_totals.append(val)
@@ -349,41 +353,8 @@ def build_hourly_heatmap_for_account(
     lines.append(f"Период: {mode_label}")
     lines.append("")
 
-    live_today: Dict[str, Any] = {}
-    if mode == "today" and len(days) == 1:
-        today_key = days[0].strftime("%Y-%m-%d")
-        today_stats = acc_stats.get(today_key) or {}
-        if not isinstance(today_stats, dict):
-            today_stats = {}
-
-        has_any_hour_data = False
-        for h in hours:
-            if _get_bucket(today_stats, h):
-                has_any_hour_data = True
-                break
-
-        if not has_any_hour_data:
-            try:
-                ins_live = fetch_insights(aid, "today") or {}
-                spend, msgs, leads, total, _ = _blend_totals(ins_live, aid=aid)
-                live_today = {
-                    "spend": float(spend or 0.0),
-                    "messages": int(msgs or 0),
-                    "leads": int(leads or 0),
-                    "total_conversions": int(total or 0),
-                }
-            except Exception:
-                live_today = {}
-
     if not matrix or total_convs_all == 0:
-        if live_today.get("spend", 0.0) > 0 or live_today.get("total_conversions", 0) > 0:
-            lines.append(
-                "Почасовой кэш за сегодня ещё не накоплен. "
-                f"Текущее за сегодня: {int(live_today.get('total_conversions', 0))} заявок, "
-                f"затраты: {float(live_today.get('spend', 0.0)):.2f} $."
-            )
-        else:
-            lines.append("За выбранный период нет заявок (💬+📩) по часам.")
+        lines.append("За выбранный период нет заявок (💬+📩) по часам.")
     else:
         lines.append(
             f"Итого за период: {total_convs_all} заявок, затраты: {total_spend_all:.2f} $"
@@ -426,7 +397,7 @@ def build_hourly_heatmap_for_account(
         ],
         "total_conversions_all": total_convs_all,
         "total_spend_all": total_spend_all,
-        "live_today": live_today,
+        "live_today": {},
     }
 
     return text, summary
