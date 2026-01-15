@@ -284,6 +284,7 @@ def safe_api_call(fn, *args, **kwargs):
     except FacebookRequestError as e:
         code = None
         subcode = None
+        http_status = None
         try:
             code = int(e.api_error_code())
         except Exception:
@@ -292,6 +293,14 @@ def safe_api_call(fn, *args, **kwargs):
             subcode = int(e.api_error_subcode())
         except Exception:
             subcode = None
+        try:
+            hs = getattr(e, "http_status", None)
+            if callable(hs):
+                http_status = hs()
+            else:
+                http_status = hs
+        except Exception:
+            http_status = None
 
         try:
             _LAST_API_ERROR = str(e)
@@ -308,6 +317,7 @@ def safe_api_call(fn, *args, **kwargs):
             "subcode": subcode,
             "message": _LAST_API_ERROR,
             "endpoint": endpoint,
+            "http_status": http_status,
             "params": _sanitize_params(meta_params) or _sanitize_params(kwargs.get("params")),
         }
         try:

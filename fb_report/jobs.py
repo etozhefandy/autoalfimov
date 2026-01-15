@@ -1050,6 +1050,32 @@ def _refresh_adset_status_cache(aid: str, *, log: logging.Logger) -> dict[str, s
     return _adset_status_map_from_cache(obj)
 
 
+def _has_real_reason(snap: dict) -> bool:
+    try:
+        r = str((snap or {}).get("reason") or "")
+    except Exception:
+        r = ""
+    if not r:
+        return False
+    return r not in {"snapshot_collecting"}
+
+
+def _map_fb_reason(info: dict, et: str) -> str:
+    try:
+        code = int((info or {}).get("code") or 0)
+    except Exception:
+        code = 0
+    if code == 17:
+        return "fb_rate_limit"
+    if code == 190:
+        return "fb_auth"
+    if code == 100:
+        return "fb_invalid_fields"
+    if et in {"fb_permission_error"}:
+        return "fb_permission"
+    return "snapshot_failed"
+
+
 async def _heatmap_snapshot_collector_job(
     context: ContextTypes.DEFAULT_TYPE,
     *,
@@ -1128,6 +1154,12 @@ async def _heatmap_snapshot_collector_job(
         except Exception:
             window_label = f"{date_str} {hour_int:02d}:00–{(hour_int + 1) % 24:02d}:00"
 
+        preserve_existing_failure = False
+        try:
+            preserve_existing_failure = str((snap or {}).get("status") or "") == "failed" or _has_real_reason(snap)
+        except Exception:
+            preserve_existing_failure = False
+
         log.info(
             "🟦 FB COLLECTOR START aid=%s window=%s attempt=%s/%s allow_fb_api_calls=TRUE",
             str(aid),
@@ -1160,20 +1192,47 @@ async def _heatmap_snapshot_collector_job(
             except Exception:
                 has_any = False
 
+            preserve_now = False
+            try:
+                preserve_now = str((snap or {}).get("status") or "") == "failed" or _has_real_reason(snap)
+            except Exception:
+                preserve_now = False
+
             if has_any:
                 snap["status"] = "ready_low_confidence"
                 snap["reason"] = "low_volume"
                 snap["error"] = None
                 snap["next_try_at"] = None
             else:
-                snap["status"] = "failed"
-                et = str((err or {}).get("type") or "api_error")
-                if is_invalid_fields:
-                    snap["reason"] = "fb_invalid_fields"
-                    snap["error"] = err
+                # Hard rule: if snapshot already failed or has a real reason, do not overwrite.
+                if preserve_now:
+                    # Preserve reason/error/meta/next_try_at, but finalize as failed after deadline.
+                    try:
+                        if str(snap.get("status") or "") != "failed":
+                            snap["status"] = "failed"
+                    except Exception:
+                        snap["status"] = "failed"
+                    snap["reason"] = snap.get("reason")
+                    snap["error"] = snap.get("error")
+                    snap["meta"] = snap.get("meta")
                     snap["next_try_at"] = snap.get("next_try_at")
                 else:
-                    snap["reason"] = "rate_limit" if et == "rate_limit" else "snapshot_failed"
+                    # No real reason yet -> mark as failed with fallback reason.
+                    snap["status"] = "failed"
+                    et = str((err or {}).get("type") or "api_error")
+                    info_like = {}
+                    try:
+                        info_like = {
+                            "code": (err or {}).get("fb_code"),
+                            "subcode": (err or {}).get("fb_subcode"),
+                            "fbtrace_id": (err or {}).get("fbtrace_id"),
+                            "message": (err or {}).get("message") or (err or {}).get("fb_message"),
+                            "http_status": (err or {}).get("http_status"),
+                        }
+                    except Exception:
+                        info_like = {}
+                    rr = "fb_invalid_fields" if is_invalid_fields else _map_fb_reason(info_like, et)
+                    snap["reason"] = rr
                     snap["error"] = err
             save_snapshot(snap)
 
@@ -1248,13 +1307,26 @@ async def _heatmap_snapshot_collector_job(
 
         if is_rate_limited_now():
             info = get_last_api_error_info() or {}
+            # Retryable: keep status collecting, but record a real reason + meta.
+            snap["reason"] = "fb_rate_limit"
             snap["error"] = {
-                "type": "rate_limit",
+                "type": "fb_rate_limit",
                 "fb_code": (info or {}).get("code") or 17,
                 "fb_subcode": (info or {}).get("subcode"),
                 "fbtrace_id": (info or {}).get("fbtrace_id"),
+                "message": (info or {}).get("message"),
+                "http_status": (info or {}).get("http_status"),
             }
-            snap["reason"] = "rate_limit"
+            snap["meta"] = {
+                "endpoint": (info or {}).get("endpoint") or "insights/adset/hourly",
+                "fields": None,
+                "params": (info or {}).get("params"),
+                "last_http_status": (info or {}).get("http_status"),
+                "fb_code": (info or {}).get("code") or 17,
+                "fb_subcode": (info or {}).get("subcode"),
+                "fbtrace_id": (info or {}).get("fbtrace_id"),
+                "message": (info or {}).get("message"),
+            }
             save_snapshot(snap)
 
             try:
@@ -1321,6 +1393,22 @@ async def _heatmap_snapshot_collector_job(
                         "campaign_id",
                         "campaign_name",
                     ]
+
+                    # Persist meta for this attempt (snapshots-only debug relies on it).
+                    try:
+                        snap["meta"] = {
+                            "endpoint": "insights/adset/hourly",
+                            "fields": list(fields or []),
+                            "params": params,
+                            "last_http_status": None,
+                            "fb_code": None,
+                            "fb_subcode": None,
+                            "fbtrace_id": None,
+                            "message": None,
+                        }
+                    except Exception:
+                        pass
+
                     try:
                         log.info(
                             "🟦 FB REQUEST aid=%s endpoint=%s date=%s hour=%s window=%s fields=%s",
@@ -1345,6 +1433,32 @@ async def _heatmap_snapshot_collector_job(
 
         if not data:
             info = get_last_api_error_info() or {}
+            try:
+                et = str(classify_api_error(info))
+            except Exception:
+                et = "api_error"
+
+            # Always attach error meta for debug (do not clear existing if preservation rule triggers).
+            try:
+                if not preserve_existing_failure:
+                    snap_meta = snap.get("meta") if isinstance(snap.get("meta"), dict) else {}
+                    if not isinstance(snap_meta, dict):
+                        snap_meta = {}
+                    snap_meta.update(
+                        {
+                            "endpoint": (info or {}).get("endpoint") or (snap_meta or {}).get("endpoint") or "insights/adset/hourly",
+                            "last_http_status": (info or {}).get("http_status"),
+                            "fb_code": (info or {}).get("code"),
+                            "fb_subcode": (info or {}).get("subcode"),
+                            "fbtrace_id": (info or {}).get("fbtrace_id"),
+                            "message": (info or {}).get("message"),
+                            "params": (info or {}).get("params") or (snap_meta or {}).get("params"),
+                        }
+                    )
+                    snap["meta"] = snap_meta
+            except Exception:
+                pass
+
             try:
                 log.warning(
                     "🟦 FB ERROR aid=%s fb_code=%s message=%s window=%s",
@@ -1518,49 +1632,59 @@ async def _heatmap_snapshot_collector_job(
             except Exception:
                 msg = ""
 
-            invalid_fields = False
+            preserve_now = False
             try:
-                invalid_fields = bool(code == 100) and ("not valid" in msg.lower()) and ("fields" in msg.lower())
+                preserve_now = str((snap or {}).get("status") or "") == "failed" or _has_real_reason(snap)
             except Exception:
-                invalid_fields = False
+                preserve_now = False
 
-            if invalid_fields:
-                snap["status"] = "failed"
-                snap["reason"] = "fb_invalid_fields"
+            # If we already have a real reason (or failed), do not overwrite anything.
+            if preserve_now:
+                snap["reason"] = snap.get("reason")
+                snap["error"] = snap.get("error")
+                snap["meta"] = snap.get("meta")
+                snap["next_try_at"] = snap.get("next_try_at")
+            else:
+                rr = _map_fb_reason(info, et)
+                snap["reason"] = rr
+                if rr == "fb_invalid_fields":
+                    snap["status"] = "failed"
+                    try:
+                        snap["next_try_at"] = (now + timedelta(hours=6)).isoformat()
+                    except Exception:
+                        snap["next_try_at"] = snap.get("next_try_at")
+                elif rr in {"fb_auth", "fb_permission"}:
+                    snap["status"] = "failed"
+                else:
+                    snap["status"] = "collecting"
+
                 snap["error"] = {
-                    "type": "fb_invalid_fields",
+                    "type": rr,
                     "fb_code": (info or {}).get("code"),
                     "fb_subcode": (info or {}).get("subcode"),
                     "fbtrace_id": (info or {}).get("fbtrace_id"),
-                    "message": msg,
+                    "message": (info or {}).get("message"),
+                    "http_status": (info or {}).get("http_status"),
                 }
-                snap["meta"] = {
-                    "fb_code": (info or {}).get("code"),
-                    "fbtrace_id": (info or {}).get("fbtrace_id"),
-                    "message": msg,
-                }
+
                 try:
-                    snap["next_try_at"] = (now + timedelta(hours=6)).isoformat()
-                except Exception:
-                    snap["next_try_at"] = None
-                try:
-                    log.warning(
-                        "🟦 FB ERROR aid=%s fb_code=%s message=%s window=%s",
-                        str(aid),
-                        str(code),
-                        str(msg),
-                        str(window_label),
+                    snap_meta = snap.get("meta") if isinstance(snap.get("meta"), dict) else {}
+                    if not isinstance(snap_meta, dict):
+                        snap_meta = {}
+                    snap_meta.update(
+                        {
+                            "endpoint": (info or {}).get("endpoint") or (snap_meta or {}).get("endpoint"),
+                            "last_http_status": (info or {}).get("http_status"),
+                            "fb_code": (info or {}).get("code"),
+                            "fb_subcode": (info or {}).get("subcode"),
+                            "fbtrace_id": (info or {}).get("fbtrace_id"),
+                            "message": (info or {}).get("message"),
+                            "params": (info or {}).get("params") or (snap_meta or {}).get("params"),
+                        }
                     )
+                    snap["meta"] = snap_meta
                 except Exception:
                     pass
-            else:
-                snap["error"] = {
-                    "type": et,
-                    "fb_code": (info or {}).get("code"),
-                    "fb_subcode": (info or {}).get("subcode"),
-                    "fbtrace_id": (info or {}).get("fbtrace_id"),
-                }
-                snap["reason"] = "rate_limit" if et == "rate_limit" else "snapshot_collecting"
 
         save_snapshot(snap)
 

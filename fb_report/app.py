@@ -3251,6 +3251,12 @@ def _build_heatmap_debug_last_text(*, aid: str) -> str:
     snap_last_try = str(last_snap.get("last_try_at") or "")
     snap_next_try = str(last_snap.get("next_try_at") or "")
     snap_deadline = str(last_snap.get("deadline_at") or "")
+    snap_meta = last_snap.get("meta") if isinstance(last_snap.get("meta"), dict) else {}
+    if not isinstance(snap_meta, dict):
+        snap_meta = {}
+    snap_err = last_snap.get("error") if isinstance(last_snap.get("error"), dict) else {}
+    if not isinstance(snap_err, dict):
+        snap_err = {}
     snap_rows = last_snap.get("rows") or []
 
     st_all, ws_all, sp_all, used_all = _sum_rows(list(snap_rows), active_only=False)
@@ -3268,6 +3274,43 @@ def _build_heatmap_debug_last_text(*, aid: str) -> str:
     lines.append(f"attempts={snap_attempts} last_try_at={snap_last_try} next_try_at={snap_next_try}")
     if snap_deadline:
         lines.append(f"deadline_at={snap_deadline}")
+
+    # Diagnostics: snapshots-only, no FB calls.
+    try:
+        fb_code = snap_meta.get("fb_code") if snap_meta else None
+        if fb_code in (None, ""):
+            fb_code = snap_err.get("fb_code")
+        fbtrace_id = snap_meta.get("fbtrace_id") if snap_meta else None
+        if fbtrace_id in (None, ""):
+            fbtrace_id = snap_err.get("fbtrace_id")
+        msg = snap_meta.get("message") if snap_meta else None
+        if msg in (None, ""):
+            msg = snap_err.get("message")
+        endpoint = snap_meta.get("endpoint") if snap_meta else None
+        fields = snap_meta.get("fields") if snap_meta else None
+        params = snap_meta.get("params") if snap_meta else None
+        http_status = snap_meta.get("last_http_status") if snap_meta else None
+        if http_status in (None, ""):
+            http_status = snap_err.get("http_status")
+
+        if any(x not in (None, "") for x in [endpoint, fields, params, http_status, fb_code, fbtrace_id, msg]):
+            lines.append("diagnostics:")
+            if endpoint:
+                lines.append(f"  endpoint={endpoint}")
+            if fields not in (None, ""):
+                lines.append(f"  fields={fields}")
+            if params not in (None, ""):
+                lines.append(f"  params={params}")
+            if http_status not in (None, ""):
+                lines.append(f"  last_http_status={http_status}")
+            if fb_code not in (None, ""):
+                lines.append(f"  fb_code={fb_code}")
+            if fbtrace_id not in (None, ""):
+                lines.append(f"  fbtrace_id={fbtrace_id}")
+            if msg not in (None, ""):
+                lines.append(f"  message={msg}")
+    except Exception:
+        pass
     lines.append(f"computed_status={computed_status} computed_reason={computed_reason}")
     lines.append(f"rows_count={int(len(snap_rows) or 0)}")
 
