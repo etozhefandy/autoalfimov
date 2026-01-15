@@ -56,6 +56,7 @@ from .reporting import (
     fmt_int,
     get_cached_report,
     build_comparison_report,
+    build_report_debug,
     send_period_report,
     parse_range,
     parse_two_ranges,
@@ -3072,6 +3073,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/heatmap <act_id> — тепловая карта адсетов за 7 дней\n"
         "/heatmap_status <act_id> — статус слепка теплокарты за предыдущий полный час\n"
         "/heatmap_debug_last <act_id> — отладка: последний слепок + суммы + coverage(today/yday)\n"
+        "/report_debug <act_id> yday general — отладка отчёта (params/time_range/tz/attribution/sums)\n"
         "/version — показать текущую версию бота и краткое описание\n"
         "\n"
         "🚀 Функции автопилота:\n"
@@ -3080,6 +3082,25 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Безопасное отключение дорогих адсетов\n"
         "• Подготовка к ИИ-управлению (Пилат)\n"
     )
+    await update.message.reply_text(txt)
+
+
+async def cmd_report_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _allowed(update):
+        return
+    parts = (update.message.text or "").strip().split()
+    if len(parts) < 2:
+        await update.message.reply_text("Формат: /report_debug act_xxx yday general")
+        return
+    aid = str(parts[1] or "").strip()
+    if not aid.startswith("act_"):
+        aid = "act_" + aid
+    kind = str(parts[2] if len(parts) >= 3 else "yday")
+    mode = str(parts[3] if len(parts) >= 4 else "general")
+    try:
+        txt = build_report_debug(str(aid), str(kind), str(mode))
+    except Exception as e:
+        txt = f"report_debug_error: {type(e).__name__}: {e}"
     await update.message.reply_text(txt)
 
 
@@ -7799,6 +7820,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("heatmap_status", cmd_heatmap_status))
     app.add_handler(CommandHandler("heatmap_debug_last", cmd_heatmap_debug_last))
     app.add_handler(CommandHandler("heatmap_debug_hour", cmd_heatmap_debug_hour))
+    app.add_handler(CommandHandler("report_debug", cmd_report_debug))
 
     app.add_handler(CallbackQueryHandler(on_cb))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_any))

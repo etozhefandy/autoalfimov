@@ -29,8 +29,53 @@ from .insights import (
     _blend_totals,
 )
 
-from services.heatmap_store import load_snapshot, list_snapshot_hours
-from services.facebook_api import deny_fb_api_calls
+from services.facebook_api import allow_fb_api_calls, fetch_insights_bulk, safe_api_call
+
+
+REPORT_TEXT_CACHE_VERSION = 2
+
+
+def _account_timezone_info(aid: str) -> dict:
+    try:
+        from facebook_business.adobjects.adaccount import AdAccount
+
+        acc = AdAccount(str(aid))
+        with allow_fb_api_calls(reason="reporting_account_timezone"):
+            info = safe_api_call(
+                acc.api_get,
+                fields=["timezone_name", "timezone_offset_hours_utc"],
+                params={},
+                _meta={"endpoint": "adaccount", "params": {"fields": "timezone_name,timezone_offset_hours_utc"}},
+                _caller="reporting_account_timezone",
+            )
+        if isinstance(info, dict):
+            return info
+    except Exception:
+        pass
+    return {}
+
+
+def _account_now(aid: str) -> tuple[datetime, str, float | None]:
+    tz_name = ""
+    off = None
+    try:
+        info = _account_timezone_info(str(aid)) or {}
+        tz_name = str(info.get("timezone_name") or "")
+        try:
+            off = float(info.get("timezone_offset_hours_utc"))
+        except Exception:
+            off = None
+    except Exception:
+        tz_name = ""
+        off = None
+
+    try:
+        if off is not None:
+            now = datetime.utcnow() + timedelta(hours=float(off))
+            return now, tz_name, float(off)
+    except Exception:
+        pass
+    return datetime.now(ALMATY_TZ), tz_name, off
 
 
 # ========= Утилиты форматирования =========
@@ -90,104 +135,69 @@ def fetch_insight(aid: str, period):
 
     if use_cache and key in store:
         name = get_account_name(aid)
-        return name, store[key]
+        cached = store.get(key)
+        # Old implementation stored snapshots-based aggregates. Do not reuse them.
+        try:
+            if isinstance(cached, dict) and str(cached.get("_source") or "") == "fb_api":
+                return name, cached
+        except Exception:
+            pass
 
-    now = datetime.now(ALMATY_TZ)
-    dates: list[str] = []
-    if isinstance(period, dict):
-        since = str(period.get("since") or "")
-        until = str(period.get("until") or "")
-        if since and until and since <= until:
-            try:
-                d1 = datetime.strptime(since, "%Y-%m-%d").date()
-                d2 = datetime.strptime(until, "%Y-%m-%d").date()
-                cur = d1
-                while cur <= d2:
-                    dates.append(cur.strftime("%Y-%m-%d"))
-                    cur = cur + timedelta(days=1)
-            except Exception:
-                dates = []
-    else:
+    now_acc, tz_name, tz_offset = _account_now(str(aid))
+
+    # Strict calendar day in ad account TZ for today/yesterday.
+    period_for_api: Any = period
+    try:
         p = str(period or "")
-        if p == "today":
-            dates = [now.strftime("%Y-%m-%d")]
-        elif p == "yesterday":
-            dates = [(now - timedelta(days=1)).strftime("%Y-%m-%d")]
-        elif p.startswith("last_") and p.endswith("d"):
-            try:
-                n = int(p.replace("last_", "").replace("d", ""))
-            except Exception:
-                n = 0
-            if n > 0:
-                end = (now - timedelta(days=1)).date()
-                start = end - timedelta(days=max(0, n - 1))
-                cur = start
-                while cur <= end:
-                    dates.append(cur.strftime("%Y-%m-%d"))
-                    cur = cur + timedelta(days=1)
+        if p in {"today", "yesterday"}:
+            day = now_acc.date() if p == "today" else (now_acc.date() - timedelta(days=1))
+            ds = day.strftime("%Y-%m-%d")
+            period_for_api = {"since": ds, "until": ds}
+    except Exception:
+        period_for_api = period
 
-    spend = 0.0
-    msgs = 0
-    leads = 0
-    total = 0
-    impressions = 0
-    clicks = 0
+    fields = [
+        "impressions",
+        "cpm",
+        "clicks",
+        "cpc",
+        "spend",
+        "actions",
+        "cost_per_action_type",
+    ]
 
-    with deny_fb_api_calls(reason="reporting_fetch_insight"):
-        for d in dates:
-            for h in list_snapshot_hours(str(aid), date_str=str(d)):
-                snap = load_snapshot(str(aid), date_str=str(d), hour=int(h)) or {}
-                if str(snap.get("status") or "") not in {"ready", "ready_low_confidence"}:
-                    continue
-                for r in (snap.get("rows") or []):
-                    if not isinstance(r, dict):
-                        continue
-                    try:
-                        spend += float(r.get("spend") or 0.0)
-                    except Exception:
-                        pass
-                    try:
-                        msgs += int(r.get("started_conversations") or r.get("msgs") or 0)
-                    except Exception:
-                        pass
-                    try:
-                        leads += int(r.get("website_submit_applications") or r.get("leads") or 0)
-                    except Exception:
-                        pass
-                    try:
-                        t = r.get("total")
-                        if t is None:
-                            t = int(r.get("started_conversations") or r.get("msgs") or 0) + int(
-                                r.get("website_submit_applications") or r.get("leads") or 0
-                            )
-                        total += int(t or 0)
-                    except Exception:
-                        pass
-                    try:
-                        impressions += int(r.get("impressions") or 0)
-                    except Exception:
-                        pass
-                    try:
-                        clicks += int(r.get("clicks") or 0)
-                    except Exception:
-                        pass
-
-    cpm = (float(spend) / (float(impressions) / 1000.0)) if impressions > 0 and spend > 0 else 0.0
-    cpc = (float(spend) / float(clicks)) if clicks > 0 and spend > 0 else 0.0
-
-    ins_dict = {
-        "impressions": int(impressions),
-        "cpm": float(cpm),
-        "clicks": int(clicks),
-        "cpc": float(cpc),
-        "spend": float(spend),
-        "actions": [
-            {"action_type": "onsite_conversion.messaging_conversation_started_7d", "value": int(msgs)},
-            {"action_type": "offsite_conversion.fb_pixel_submit_application", "value": int(leads)},
-            {"action_type": "link_click", "value": 0},
-        ],
-        "cost_per_action_type": [],
+    params_extra = {
+        # Match Ads Manager default as close as we can.
+        # Spend/impressions/clicks should match regardless of attribution, but actions can differ.
+        "action_report_time": "conversion",
+        "use_unified_attribution_setting": True,
     }
+
+    rows: list[dict] = []
+    with allow_fb_api_calls(reason="reporting_fetch_insight"):
+        rows = fetch_insights_bulk(
+            str(aid),
+            period=period_for_api,
+            level="account",
+            fields=list(fields),
+            params_extra=dict(params_extra),
+        )
+
+    ins_dict = (rows[0] if rows else None) or {}
+    if isinstance(ins_dict, dict):
+        try:
+            ins_dict["_source"] = "fb_api"
+            ins_dict["_meta"] = {
+                "timezone_name": tz_name,
+                "timezone_offset_hours_utc": tz_offset,
+                "period_input": period,
+                "period_effective": period_for_api,
+                "level": "account",
+                "fields": list(fields),
+                "params_extra": dict(params_extra),
+            }
+        except Exception:
+            pass
 
     name = get_account_name(aid)
 
@@ -195,6 +205,99 @@ def fetch_insight(aid: str, period):
     save_local_insights(aid, store)
 
     return name, ins_dict
+
+
+def build_report_debug(aid: str, kind: str, mode: str = "general") -> str:
+    now_acc, tz_name, tz_offset = _account_now(str(aid))
+    p = str(kind or "")
+    if p in {"yday", "yesterday"}:
+        period = "yesterday"
+    elif p in {"today"}:
+        period = "today"
+    else:
+        period = p
+
+    period_for_api: Any = period
+    try:
+        if str(period) in {"today", "yesterday"}:
+            day = now_acc.date() if str(period) == "today" else (now_acc.date() - timedelta(days=1))
+            ds = day.strftime("%Y-%m-%d")
+            period_for_api = {"since": ds, "until": ds}
+    except Exception:
+        period_for_api = period
+
+    fields = [
+        "impressions",
+        "clicks",
+        "spend",
+        "actions",
+    ]
+    params_extra = {
+        "action_report_time": "conversion",
+        "use_unified_attribution_setting": True,
+    }
+
+    rows: list[dict] = []
+    with allow_fb_api_calls(reason="report_debug"):
+        rows = fetch_insights_bulk(
+            str(aid),
+            period=period_for_api,
+            level="account",
+            fields=list(fields),
+            params_extra=dict(params_extra),
+        )
+
+    spend = 0.0
+    impr = 0
+    clicks = 0
+    started = 0
+    website = 0
+    for r in rows or []:
+        if not isinstance(r, dict):
+            continue
+        try:
+            spend += float(r.get("spend") or 0.0)
+        except Exception:
+            pass
+        try:
+            impr += int(r.get("impressions") or 0)
+        except Exception:
+            pass
+        try:
+            clicks += int(r.get("clicks") or 0)
+        except Exception:
+            pass
+        acts = extract_actions(r)
+        try:
+            started += int(acts.get("onsite_conversion.messaging_conversation_started_7d", 0) or 0)
+        except Exception:
+            pass
+        try:
+            website += int(acts.get("offsite_conversion.fb_pixel_submit_application", 0) or 0)
+        except Exception:
+            pass
+
+    lines = []
+    lines.append("🧪 report_debug")
+    lines.append(f"aid={str(aid)}")
+    lines.append(f"kind={str(kind)} mode={str(mode)}")
+    lines.append(f"timezone_name={str(tz_name or 'unknown')}")
+    lines.append(f"timezone_offset_hours_utc={str(tz_offset) if tz_offset is not None else 'unknown'}")
+    lines.append(f"account_now={now_acc.isoformat()}")
+    lines.append(f"period_input={str(period)}")
+    lines.append(f"period_effective={str(period_for_api)}")
+    lines.append("level=account")
+    lines.append(f"fields={','.join([str(x) for x in fields])}")
+    lines.append(f"action_report_time={str(params_extra.get('action_report_time'))}")
+    lines.append("attribution=unified(account_default)")
+    lines.append("filters=none")
+    lines.append(f"rows_count={int(len(rows or []))}")
+    lines.append(f"sum_spend={float(spend):.2f}")
+    lines.append(f"sum_impressions={int(impr)}")
+    lines.append(f"sum_clicks={int(clicks)}")
+    lines.append(f"started_conversations_7d={int(started)}")
+    lines.append(f"website_submit_applications={int(website)}")
+    return "\n".join(lines)
 
 
 # ========== КЭШ ТЕКСТОВЫХ ОТЧЁТОВ ==========
@@ -207,7 +310,7 @@ def get_cached_report(aid: str, period, label: str = "") -> str:
     if period == "today":
         return build_report(aid, period, label)
 
-    key = period_key(period)
+    key = f"v{int(REPORT_TEXT_CACHE_VERSION)}:{period_key(period)}"
     now_ts = datetime.now().timestamp()
 
     cache = _load_report_cache()
@@ -244,10 +347,30 @@ def build_report(aid: str, period, label: str = "") -> str:
             return ""
         return f"⚠ Ошибка по {get_account_name(aid)}:\n\n{e}"
 
-    badge = "🟢" if is_active(aid) else "🔴"
+    badge = "🟢"
+    try:
+        if float((ins or {}).get("spend") or 0.0) <= 0.0 and int((ins or {}).get("impressions") or 0) <= 0:
+            badge = "🔴"
+    except Exception:
+        badge = "🟢"
     hdr = f"{badge} <b>{name}</b>{(' (' + label + ')') if label else ''}\n"
     if not ins:
         return hdr + "Нет данных за выбранный период"
+
+    try:
+        meta = ins.get("_meta") if isinstance(ins, dict) else None
+        if not isinstance(meta, dict):
+            meta = {}
+        tz_name = str(meta.get("timezone_name") or "")
+        params_extra = meta.get("params_extra") if isinstance(meta.get("params_extra"), dict) else {}
+        if not isinstance(params_extra, dict):
+            params_extra = {}
+        art = str(params_extra.get("action_report_time") or "")
+        # use_unified_attribution_setting=True => Ads Manager account default (unified)
+        if tz_name or art:
+            hdr = hdr + f"⚙ attribution=account_default action_report_time={art or 'unknown'} tz={tz_name or 'unknown'}\n"
+    except Exception:
+        pass
 
     # Базовые метрики
     impressions = int(ins.get("impressions", 0) or 0)
