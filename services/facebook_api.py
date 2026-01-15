@@ -178,6 +178,7 @@ def safe_api_call(fn, *args, **kwargs):
     Ловит ошибки, возвращает None в случае неудачи.
     """
     global _LAST_API_ERROR, _LAST_API_ERROR_AT
+    return_error_info = bool(kwargs.pop("_return_error_info", False))
     meta = kwargs.pop("_meta", None)
     aid = kwargs.pop("_aid", None)
     endpoint = None
@@ -254,7 +255,7 @@ def safe_api_call(fn, *args, **kwargs):
             )
         except Exception:
             pass
-        return None
+        return (None, info) if return_error_info else None
 
     if is_rate_limited_now():
         try:
@@ -267,18 +268,17 @@ def safe_api_call(fn, *args, **kwargs):
             )
         except Exception:
             pass
-        _set_last_error_info(
-            {
-                "code": 17,
-                "message": "User request limit reached (rate limited)",
-                "kind": "rate_limit",
-                "endpoint": endpoint,
-                "path": path,
-                "aid": str(aid or ""),
-                "caller": str(effective_caller or ""),
-            }
-        )
-        return None
+        info = {
+            "code": 17,
+            "message": "User request limit reached (rate limited)",
+            "kind": "rate_limit",
+            "endpoint": endpoint,
+            "path": path,
+            "aid": str(aid or ""),
+            "caller": str(effective_caller or ""),
+        }
+        _set_last_error_info(info)
+        return (None, info) if return_error_info else None
     try:
         try:
             logging.getLogger(__name__).info(
@@ -309,7 +309,7 @@ def safe_api_call(fn, *args, **kwargs):
             )
         except Exception:
             pass
-        return res
+        return (res, None) if return_error_info else res
     except FacebookRequestError as e:
         code = None
         subcode = None
@@ -398,7 +398,7 @@ def safe_api_call(fn, *args, **kwargs):
             )
         except Exception:
             pass
-        return None
+        return (None, info) if return_error_info else None
     except Exception as e:
         try:
             _LAST_API_ERROR = str(e)
@@ -408,16 +408,15 @@ def safe_api_call(fn, *args, **kwargs):
             _LAST_API_ERROR_AT = datetime.utcnow().isoformat()
         except Exception:
             _LAST_API_ERROR_AT = None
-        _set_last_error_info(
-            {
-                "kind": "exception",
-                "message": _LAST_API_ERROR,
-                "endpoint": endpoint,
-                "path": path,
-                "aid": str(aid or ""),
-                "caller": str(effective_caller or ""),
-            }
-        )
+        info = {
+            "kind": "exception",
+            "message": _LAST_API_ERROR,
+            "endpoint": endpoint,
+            "path": path,
+            "aid": str(aid or ""),
+            "caller": str(effective_caller or ""),
+        }
+        _set_last_error_info(info)
         try:
             logging.getLogger(__name__).warning(
                 "🟦 FB ERROR endpoint=%s path=%s aid=%s message=%s",
@@ -428,7 +427,7 @@ def safe_api_call(fn, *args, **kwargs):
             )
         except Exception:
             pass
-        return None
+        return (None, info) if return_error_info else None
 
 
 def fetch_insights_bulk(

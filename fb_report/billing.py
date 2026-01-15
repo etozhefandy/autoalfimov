@@ -8,23 +8,31 @@ from .constants import ALMATY_TZ, usd_to_kzt, kzt_round_up_1000
 from .storage import iter_enabled_accounts_only, get_account_name
 from .reporting import fmt_int
 
-from services.facebook_api import allow_fb_api_calls, safe_api_call, get_last_api_error_info, classify_api_error
+from services.facebook_api import allow_fb_api_calls, safe_api_call, classify_api_error
 
 
 async def send_billing(ctx: ContextTypes.DEFAULT_TYPE, chat_id: str, only_inactive: bool = False):
-    """Текущие биллинги: по умолчанию выводит все enabled аккаунты."""
+    """Текущие биллинги: работает только по аккаунтам enabled=True из настроек."""
+    enabled_ids = list(iter_enabled_accounts_only())
+    if not enabled_ids:
+        await ctx.bot.send_message(
+            chat_id=chat_id,
+            text="📋 Биллинги: нет включённых аккаунтов (enabled).",
+        )
+        return
     rate = float(usd_to_kzt() or 0.0)
     ok_lines = []
     no_access = []
     failed = []
     with allow_fb_api_calls(reason="billing_current"):
-        for aid in iter_enabled_accounts_only():
+        for aid in enabled_ids:
             try:
-                info = safe_api_call(
+                res, err = safe_api_call(
                     AdAccount(str(aid)).api_get,
                     fields=["name", "account_status", "balance"],
                     params={},
                     _aid=str(aid),
+                    _return_error_info=True,
                     _meta={
                         "endpoint": "adaccount",
                         "path": f"/{str(aid)}",
@@ -33,10 +41,11 @@ async def send_billing(ctx: ContextTypes.DEFAULT_TYPE, chat_id: str, only_inacti
                     _caller="billing_current",
                 )
             except Exception:
-                info = None
+                res, err = None, {"kind": "exception", "message": "exception"}
 
+            info = res
             if not isinstance(info, dict):
-                err = get_last_api_error_info() or {}
+                err = err if isinstance(err, dict) else {}
                 try:
                     http_status = int(err.get("http_status") or 0)
                 except Exception:
@@ -45,8 +54,18 @@ async def send_billing(ctx: ContextTypes.DEFAULT_TYPE, chat_id: str, only_inacti
                     code = int(err.get("code") or 0)
                 except Exception:
                     code = 0
+                msg = str(err.get("message") or "")
+                msg_l = msg.lower()
 
-                if http_status == 403 and code == 200:
+                is_no_access = (
+                    http_status == 403
+                    and code == 200
+                    and (
+                        "has not granted" in msg_l
+                        and ("ads_management" in msg_l or "ads_read" in msg_l)
+                    )
+                )
+                if is_no_access:
                     no_access.append(str(aid))
                 else:
                     failed.append(f"{str(aid)}({classify_api_error(err)})")
@@ -94,6 +113,10 @@ async def send_billing(ctx: ContextTypes.DEFAULT_TYPE, chat_id: str, only_inacti
         blocks.append("⚠️ Нет доступа (ads_read): " + ", ".join(no_access))
     if failed:
         blocks.append("⚠️ Ошибки API: " + ", ".join(failed))
+
+    blocks.append(
+        f"debug: enabled={len(enabled_ids)} ok={len(ok_lines)} no_access={len(no_access)} failed={len(failed)}"
+    )
 
     max_len = 3500
     buf = ""
