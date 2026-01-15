@@ -315,6 +315,8 @@ def build_hourly_heatmap_for_account(
 
         coverage_hours = 0
         missing_hours: list[str] = []
+        failed_hours: list[str] = []
+        failed_reasons: dict[str, str] = {}
 
         row_totals: List[int] = []
         row_spends: List[float] = []
@@ -335,8 +337,24 @@ def build_hourly_heatmap_for_account(
                 sp = 0.0
             else:
                 st = str(snap.get("status") or "missing")
-                if st not in {"ready", "ready_low_confidence"}:
+                if st == "failed":
+                    failed_hours.append(f"{h}")
+                    try:
+                        failed_reasons[str(h)] = str(snap.get("reason") or "snapshot_failed")
+                    except Exception:
+                        pass
+                    val = 0
+                    sp = 0.0
+                elif st not in {"ready", "ready_low_confidence"}:
                     missing_hours.append(f"{h}")
+                    val = 0
+                    sp = 0.0
+                elif int(snap.get("rows_count") or 0) <= 0:
+                    failed_hours.append(f"{h}")
+                    try:
+                        failed_reasons[str(h)] = "empty_rows"
+                    except Exception:
+                        pass
                     val = 0
                     sp = 0.0
                 else:
@@ -350,7 +368,8 @@ def build_hourly_heatmap_for_account(
                         row_status = r.get("adset_status")
                         if not include_paused:
                             try:
-                                if row_status and str(row_status).upper() not in {"ACTIVE"}:
+                                st = str(row_status).upper() if row_status is not None else ""
+                                if st and st not in {"ACTIVE", "UNKNOWN"}:
                                     continue
                             except Exception:
                                 pass
@@ -395,6 +414,8 @@ def build_hourly_heatmap_for_account(
                 "spend": day_spend,
                 "coverage_hours": int(coverage_hours),
                 "missing_hours": list(missing_hours),
+                "failed_hours": list(failed_hours),
+                "failed_reasons": dict(failed_reasons),
             }
         )
 
@@ -440,11 +461,29 @@ def build_hourly_heatmap_for_account(
 
         if mode in {"today", "yday"} and matrix:
             miss = (matrix[0] or {}).get("missing_hours") or []
+            failed = (matrix[0] or {}).get("failed_hours") or []
+            failed_reasons = (matrix[0] or {}).get("failed_reasons") or {}
             cov = int((matrix[0] or {}).get("coverage_hours") or 0)
             if cov < 24:
                 miss_s = ", ".join([str(x) for x in (miss or [])])
                 lines.append("")
                 lines.append(f"Данные неполные: missing_hours={miss_s}")
+            if failed:
+                try:
+                    items = []
+                    for hh in failed:
+                        rs = None
+                        try:
+                            rs = (failed_reasons or {}).get(str(hh))
+                        except Exception:
+                            rs = None
+                        if rs:
+                            items.append(f"{hh}({rs})")
+                        else:
+                            items.append(str(hh))
+                    lines.append(f"failed_hours={', '.join(items)}")
+                except Exception:
+                    lines.append(f"failed_hours={', '.join([str(x) for x in failed])}")
 
     text = "\n".join(lines)
 
@@ -469,6 +508,8 @@ def build_hourly_heatmap_for_account(
         "include_paused": include_paused,
         "coverage_hours": int((matrix[0] or {}).get("coverage_hours") or 0) if (mode in {"today", "yday"} and matrix) else None,
         "missing_hours": (matrix[0] or {}).get("missing_hours") if (mode in {"today", "yday"} and matrix) else None,
+        "failed_hours": (matrix[0] or {}).get("failed_hours") if (mode in {"today", "yday"} and matrix) else None,
+        "failed_reasons": (matrix[0] or {}).get("failed_reasons") if (mode in {"today", "yday"} and matrix) else None,
         "live_today": {},
     }
 

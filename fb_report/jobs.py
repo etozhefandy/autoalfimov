@@ -934,6 +934,122 @@ def _ap_heatmap_profile(summary: dict) -> tuple[list[int], list[int]]:
     return top, low
 
 
+def _adset_status_cache_path(aid: str) -> str:
+    return os.path.join(
+        str(os.getenv("DATA_DIR", "")) or "DATA_DIR",
+        "adset_status_cache",
+        f"{str(aid)}.json",
+    )
+
+
+def _load_adset_status_cache(aid: str) -> dict:
+    path = _adset_status_cache_path(str(aid))
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_adset_status_cache(aid: str, obj: dict) -> None:
+    path = _adset_status_cache_path(str(aid))
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2)
+    except Exception:
+        return
+
+
+def _adset_status_map_from_cache(obj: dict) -> dict[str, str]:
+    out: dict[str, str] = {}
+    adsets = (obj or {}).get("adsets")
+    if isinstance(adsets, dict):
+        for k, v in adsets.items():
+            sid = str(k or "")
+            if not sid:
+                continue
+            st = None
+            if isinstance(v, dict):
+                st = v.get("effective_status") or v.get("status")
+            out[sid] = str(st or "UNKNOWN")
+    return out
+
+
+def _is_adset_cache_fresh(obj: dict, *, ttl_hours: int = 6) -> bool:
+    raw = str((obj or {}).get("updated_at") or "")
+    if not raw:
+        return False
+    try:
+        dt = datetime.fromisoformat(raw)
+        if not dt.tzinfo:
+            dt = ALMATY_TZ.localize(dt)
+        dt = dt.astimezone(ALMATY_TZ)
+    except Exception:
+        return False
+    age_s = (datetime.now(ALMATY_TZ) - dt).total_seconds()
+    return age_s >= 0 and age_s <= float(ttl_hours) * 3600.0
+
+
+def _refresh_adset_status_cache(aid: str, *, log: logging.Logger) -> dict[str, str]:
+    try:
+        from facebook_business.adobjects.adaccount import AdAccount
+    except Exception:
+        return {}
+
+    acc = AdAccount(str(aid))
+    fields = ["id", "effective_status", "campaign_id", "name"]
+    params = {"limit": 500}
+    data = safe_api_call(
+        acc.get_ad_sets,
+        fields=fields,
+        params=params,
+        _meta={"endpoint": "adsets", "params": params},
+        _caller="heatmap_snapshot_collector",
+    )
+    out: dict[str, dict] = {}
+    if data:
+        try:
+            items = None
+            try:
+                items = list(data)
+            except Exception:
+                items = data
+            for r in (items or []):
+                if not isinstance(r, dict):
+                    try:
+                        r = dict(r)
+                    except Exception:
+                        continue
+                sid = str(r.get("id") or "")
+                if not sid:
+                    continue
+                out[sid] = {
+                    "effective_status": str(r.get("effective_status") or "UNKNOWN"),
+                    "campaign_id": str(r.get("campaign_id") or ""),
+                    "name": str(r.get("name") or ""),
+                }
+        except Exception:
+            out = {}
+
+    obj = {
+        "account_id": str(aid),
+        "updated_at": datetime.now(ALMATY_TZ).isoformat(),
+        "adsets": out,
+    }
+    _save_adset_status_cache(str(aid), obj)
+    try:
+        log.info(
+            "🟦 FB ADSET STATUS CACHE UPDATED aid=%s adsets=%s",
+            str(aid),
+            str(int(len(out or {}))),
+        )
+    except Exception:
+        pass
+    return _adset_status_map_from_cache(obj)
+
+
 async def _heatmap_snapshot_collector_job(
     context: ContextTypes.DEFAULT_TYPE,
     *,
@@ -1031,6 +1147,13 @@ async def _heatmap_snapshot_collector_job(
             if not isinstance(err, dict):
                 err = {"type": "api_error"}
 
+            existing_reason = str((snap or {}).get("reason") or "")
+            existing_type = str((err or {}).get("type") or "")
+            is_invalid_fields = existing_reason in {"invalid_fields", "fb_invalid_fields"} or existing_type in {
+                "invalid_fields",
+                "fb_invalid_fields",
+            }
+
             has_any = False
             try:
                 has_any = bool(snap.get("rows")) and float(snap.get("spend") or 0.0) > 0.0
@@ -1045,8 +1168,13 @@ async def _heatmap_snapshot_collector_job(
             else:
                 snap["status"] = "failed"
                 et = str((err or {}).get("type") or "api_error")
-                snap["reason"] = "rate_limit" if et == "rate_limit" else "snapshot_failed"
-                snap["error"] = err
+                if is_invalid_fields:
+                    snap["reason"] = "fb_invalid_fields"
+                    snap["error"] = err
+                    snap["next_try_at"] = snap.get("next_try_at")
+                else:
+                    snap["reason"] = "rate_limit" if et == "rate_limit" else "snapshot_failed"
+                    snap["error"] = err
             save_snapshot(snap)
 
             hh = f"{int(hour_int):02d}"
@@ -1059,9 +1187,10 @@ async def _heatmap_snapshot_collector_job(
                 "snapshot.json",
             )
             log.info(
-                "🟦 SNAPSHOT SAVED aid=%s status=%s rows=%s spend=%s window=%s path=%s",
+                "🟦 SNAPSHOT SAVED aid=%s status=%s reason=%s rows=%s spend=%s window=%s path=%s",
                 str(aid),
                 str(snap.get("status") or ""),
+                str(snap.get("reason") or ""),
                 str(int(snap.get("rows_count") or 0)),
                 str(float(snap.get("spend") or 0.0)),
                 str(window_label),
@@ -1155,6 +1284,18 @@ async def _heatmap_snapshot_collector_job(
         except Exception:
             lead_action_type = None
 
+        adset_status_map: dict[str, str] = {}
+        try:
+            cache_obj = _load_adset_status_cache(str(aid))
+            adset_status_map = _adset_status_map_from_cache(cache_obj)
+            if not _is_adset_cache_fresh(cache_obj, ttl_hours=6):
+                with allow_fb_api_calls(reason="heatmap_snapshot_collector_adset_status"):
+                    refreshed = _refresh_adset_status_cache(str(aid), log=log)
+                if refreshed:
+                    adset_status_map = dict(refreshed)
+        except Exception:
+            adset_status_map = {}
+
         data = None
         with allow_fb_api_calls(reason="heatmap_snapshot_collector"):
             if max_calls > 0:
@@ -1172,24 +1313,23 @@ async def _heatmap_snapshot_collector_job(
                     fields = [
                         "spend",
                         "actions",
-                        "cost_per_action_type",
                         "impressions",
                         "clicks",
                         "frequency",
                         "adset_id",
                         "adset_name",
-                        "adset_effective_status",
                         "campaign_id",
                         "campaign_name",
                     ]
                     try:
                         log.info(
-                            "🟦 FB REQUEST aid=%s endpoint=%s date=%s hour=%s window=%s",
+                            "🟦 FB REQUEST aid=%s endpoint=%s date=%s hour=%s window=%s fields=%s",
                             str(aid),
                             "insights/adset/hourly",
                             str(date_str),
                             str(int(hour_int)),
                             str(window_label),
+                            str(",".join([str(x) for x in (fields or [])])),
                         )
                     except Exception:
                         pass
@@ -1202,6 +1342,19 @@ async def _heatmap_snapshot_collector_job(
                     )
                 except Exception:
                     data = None
+
+        if not data:
+            info = get_last_api_error_info() or {}
+            try:
+                log.warning(
+                    "🟦 FB ERROR aid=%s fb_code=%s message=%s window=%s",
+                    str(aid),
+                    str((info or {}).get("code")),
+                    str((info or {}).get("message") or ""),
+                    str(window_label),
+                )
+            except Exception:
+                pass
 
         rows_out: list[dict] = []
         if data:
@@ -1250,11 +1403,16 @@ async def _heatmap_snapshot_collector_job(
                     continue
                 blended_total = int((started_conversations or 0) + (website_submit or 0))
                 spend = float(parsed.get("spend") or 0.0)
+                stt = None
+                try:
+                    stt = adset_status_map.get(str(adset_id))
+                except Exception:
+                    stt = None
                 rows_out.append(
                     {
                         "adset_id": adset_id,
                         "name": (d or {}).get("adset_name") or (d or {}).get("name"),
-                        "adset_status": (d or {}).get("adset_effective_status") or (d or {}).get("adset_status"),
+                        "adset_status": str(stt or "UNKNOWN"),
                         "campaign_id": (d or {}).get("campaign_id"),
                         "campaign_name": (d or {}).get("campaign_name"),
                         "spend": spend,
@@ -1271,10 +1429,12 @@ async def _heatmap_snapshot_collector_job(
 
         try:
             log.info(
-                "🟦 FB RESPONSE aid=%s rows=%s spend=%s",
+                "🟦 FB RESPONSE aid=%s endpoint=%s rows=%s spend=%s window=%s",
                 str(aid),
+                "insights/adset/hourly",
                 str(int(len(rows_out or []))),
                 str(float(sum(float((r or {}).get("spend") or 0.0) for r in (rows_out or [])))),
+                str(window_label),
             )
         except Exception:
             pass
@@ -1346,13 +1506,61 @@ async def _heatmap_snapshot_collector_job(
                 et = str(classify_api_error(info))
             except Exception:
                 et = "api_error"
-            snap["error"] = {
-                "type": et,
-                "fb_code": (info or {}).get("code"),
-                "fb_subcode": (info or {}).get("subcode"),
-                "fbtrace_id": (info or {}).get("fbtrace_id"),
-            }
-            snap["reason"] = "rate_limit" if et == "rate_limit" else "snapshot_collecting"
+
+            code = None
+            msg = ""
+            try:
+                code = int((info or {}).get("code") or 0)
+            except Exception:
+                code = None
+            try:
+                msg = str((info or {}).get("message") or "")
+            except Exception:
+                msg = ""
+
+            invalid_fields = False
+            try:
+                invalid_fields = bool(code == 100) and ("not valid" in msg.lower()) and ("fields" in msg.lower())
+            except Exception:
+                invalid_fields = False
+
+            if invalid_fields:
+                snap["status"] = "failed"
+                snap["reason"] = "fb_invalid_fields"
+                snap["error"] = {
+                    "type": "fb_invalid_fields",
+                    "fb_code": (info or {}).get("code"),
+                    "fb_subcode": (info or {}).get("subcode"),
+                    "fbtrace_id": (info or {}).get("fbtrace_id"),
+                    "message": msg,
+                }
+                snap["meta"] = {
+                    "fb_code": (info or {}).get("code"),
+                    "fbtrace_id": (info or {}).get("fbtrace_id"),
+                    "message": msg,
+                }
+                try:
+                    snap["next_try_at"] = (now + timedelta(hours=6)).isoformat()
+                except Exception:
+                    snap["next_try_at"] = None
+                try:
+                    log.warning(
+                        "🟦 FB ERROR aid=%s fb_code=%s message=%s window=%s",
+                        str(aid),
+                        str(code),
+                        str(msg),
+                        str(window_label),
+                    )
+                except Exception:
+                    pass
+            else:
+                snap["error"] = {
+                    "type": et,
+                    "fb_code": (info or {}).get("code"),
+                    "fb_subcode": (info or {}).get("subcode"),
+                    "fbtrace_id": (info or {}).get("fbtrace_id"),
+                }
+                snap["reason"] = "rate_limit" if et == "rate_limit" else "snapshot_collecting"
 
         save_snapshot(snap)
 
@@ -1366,9 +1574,10 @@ async def _heatmap_snapshot_collector_job(
             "snapshot.json",
         )
         log.info(
-            "🟦 SNAPSHOT SAVED aid=%s status=%s rows=%s spend=%s window=%s path=%s",
+            "🟦 SNAPSHOT SAVED aid=%s status=%s reason=%s rows=%s spend=%s window=%s path=%s",
             str(aid),
             str(snap.get("status") or ""),
+            str(snap.get("reason") or ""),
             str(int(snap.get("rows_count") or 0)),
             str(float(snap.get("spend") or 0.0)),
             str(window_label),

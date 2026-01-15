@@ -3185,8 +3185,12 @@ def _build_heatmap_debug_last_text(*, aid: str) -> str:
                 continue
             if active_only:
                 stt = r.get("adset_status")
-                if stt and str(stt).upper() not in {"ACTIVE"}:
-                    continue
+                try:
+                    st = str(stt).upper() if stt is not None else ""
+                    if st and st not in {"ACTIVE", "UNKNOWN"}:
+                        continue
+                except Exception:
+                    pass
             used += 1
             try:
                 started += int(r.get("started_conversations") or r.get("msgs") or 0)
@@ -3243,6 +3247,10 @@ def _build_heatmap_debug_last_text(*, aid: str) -> str:
     snap_hour = str(last_snap.get("hour") or "")
     snap_status = str(last_snap.get("status") or "")
     snap_reason = str(last_snap.get("reason") or "")
+    snap_attempts = str(last_snap.get("attempts") or "")
+    snap_last_try = str(last_snap.get("last_try_at") or "")
+    snap_next_try = str(last_snap.get("next_try_at") or "")
+    snap_deadline = str(last_snap.get("deadline_at") or "")
     snap_rows = last_snap.get("rows") or []
 
     st_all, ws_all, sp_all, used_all = _sum_rows(list(snap_rows), active_only=False)
@@ -3257,6 +3265,9 @@ def _build_heatmap_debug_last_text(*, aid: str) -> str:
     lines.append("")
     lines.append(f"last_snapshot_date={snap_date} hour={snap_hour}")
     lines.append(f"snapshot_status={snap_status} snapshot_reason={snap_reason}")
+    lines.append(f"attempts={snap_attempts} last_try_at={snap_last_try} next_try_at={snap_next_try}")
+    if snap_deadline:
+        lines.append(f"deadline_at={snap_deadline}")
     lines.append(f"computed_status={computed_status} computed_reason={computed_reason}")
     lines.append(f"rows_count={int(len(snap_rows) or 0)}")
 
