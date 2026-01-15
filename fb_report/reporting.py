@@ -29,6 +29,8 @@ from .insights import (
     _blend_totals,
 )
 
+from services.analytics import count_leads_from_actions, count_started_conversations_from_actions
+
 from services.facebook_api import allow_fb_api_calls, fetch_insights_bulk, safe_api_call
 
 
@@ -251,7 +253,7 @@ def build_report_debug(aid: str, kind: str, mode: str = "general") -> str:
     impr = 0
     clicks = 0
     started = 0
-    website = 0
+    leads_sel = 0
     for r in rows or []:
         if not isinstance(r, dict):
             continue
@@ -273,7 +275,7 @@ def build_report_debug(aid: str, kind: str, mode: str = "general") -> str:
         except Exception:
             pass
         try:
-            website += int(acts.get("offsite_conversion.fb_pixel_submit_application", 0) or 0)
+            leads_sel += int(count_leads_from_actions(acts, aid=str(aid), lead_action_type=None) or 0)
         except Exception:
             pass
 
@@ -296,8 +298,86 @@ def build_report_debug(aid: str, kind: str, mode: str = "general") -> str:
     lines.append(f"sum_impressions={int(impr)}")
     lines.append(f"sum_clicks={int(clicks)}")
     lines.append(f"started_conversations_7d={int(started)}")
-    lines.append(f"website_submit_applications={int(website)}")
+    lines.append(f"leads_selected={int(leads_sel)}")
     return "\n".join(lines)
+
+
+def _lead_cpl_account_level(aid: str, period_for_api: Any) -> tuple[int, float, float | None]:
+    """Returns (leads_total, spend_leads_only, cpl)."""
+    rows: list[dict] = []
+    params_extra = {
+        "action_report_time": "conversion",
+        "use_unified_attribution_setting": True,
+    }
+    with allow_fb_api_calls(reason="reporting_lead_cpl"):
+        rows = fetch_insights_bulk(
+            str(aid),
+            period=period_for_api,
+            level="campaign",
+            fields=["spend", "actions"],
+            params_extra=dict(params_extra),
+        )
+
+    leads_total = 0
+    spend_leads_only = 0.0
+    for r in (rows or []):
+        if not isinstance(r, dict):
+            continue
+        acts = extract_actions(r)
+        leads = 0
+        try:
+            leads = int(count_leads_from_actions(acts, aid=str(aid), lead_action_type=None) or 0)
+        except Exception:
+            leads = 0
+        if leads <= 0:
+            continue
+        leads_total += int(leads)
+        try:
+            spend_leads_only += float(r.get("spend") or 0.0)
+        except Exception:
+            pass
+
+    cpl = (spend_leads_only / float(leads_total)) if (leads_total > 0 and spend_leads_only > 0) else None
+    return int(leads_total), float(spend_leads_only), cpl
+
+
+def _msg_cps_account_level(aid: str, period_for_api: Any) -> tuple[int, float, float | None]:
+    """Returns (msgs_total, spend_msgs_only, cps)."""
+    rows: list[dict] = []
+    params_extra = {
+        "action_report_time": "conversion",
+        "use_unified_attribution_setting": True,
+    }
+    with allow_fb_api_calls(reason="reporting_msg_cps"):
+        rows = fetch_insights_bulk(
+            str(aid),
+            period=period_for_api,
+            level="campaign",
+            fields=["spend", "actions"],
+            params_extra=dict(params_extra),
+        )
+
+    msgs_total = 0
+    spend_msgs_only = 0.0
+    for r in (rows or []):
+        if not isinstance(r, dict):
+            continue
+        acts = extract_actions(r)
+        msgs = 0
+        try:
+            msgs = int(count_started_conversations_from_actions(acts) or 0)
+        except Exception:
+            msgs = 0
+        if msgs <= 0:
+            continue
+        msgs_total += int(msgs)
+        try:
+            spend_msgs_only += float(r.get("spend") or 0.0)
+        except Exception:
+            pass
+
+    cps = (spend_msgs_only / float(msgs_total)) if (msgs_total > 0 and spend_msgs_only > 0) else None
+    return int(msgs_total), float(spend_msgs_only), cps
 
 
 # ========== КЭШ ТЕКСТОВЫХ ОТЧЁТОВ ==========
@@ -396,12 +476,23 @@ def build_report(aid: str, period, label: str = "") -> str:
     # (он уже использует те же action_type, что и раньше).
     _, msgs, leads, total_conv, blended_cpa = _blend_totals(ins, aid=aid)
 
-    msg_action = "onsite_conversion.messaging_conversation_started_7d"
-    msg_cpa = costs.get(msg_action)
-    if msgs <= 0:
-        msg_cpa = None
-
     lead_cpa = None
+    msg_cpa = None
+    try:
+        meta = ins.get("_meta") if isinstance(ins, dict) else None
+        period_for_api = None
+        if isinstance(meta, dict):
+            period_for_api = meta.get("period_effective")
+        if period_for_api is None:
+            period_for_api = period
+
+        _msgs_cnt, _spend_msgs_only, cps = _msg_cps_account_level(str(aid), period_for_api)
+        msg_cpa = cps
+        _leads_cnt, _spend_leads_only, cpl = _lead_cpl_account_level(str(aid), period_for_api)
+        lead_cpa = cpl
+    except Exception:
+        lead_cpa = None
+        msg_cpa = None
 
     body = []
     body.append(f"👁 Показы: {fmt_int(impressions)}")
@@ -431,7 +522,7 @@ def build_report(aid: str, period, label: str = "") -> str:
 
     if flags["leads"]:
         body.append(f"♿️ Лиды: {leads}")
-        if lead_cpa is not None and float(lead_cpa) > 0:
+        if lead_cpa is not None and float(lead_cpa) > 0 and int(leads or 0) > 0:
             body.append(f"♿️💲 Цена лида: $ {float(lead_cpa):.2f}")
         else:
             body.append("♿️💲 Цена лида: —")
@@ -702,34 +793,92 @@ def build_account_report(
             nm = str((r or {}).get(name_field) or (r or {}).get("name") or k)
             a = agg.setdefault(
                 k,
-                {"id": k, "name": nm, "spend": 0.0, "msgs": 0, "leads": 0, "total": 0, "msg_cpa": None, "lead_cpa": None},
+                {
+                    "id": k,
+                    "name": nm,
+                    "spend": 0.0,
+                    "spend_for_msgs": 0.0,
+                    "spend_for_leads": 0.0,
+                    "msgs": 0,
+                    "leads": 0,
+                    "total": 0,
+                    "msg_cpa": None,
+                    "lead_cpa": None,
+                },
             )
             try:
                 a["spend"] = float(a.get("spend") or 0.0) + float((r or {}).get("spend") or 0.0)
             except Exception:
                 pass
+
+            row_msgs = 0
             try:
-                a["msgs"] = int(a.get("msgs") or 0) + int(
-                    (r or {}).get("started_conversations") or (r or {}).get("msgs") or 0
-                )
+                row_msgs = int((r or {}).get("started_conversations") or (r or {}).get("msgs") or 0)
+            except Exception:
+                row_msgs = 0
+            row_leads = 0
+            try:
+                actions_map = (r or {}).get("actions")
+                if isinstance(actions_map, dict) and actions_map:
+                    row_leads = int(count_leads_from_actions(actions_map, aid=str(aid), lead_action_type=None) or 0)
+                else:
+                    row_leads = int((r or {}).get("website_submit_applications") or (r or {}).get("leads") or 0)
+            except Exception:
+                row_leads = 0
+
+            try:
+                a["msgs"] = int(a.get("msgs") or 0) + int(row_msgs or 0)
             except Exception:
                 pass
             try:
-                a["leads"] = int(a.get("leads") or 0) + int(
-                    (r or {}).get("website_submit_applications") or (r or {}).get("leads") or 0
-                )
+                a["leads"] = int(a.get("leads") or 0) + int(row_leads or 0)
             except Exception:
                 pass
+
+            # TЗ-3: attribute spend only to objectives that happened in this row.
+            try:
+                row_spend = float((r or {}).get("spend") or 0.0)
+            except Exception:
+                row_spend = 0.0
+            if row_msgs > 0 and row_spend > 0:
+                try:
+                    a["spend_for_msgs"] = float(a.get("spend_for_msgs") or 0.0) + float(row_spend)
+                except Exception:
+                    pass
+            if row_leads > 0 and row_spend > 0:
+                try:
+                    a["spend_for_leads"] = float(a.get("spend_for_leads") or 0.0) + float(row_spend)
+                except Exception:
+                    pass
             try:
                 t = (r or {}).get("total")
                 if t is None:
-                    t = int((r or {}).get("started_conversations") or (r or {}).get("msgs") or 0) + int(
-                        (r or {}).get("website_submit_applications") or (r or {}).get("leads") or 0
-                    )
+                    t = int(row_msgs or 0) + int(row_leads or 0)
                 a["total"] = int(a.get("total") or 0) + int(t or 0)
             except Exception:
                 pass
-        return list(agg.values())
+
+        out = list(agg.values())
+        for it in out:
+            try:
+                sp_msgs = float(it.get("spend_for_msgs") or 0.0)
+            except Exception:
+                sp_msgs = 0.0
+            try:
+                sp_leads = float(it.get("spend_for_leads") or 0.0)
+            except Exception:
+                sp_leads = 0.0
+            try:
+                ms = int(it.get("msgs") or 0)
+            except Exception:
+                ms = 0
+            try:
+                ld = int(it.get("leads") or 0)
+            except Exception:
+                ld = 0
+            it["msg_cpa"] = (sp_msgs / float(ms)) if (ms > 0 and sp_msgs > 0) else None
+            it["lead_cpa"] = (sp_leads / float(ld)) if (ld > 0 and sp_leads > 0) else None
+        return out
 
     camps = _group_rows("campaign_id", "campaign_name")
 

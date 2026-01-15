@@ -90,7 +90,8 @@ def _blend_totals(ins: dict, *, aid: Optional[str] = None):
 
     msgs = int(count_started_conversations_from_actions(acts) or 0)
 
-    leads = int(count_website_submit_applications_from_actions(acts) or 0)
+    # Standard leads (Submit Application / Lead) across global LEAD_ACTION_TYPES.
+    leads = int(count_leads_from_actions(acts, aid=aid, lead_action_type=None) or 0)
 
     total = msgs + leads
     blended = (spend / total) if total > 0 else None
@@ -196,14 +197,22 @@ def _get_daily_stats_from_snapshots(aid: str, day: datetime) -> Optional[Dict[st
                 except Exception:
                     pass
                 try:
-                    leads += int(r.get("website_submit_applications") or r.get("leads") or 0)
+                    actions_map = (r or {}).get("actions")
+                    if isinstance(actions_map, dict) and actions_map:
+                        leads += int(count_leads_from_actions(actions_map, aid=str(aid), lead_action_type=None) or 0)
+                    else:
+                        leads += int(r.get("website_submit_applications") or r.get("leads") or 0)
                 except Exception:
                     pass
                 try:
                     t = r.get("total")
                     if t is None:
                         t = int(r.get("started_conversations") or r.get("msgs") or 0) + int(
-                            r.get("website_submit_applications") or r.get("leads") or 0
+                            (
+                                int(count_leads_from_actions((r or {}).get("actions") or {}, aid=str(aid), lead_action_type=None) or 0)
+                                if isinstance((r or {}).get("actions"), dict)
+                                else int(r.get("website_submit_applications") or r.get("leads") or 0)
+                            )
                         )
                     total += int(t or 0)
                 except Exception:
@@ -378,7 +387,11 @@ def build_hourly_heatmap_for_account(
                         except Exception:
                             pass
                         try:
-                            website += int(r.get("website_submit_applications") or r.get("leads") or 0)
+                            actions_map = (r or {}).get("actions")
+                            if isinstance(actions_map, dict) and actions_map:
+                                website += int(count_leads_from_actions(actions_map, aid=str(aid), lead_action_type=None) or 0)
+                            else:
+                                website += int(r.get("website_submit_applications") or r.get("leads") or 0)
                         except Exception:
                             pass
                         try:

@@ -30,7 +30,7 @@ try:  # pragma: no cover
     from services.analytics import (
         parse_insight,
         count_started_conversations_from_actions,
-        count_website_submit_applications_from_actions,
+        count_leads_from_actions,
     )
     from services.facebook_api import (
         is_rate_limited_now,
@@ -729,6 +729,7 @@ def _ap_hourly_bucket(stats: dict, *, section: str, aid: str, entity_id: str, da
 
 def _ap_hourly_agg(stats: dict, *, section: str, aid: str, entity_id: str, now: datetime, hour_key: str, days: int) -> dict:
     spend = 0.0
+    spend_for_leads = 0.0
     total = 0
     msgs = 0
     leads = 0
@@ -752,8 +753,19 @@ def _ap_hourly_agg(stats: dict, *, section: str, aid: str, entity_id: str, now: 
         except Exception:
             pass
 
-    cpl = (spend / float(total)) if total > 0 and spend > 0 else None
-    return {"spend": spend, "total": total, "messages": msgs, "leads": leads, "cpl": cpl}
+        try:
+            b_spend = float((b or {}).get("spend", 0.0) or 0.0)
+        except Exception:
+            b_spend = 0.0
+        try:
+            b_leads = int((b or {}).get("leads", 0) or 0)
+        except Exception:
+            b_leads = 0
+        if b_leads > 0 and b_spend > 0:
+            spend_for_leads += float(b_spend)
+
+    cpl = (spend_for_leads / float(leads)) if leads > 0 and spend_for_leads > 0 else None
+    return {"spend": spend, "spend_for_leads": spend_for_leads, "total": total, "messages": msgs, "leads": leads, "cpl": cpl}
 
 
 def _ap_select_hourly_good_bad_adsets(
@@ -1406,15 +1418,8 @@ async def _heatmap_snapshot_collector_job(
 
             calls_used = 0
 
+            # Standard leads are global; do not depend on per-account selection.
             lead_action_type = None
-            try:
-                from fb_report.storage import get_lead_metric_for_account
-
-                sel = get_lead_metric_for_account(str(aid))
-                if isinstance(sel, dict):
-                    lead_action_type = sel.get("action_type")
-            except Exception:
-                lead_action_type = None
 
             adset_status_map: dict[str, str] = {}
             try:
@@ -1571,7 +1576,7 @@ async def _heatmap_snapshot_collector_job(
                         started_conversations = int(parsed.get("msgs") or 0)
 
                     try:
-                        website_submit = int(count_website_submit_applications_from_actions(actions_map) or 0)
+                        website_submit = int(count_leads_from_actions(actions_map, aid=str(aid), lead_action_type=None) or 0)
                     except Exception:
                         website_submit = 0
 
@@ -1585,24 +1590,24 @@ async def _heatmap_snapshot_collector_job(
                         stt = adset_status_map.get(str(adset_id))
                     except Exception:
                         stt = None
-                    rows_out.append(
-                        {
-                            "adset_id": adset_id,
-                            "name": (d or {}).get("adset_name") or (d or {}).get("name"),
-                            "adset_status": str(stt or "UNKNOWN"),
-                            "campaign_id": (d or {}).get("campaign_id"),
-                            "campaign_name": (d or {}).get("campaign_name"),
-                            "spend": spend,
-                            "started_conversations": int(started_conversations or 0),
-                            "website_submit_applications": int(website_submit or 0),
-                            "msgs": int(started_conversations or 0),
-                            "leads": int(website_submit or 0),
-                            "total": int(blended_total or 0),
-                            "results": int(blended_total or 0),
-                            "cpl": parsed.get("cpa"),
-                            "hour": int(target_hour_int),
-                        }
-                    )
+                    row_out = {
+                        "adset_id": adset_id,
+                        "name": (d or {}).get("adset_name") or (d or {}).get("name"),
+                        "adset_status": str(stt or "UNKNOWN"),
+                        "campaign_id": (d or {}).get("campaign_id"),
+                        "campaign_name": (d or {}).get("campaign_name"),
+                        "spend": spend,
+                        "started_conversations": int(started_conversations or 0),
+                        "website_submit_applications": int(website_submit or 0),
+                        "actions": dict(actions_map or {}),
+                        "msgs": int(started_conversations or 0),
+                        "leads": int(website_submit or 0),
+                        "total": int(blended_total or 0),
+                        "results": int(blended_total or 0),
+                        "cpl": parsed.get("cpa"),
+                        "hour": int(target_hour_int),
+                    }
+                    rows_out.append(row_out)
 
             try:
                 log.info(

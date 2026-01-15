@@ -107,6 +107,19 @@ EXCLUDED_NAME_KEYWORDS = {"kense", "кенсе"}
 
 # ========= ВЕРСИЯ БОТА / ФУНКЦИОНАЛ =========
 
+
+# ========= ГЛОБАЛЬНЫЕ ACTION TYPES =========
+
+# Стандартные pixel events Meta, которые считаем как "Лиды/Отправить заявку".
+# Этот список не редактируется пользователем и используется везде.
+LEAD_ACTION_TYPES = {
+    "lead",
+    "omni_lead",
+    "submit_application",
+    "offsite_conversion.fb_pixel_lead",
+    "offsite_conversion.fb_pixel_submit_application",
+}
+
 BOT_VERSION = "1.3.0"
 
 # Список строк, которые показываются по кнопке "ℹ️ Версия" в боте.

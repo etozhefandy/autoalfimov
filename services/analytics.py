@@ -12,11 +12,17 @@ from services.facebook_api import (
     fetch_campaigns,
 )
 from services.storage import load_accounts
-from fb_report.constants import ALMATY_TZ
+from fb_report.constants import ALMATY_TZ, LEAD_ACTION_TYPES
 
 
 STARTED_CONVERSATIONS_ACTION_TYPE = "onsite_conversion.messaging_conversation_started_7d"
-WEBSITE_SUBMIT_APPLICATIONS_ACTION_TYPE = "offsite_conversion.fb_pixel_submit_application"
+
+
+def _is_standard_leads_mode(lead_action_type: Optional[str]) -> bool:
+    at = str(lead_action_type or "").strip()
+    if not at:
+        return True
+    return False
 
 
 def count_started_conversations_from_actions(actions: Dict[str, float]) -> int:
@@ -27,10 +33,8 @@ def count_started_conversations_from_actions(actions: Dict[str, float]) -> int:
 
 
 def count_website_submit_applications_from_actions(actions: Dict[str, float]) -> int:
-    try:
-        return int(float((actions or {}).get(WEBSITE_SUBMIT_APPLICATIONS_ACTION_TYPE, 0) or 0))
-    except Exception:
-        return 0
+    # Legacy name, but now "website submit applications" is treated as standard leads.
+    return int(count_leads_from_actions(actions, aid=None, lead_action_type=None) or 0)
 
 
 def _parse_action_type_patterns(raw: str) -> Tuple[set[str], List[str]]:
@@ -51,11 +55,9 @@ def _parse_action_type_patterns(raw: str) -> Tuple[set[str], List[str]]:
 
 
 def _lead_action_patterns() -> Tuple[set[str], List[str]]:
-    raw = os.getenv(
-        "FB_LEAD_ACTION_TYPES",
-        "Website Submit Applications,offsite_conversion.fb_pixel_submit_application,offsite_conversion.fb_pixel_lead,lead,submit_application,offsite_conversion.custom.*",
-    )
-    return _parse_action_type_patterns(raw)
+    # Deprecated: kept only for backward-compatibility of return type.
+    # New global behavior uses LEAD_ACTION_TYPES.
+    return set(LEAD_ACTION_TYPES), []
 
 
 def _is_match(action_type: str, exact: set[str], prefixes: List[str]) -> bool:
@@ -100,12 +102,11 @@ def count_leads_from_actions(
         if not t:
             continue
 
-        if lead_action_type:
-            if str(t) != str(lead_action_type):
+        if _is_standard_leads_mode(lead_action_type):
+            if str(t) not in LEAD_ACTION_TYPES:
                 continue
         else:
-            lead_exact, lead_prefixes = _lead_action_patterns()
-            if not _is_match(str(t), lead_exact, lead_prefixes):
+            if str(t) != str(lead_action_type):
                 continue
 
         try:
@@ -132,12 +133,11 @@ def lead_cost_and_count(
         if not t:
             continue
 
-        if lead_action_type:
-            if str(t) != str(lead_action_type):
+        if _is_standard_leads_mode(lead_action_type):
+            if str(t) not in LEAD_ACTION_TYPES:
                 continue
         else:
-            lead_exact, lead_prefixes = _lead_action_patterns()
-            if not _is_match(str(t), lead_exact, lead_prefixes):
+            if str(t) != str(lead_action_type):
                 continue
         try:
             cnt = int(float(v or 0))

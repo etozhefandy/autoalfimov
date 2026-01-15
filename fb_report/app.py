@@ -478,11 +478,15 @@ def _ap_generate_actions(
 
         sp_t = _to_float((r or {}).get("spend"))
         ld_t = _kpi_count(r)
-        cpl_t = (r or {}).get("cpl")
-        try:
-            cpl_t = float(cpl_t) if cpl_t not in (None, "") else _cpl(sp_t, ld_t)
-        except Exception:
-            cpl_t = _cpl(sp_t, ld_t)
+        # В heatmap cache поле cpl может быть blended (msgs+leads).
+        # Для KPI=leads считаем CPL строго по лидам.
+        cpl_t = None
+        if kpi_mode == "leads":
+            cpl_t = _cpl(sp_t, _to_int((r or {}).get("leads")))
+        elif kpi_mode == "msgs":
+            cpl_t = _cpl(sp_t, _to_int((r or {}).get("msgs")))
+        else:
+            cpl_t = _cpl(sp_t, _to_int((r or {}).get("total")))
 
         if sp_t <= 0:
             continue
@@ -1074,14 +1078,29 @@ def _autopilot_analysis_text(aid: str) -> str:
     if group_campaign_set:
         rows = [r for r in rows if str((r or {}).get("campaign_id") or "") in group_campaign_set]
 
+    def _row_spend_for_kpi(row: dict) -> float:
+        try:
+            if kpi_mode == "msgs":
+                return float((row or {}).get("spend_for_msgs") or (row or {}).get("spend") or 0.0)
+            if kpi_mode == "leads":
+                return float((row or {}).get("spend_for_leads") or (row or {}).get("spend") or 0.0)
+            return float((row or {}).get("spend_for_total") or (row or {}).get("spend") or 0.0)
+        except Exception:
+            return float((row or {}).get("spend") or 0.0)
+
     sum_spend = 0.0
     sum_kpi = 0
     for r in rows:
+        kpi_v = int(_kpi_count_row(r))
+        if kpi_mode == "leads" and kpi_v <= 0:
+            continue
+        if kpi_mode == "msgs" and kpi_v <= 0:
+            continue
         try:
-            sum_spend += float((r or {}).get("spend") or 0.0)
+            sum_spend += float(_row_spend_for_kpi(r) or 0.0)
         except Exception:
             pass
-        sum_kpi += int(_kpi_count_row(r))
+        sum_kpi += int(kpi_v)
     cpl = (float(sum_spend) / float(sum_kpi)) if (sum_spend > 0 and sum_kpi > 0) else None
 
     lines.append(f"Итого: spend {_fmt_money(sum_spend)} | results {sum_kpi} | CPL {_fmt_money(cpl)}")
@@ -1094,7 +1113,7 @@ def _autopilot_analysis_text(aid: str) -> str:
     lines.append("Топ adset по spend:")
     for r in rows[:12]:
         name = str((r or {}).get("name") or (r or {}).get("adset_id") or "")
-        sp = float((r or {}).get("spend") or 0.0)
+        sp = float(_row_spend_for_kpi(r) or 0.0)
         kpi = _kpi_count_row(r)
         cpl_r = (sp / float(kpi)) if (sp > 0 and kpi > 0) else None
         lines.append(f"• {name}: spend {_fmt_money(sp)} | results {kpi} | CPL {_fmt_money(cpl_r)}")
@@ -3315,6 +3334,50 @@ async def cmd_billing(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_billing_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _allowed(update):
+        return
+    try:
+        import os
+        import json
+        from fb_report.constants import DATA_DIR
+        from datetime import datetime
+
+        path = os.path.join(DATA_DIR, "billing_followups.json")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                obj = json.load(f)
+        except Exception:
+            obj = {}
+
+        followups = obj.get("followups") if isinstance(obj, dict) else None
+        if not isinstance(followups, dict):
+            followups = {}
+
+        items = []
+        for aid, it in followups.items():
+            if not isinstance(it, dict):
+                continue
+            due = str(it.get("due_at") or "")
+            items.append((str(aid), due))
+        items.sort(key=lambda x: x[1])
+
+        lines = []
+        lines.append(f"FB_API_DEFAULT_DENY={str(os.getenv('FB_API_DEFAULT_DENY','1'))}")
+        lines.append(f"BILLING_COOLDOWN_HOURS={str(os.getenv('BILLING_COOLDOWN_HOURS','8'))}")
+        lines.append(f"followups_file={path}")
+        lines.append(f"pending_followups={len(items)}")
+        if items:
+            lines.append("next_due:")
+            for aid, due in items[:10]:
+                lines.append(f"- {aid}: {due}")
+        lines.append(f"now={datetime.now(ALMATY_TZ).isoformat()}")
+
+        await update.message.reply_text("\n".join(lines))
+    except Exception as e:
+        await update.message.reply_text(f"billing_debug_error: {type(e).__name__}: {e}")
+
+
 async def cmd_version(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _allowed(update):
         return
@@ -5008,6 +5071,9 @@ async def _on_cb_internal(
             msgs_sum = 0
             leads_sum = 0
             total_sum = 0
+            spend_for_msgs_sum = 0.0
+            spend_for_leads_sum = 0.0
+            spend_for_total_sum = 0.0
             for r in rows:
                 try:
                     spend_sum += float((r or {}).get("spend") or 0.0)
@@ -5026,7 +5092,20 @@ async def _on_cb_internal(
                 except Exception:
                     pass
 
-            cpl_total = (spend_sum / float(total_sum)) if (total_sum > 0 and spend_sum > 0) else None
+                try:
+                    spend_for_msgs_sum += float((r or {}).get("spend_for_msgs") or (float((r or {}).get("spend") or 0.0) if int((r or {}).get("msgs") or 0) > 0 else 0.0))
+                except Exception:
+                    pass
+                try:
+                    spend_for_leads_sum += float((r or {}).get("spend_for_leads") or (float((r or {}).get("spend") or 0.0) if int((r or {}).get("leads") or 0) > 0 else 0.0))
+                except Exception:
+                    pass
+                try:
+                    spend_for_total_sum += float((r or {}).get("spend_for_total") or (float((r or {}).get("spend") or 0.0) if int((r or {}).get("total") or 0) > 0 else 0.0))
+                except Exception:
+                    pass
+
+            cpl_total = (spend_for_total_sum / float(total_sum)) if (total_sum > 0 and spend_for_total_sum > 0) else None
 
             if level == "account":
                 data_for_analysis = {
@@ -5046,6 +5125,9 @@ async def _on_cb_internal(
                     },
                     "totals": {
                         "spend": spend_sum,
+                        "spend_for_msgs": spend_for_msgs_sum,
+                        "spend_for_leads": spend_for_leads_sum,
+                        "spend_for_total": spend_for_total_sum,
                         "msgs": msgs_sum,
                         "leads": leads_sum,
                         "total": total_sum,
@@ -5083,19 +5165,25 @@ async def _on_cb_internal(
                             "campaign_id": cid,
                             "name": (r or {}).get("campaign_name") or cid,
                             "spend": 0.0,
+                            "spend_for_msgs": 0.0,
+                            "spend_for_leads": 0.0,
+                            "spend_for_total": 0.0,
                             "msgs": 0,
                             "leads": 0,
                             "total": 0,
                         },
                     )
                     it["spend"] = float(it.get("spend") or 0.0) + float((r or {}).get("spend") or 0.0)
+                    it["spend_for_msgs"] = float(it.get("spend_for_msgs") or 0.0) + float((r or {}).get("spend_for_msgs") or (float((r or {}).get("spend") or 0.0) if int((r or {}).get("msgs") or 0) > 0 else 0.0))
+                    it["spend_for_leads"] = float(it.get("spend_for_leads") or 0.0) + float((r or {}).get("spend_for_leads") or (float((r or {}).get("spend") or 0.0) if int((r or {}).get("leads") or 0) > 0 else 0.0))
+                    it["spend_for_total"] = float(it.get("spend_for_total") or 0.0) + float((r or {}).get("spend_for_total") or (float((r or {}).get("spend") or 0.0) if int((r or {}).get("total") or 0) > 0 else 0.0))
                     it["msgs"] = int(it.get("msgs") or 0) + int((r or {}).get("msgs") or 0)
                     it["leads"] = int(it.get("leads") or 0) + int((r or {}).get("leads") or 0)
                     it["total"] = int(it.get("total") or 0) + int((r or {}).get("total") or 0)
 
                 camps = list(by_camp.values())
                 for c in camps:
-                    sp = float(c.get("spend") or 0.0)
+                    sp = float(c.get("spend_for_total") or 0.0)
                     tot = int(c.get("total") or 0)
                     c["cpl"] = (sp / float(tot)) if (tot > 0 and sp > 0) else None
                 camps.sort(key=lambda x: float((x or {}).get("spend") or 0.0), reverse=True)
@@ -6542,7 +6630,7 @@ async def _on_cb_internal(
         aid = data.split("|", 1)[1]
         sel = get_lead_metric_for_account(aid)
         if sel:
-            current = f"✅ {sel.get('label') or sel.get('action_type')} (action_type={sel.get('action_type')})"
+            current = f"✅ {sel.get('label') or sel.get('action_type')}"
         else:
             current = "Стандартная (по умолчанию)"
 
@@ -8101,6 +8189,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("version", cmd_version))
     app.add_handler(CommandHandler("ap_here", cmd_ap_here))
     app.add_handler(CommandHandler("billing", cmd_billing))
+    app.add_handler(CommandHandler("billing_debug", cmd_billing_debug))
     app.add_handler(CommandHandler("sync_accounts", cmd_sync))
     app.add_handler(CommandHandler("heatmap", cmd_heatmap))
     app.add_handler(CommandHandler("heatmap_status", cmd_heatmap_status))

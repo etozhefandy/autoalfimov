@@ -7,6 +7,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from fb_report.constants import ALMATY_TZ, DATA_DIR
 
+from services.analytics import count_leads_from_actions
+
 
 _BASE_DIR = os.path.join(DATA_DIR, "heatmap_snapshots")
 
@@ -367,8 +369,27 @@ def get_heatmap_dataset(
             spend = float(r.get("spend") or 0.0)
             spend_total += float(spend)
             msgs = int(float(r.get("msgs") or 0) or 0)
-            leads = int(float(r.get("leads") or 0) or 0)
-            total = int(float(r.get("total") or 0) or 0)
+
+            leads = None
+            actions_map = r.get("actions")
+            if isinstance(actions_map, dict) and actions_map:
+                try:
+                    leads = int(count_leads_from_actions(actions_map, aid=str(aid), lead_action_type=None) or 0)
+                except Exception:
+                    leads = None
+            if leads is None:
+                try:
+                    leads = int(float(r.get("leads") or 0) or 0)
+                except Exception:
+                    leads = 0
+
+            total = None
+            try:
+                total = int(float(r.get("total") or 0) or 0)
+            except Exception:
+                total = None
+            if total is None or total <= 0:
+                total = int(msgs or 0) + int(leads or 0)
 
             name = r.get("name")
             campaign_id = r.get("campaign_id")
@@ -383,6 +404,11 @@ def get_heatmap_dataset(
                     "msgs": 0,
                     "leads": 0,
                     "total": 0,
+                    "spend_for_msgs": 0.0,
+                    "spend_for_leads": 0.0,
+                    "spend_for_total": 0.0,
+                    "msg_cpa": None,
+                    "lead_cpa": None,
                 },
             )
 
@@ -392,15 +418,28 @@ def get_heatmap_dataset(
                 it["campaign_id"] = campaign_id
 
             it["spend"] = float(it.get("spend") or 0.0) + spend
-            it["msgs"] = int(it.get("msgs") or 0) + msgs
-            it["leads"] = int(it.get("leads") or 0) + leads
-            it["total"] = int(it.get("total") or 0) + total
+            it["msgs"] = int(it.get("msgs") or 0) + int(msgs or 0)
+            it["leads"] = int(it.get("leads") or 0) + int(leads or 0)
+            it["total"] = int(it.get("total") or 0) + int(total or 0)
 
     out_rows: List[Dict[str, Any]] = []
     for _k, v in by_adset.items():
         spend = float(v.get("spend") or 0.0)
+        msgs = int(v.get("msgs") or 0)
+        leads = int(v.get("leads") or 0)
         total = int(v.get("total") or 0)
-        cpl = (spend / float(total)) if (total > 0 and spend > 0) else None
+
+        spend_for_msgs = float(spend) if msgs > 0 else 0.0
+        spend_for_leads = float(spend) if leads > 0 else 0.0
+        spend_for_total = float(spend) if total > 0 else 0.0
+        v["spend_for_msgs"] = float(spend_for_msgs)
+        v["spend_for_leads"] = float(spend_for_leads)
+        v["spend_for_total"] = float(spend_for_total)
+
+        v["msg_cpa"] = (spend_for_msgs / float(msgs)) if (msgs > 0 and spend_for_msgs > 0) else None
+        v["lead_cpa"] = (spend_for_leads / float(leads)) if (leads > 0 and spend_for_leads > 0) else None
+
+        cpl = v.get("lead_cpa")
         v["cpl"] = cpl
         out_rows.append(v)
 
