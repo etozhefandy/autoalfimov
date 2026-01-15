@@ -12,13 +12,15 @@ from typing import Callable, Iterable, Optional, Dict, Any
 from datetime import datetime, timedelta
 import json
 import os
+import logging
 
 from facebook_business.adobjects.adaccount import AdAccount
+from facebook_business.exceptions import FacebookRequestError
 from telegram.ext import Application, ContextTypes
 
 from fb_report.constants import ALMATY_TZ, DATA_DIR, kzt_round_up_1000
 
-from services.facebook_api import allow_fb_api_calls, safe_api_call
+from services.facebook_api import allow_fb_api_calls
 
 
 _last_status: Dict[str, Any] = {}
@@ -78,6 +80,31 @@ def _dt_iso(dt: datetime) -> str:
             return ""
 
 
+def _is_no_access_error(http_status: int | None, message: str | None) -> bool:
+    if int(http_status or 0) != 403:
+        return False
+    msg_l = str(message or "").lower()
+    if "has not granted" not in msg_l:
+        return False
+    if ("ads_read" not in msg_l) and ("ads_management" not in msg_l):
+        return False
+    return True
+
+
+def _log_api_error(caller: str, aid: str, http_status: int | None, fb_code: int | None, message: str | None) -> None:
+    try:
+        logging.getLogger(__name__).warning(
+            "billing_api_error caller=%s aid=%s http_status=%s fb_code=%s message=%s",
+            str(caller),
+            str(aid),
+            str(http_status) if http_status is not None else "",
+            str(fb_code) if fb_code is not None else "",
+            str(message or ""),
+        )
+    except Exception:
+        pass
+
+
 async def _billing_followup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     data = getattr(getattr(context, "job", None), "data", None) or {}
     aid = str((data or {}).get("aid") or "")
@@ -101,20 +128,62 @@ async def _billing_followup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     rate = float(item.get("rate") or 0.0)
 
     cur_usd = first_usd
-    with allow_fb_api_calls(reason="billing_followup"):
-        info = safe_api_call(
-            AdAccount(str(aid)).api_get,
-            fields=["balance"],
-            params={},
-            _aid=str(aid),
-            _meta={"endpoint": "adaccount", "path": f"/{str(aid)}", "params": {"fields": "balance"}},
-            _caller="billing_followup",
-        )
-    if isinstance(info, dict):
+    status = None
+    try:
+        with allow_fb_api_calls(reason="billing_followup"):
+            info = AdAccount(str(aid)).api_get(fields=["name", "account_status", "balance"])
+            if hasattr(info, "export_all_data"):
+                info = info.export_all_data()
+        if isinstance(info, dict):
+            try:
+                status = int(info.get("account_status"))
+            except Exception:
+                status = None
+            try:
+                cur_usd = float(info.get("balance", 0) or 0) / 100.0
+            except Exception:
+                cur_usd = first_usd
+            try:
+                if not name:
+                    name = str(info.get("name") or "")
+            except Exception:
+                pass
+    except FacebookRequestError as e:
+        http_status = None
+        fb_code = None
         try:
-            cur_usd = float(info.get("balance", 0) or 0) / 100.0
+            http_status = int(
+                getattr(e, "http_status", None)()
+                if callable(getattr(e, "http_status", None))
+                else getattr(e, "http_status", None)
+            )
         except Exception:
-            cur_usd = first_usd
+            http_status = None
+        try:
+            fb_code = int(e.api_error_code())
+        except Exception:
+            fb_code = None
+        msg = None
+        try:
+            msg = str(e)
+        except Exception:
+            msg = None
+        _log_api_error("billing_followup", str(aid), http_status, fb_code, msg)
+        return
+    except Exception as e:
+        _log_api_error("billing_followup", str(aid), None, None, str(e))
+        return
+
+    billing_detected = (status != 1) or (float(cur_usd) < 0)
+    if not billing_detected:
+        try:
+            if isinstance(followups, dict):
+                followups.pop(str(aid), None)
+            state["followups"] = followups
+            _save_state(state)
+        except Exception:
+            pass
+        return
 
     try:
         if rate > 0:
@@ -124,7 +193,7 @@ async def _billing_followup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception:
         kzt = 0
 
-    text = f"🚨 {name}! у нас биллинг — Итоговая сумма: {float(cur_usd):.2f} $ — ≈ {int(kzt)} ₸ (@Zz11mmaa)"
+    text = f"🚨 {name}! у нас биллинг — Итоговая сумма: {float(cur_usd):.2f} $ — ≈ {int(kzt)} ₸\n@Zz11mmaa"
     try:
         await context.bot.send_message(chat_id=group_chat_id, text=text)
     except Exception:
@@ -155,7 +224,8 @@ async def _billing_watch_job(
     now = datetime.now(ALMATY_TZ)
 
     state = _load_state() or {}
-    st_last = state.get("last_status") if isinstance(state.get("last_status"), dict) else {}
+    st_detect = state.get("last_detected") if isinstance(state.get("last_detected"), dict) else {}
+    st_last_status = state.get("last_status") if isinstance(state.get("last_status"), dict) else {}
     st_prelim = state.get("prelim_sent_at") if isinstance(state.get("prelim_sent_at"), dict) else {}
     st_followups = state.get("followups") if isinstance(state.get("followups"), dict) else {}
 
@@ -172,36 +242,66 @@ async def _billing_watch_job(
         rate = 0.0
 
     for aid in get_enabled_accounts():
-        with allow_fb_api_calls(reason="billing_watch_poll"):
-            info = safe_api_call(
-                AdAccount(str(aid)).api_get,
-                fields=["name", "account_status", "balance"],
-                params={},
-                _aid=str(aid),
-                _meta={
-                    "endpoint": "adaccount",
-                    "path": f"/{str(aid)}",
-                    "params": {"fields": "name,account_status,balance"},
-                },
-                _caller="billing_watch_poll",
-            )
+        try:
+            with allow_fb_api_calls(reason="billing_watch_poll"):
+                info = AdAccount(str(aid)).api_get(fields=["name", "account_status", "balance"])
+                if hasattr(info, "export_all_data"):
+                    info = info.export_all_data()
+        except FacebookRequestError as e:
+            http_status = None
+            fb_code = None
+            try:
+                http_status = int(
+                    getattr(e, "http_status", None)()
+                    if callable(getattr(e, "http_status", None))
+                    else getattr(e, "http_status", None)
+                )
+            except Exception:
+                http_status = None
+            try:
+                fb_code = int(e.api_error_code())
+            except Exception:
+                fb_code = None
+            msg = None
+            try:
+                msg = str(e)
+            except Exception:
+                msg = None
+            _log_api_error("billing_watch_poll", str(aid), http_status, fb_code, msg)
+            continue
+        except Exception as e:
+            _log_api_error("billing_watch_poll", str(aid), None, None, str(e))
+            continue
+
         if not isinstance(info, dict):
             continue
 
-        status = info.get("account_status")
-        name = info.get("name", get_account_name(aid))
-        balance_usd = float(info.get("balance", 0) or 0) / 100.0
+        name = str(info.get("name") or get_account_name(aid))
+        try:
+            status = int(info.get("account_status"))
+        except Exception:
+            status = None
+        try:
+            balance_usd = float(info.get("balance", 0) or 0) / 100.0
+        except Exception:
+            balance_usd = 0.0
 
-        prev_status = _last_status.get(aid)
-        if isinstance(st_last, dict):
-            prev_status = st_last.get(str(aid), prev_status)
-            st_last[str(aid)] = status
-        _last_status[aid] = status
+        billing_detected = (status != 1) or (float(balance_usd) < 0)
 
-        # Переход из ACTIVE (1) в любой другой статус → алёрт о первичной сумме биллинга
-        if prev_status == 1 and status != 1:
+        prev_detected = _last_status.get(aid)
+        if isinstance(st_detect, dict):
+            prev_detected = st_detect.get(str(aid), prev_detected)
+            st_detect[str(aid)] = bool(billing_detected)
+        if isinstance(st_last_status, dict):
+            st_last_status[str(aid)] = status
+        _last_status[aid] = bool(billing_detected)
+
+        if (not prev_detected) and billing_detected:
             last_prelim_at = _parse_dt((st_prelim or {}).get(str(aid)) if isinstance(st_prelim, dict) else None)
             if last_prelim_at and (now - last_prelim_at) < timedelta(hours=float(cooldown_h)):
+                continue
+
+            if isinstance(st_followups, dict) and str(aid) in st_followups:
                 continue
 
             # Первый алёрт: подчёркиваем, что это предварительная сумма
@@ -248,7 +348,8 @@ async def _billing_watch_job(
             except Exception:
                 pass
 
-    state["last_status"] = st_last if isinstance(st_last, dict) else {}
+    state["last_detected"] = st_detect if isinstance(st_detect, dict) else {}
+    state["last_status"] = st_last_status if isinstance(st_last_status, dict) else {}
     state["prelim_sent_at"] = st_prelim if isinstance(st_prelim, dict) else {}
     state["followups"] = st_followups if isinstance(st_followups, dict) else {}
     _save_state(state)

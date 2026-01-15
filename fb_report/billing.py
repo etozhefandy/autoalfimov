@@ -1,14 +1,27 @@
 import math
 from datetime import datetime, timedelta
+import logging
 
 from facebook_business.adobjects.adaccount import AdAccount
+from facebook_business.exceptions import FacebookRequestError
 from telegram.ext import ContextTypes
 
 from .constants import ALMATY_TZ, usd_to_kzt, kzt_round_up_1000
 from .storage import iter_enabled_accounts_only, get_account_name
 from .reporting import fmt_int
 
-from services.facebook_api import allow_fb_api_calls, safe_api_call, classify_api_error
+from services.facebook_api import allow_fb_api_calls
+
+
+def _is_no_access_error(http_status: int | None, message: str | None) -> bool:
+    if int(http_status or 0) != 403:
+        return False
+    msg_l = str(message or "").lower()
+    if "has not granted" not in msg_l:
+        return False
+    if ("ads_read" not in msg_l) and ("ads_management" not in msg_l):
+        return False
+    return True
 
 
 async def send_billing(ctx: ContextTypes.DEFAULT_TYPE, chat_id: str, only_inactive: bool = False):
@@ -20,136 +33,113 @@ async def send_billing(ctx: ContextTypes.DEFAULT_TYPE, chat_id: str, only_inacti
             text="📋 Биллинги: нет включённых аккаунтов (enabled).",
         )
         return
-    rate = float(usd_to_kzt() or 0.0)
-    ok_lines = []
-    no_access = []
-    failed = []
+
+    try:
+        rate = float(usd_to_kzt() or 0.0)
+    except Exception:
+        rate = 0.0
+
+    detected = 0
+    no_access: list[str] = []
+    failed: list[str] = []
+
     with allow_fb_api_calls(reason="billing_current"):
         for aid in enabled_ids:
             try:
-                res, err = safe_api_call(
-                    AdAccount(str(aid)).api_get,
-                    fields=["name", "account_status", "balance"],
-                    params={},
-                    _aid=str(aid),
-                    _return_error_info=True,
-                    _meta={
-                        "endpoint": "adaccount",
-                        "path": f"/{str(aid)}",
-                        "params": {"fields": "name,account_status,balance"},
-                    },
-                    _caller="billing_current",
-                )
-            except Exception:
-                res, err = None, {"kind": "exception", "message": "exception"}
-
-            info = res
-            if not isinstance(info, dict):
-                err = err if isinstance(err, dict) else {}
+                info = AdAccount(str(aid)).api_get(fields=["name", "account_status", "balance"])
+                if hasattr(info, "export_all_data"):
+                    info = info.export_all_data()
+            except FacebookRequestError as e:
+                http_status = None
+                fb_code = None
                 try:
-                    http_status = int(err.get("http_status") or 0)
+                    http_status = int(getattr(e, "http_status", None)() if callable(getattr(e, "http_status", None)) else getattr(e, "http_status", None))
                 except Exception:
-                    http_status = 0
+                    http_status = None
                 try:
-                    code = int(err.get("code") or 0)
+                    fb_code = int(e.api_error_code())
                 except Exception:
-                    code = 0
-                msg = str(err.get("message") or "")
-                msg_l = msg.lower()
+                    fb_code = None
+                msg = None
+                try:
+                    msg = str(e)
+                except Exception:
+                    msg = None
 
-                is_no_access = (
-                    http_status == 403
-                    and code == 200
-                    and (
-                        "has not granted" in msg_l
-                        and ("ads_management" in msg_l or "ads_read" in msg_l)
-                    )
+                logging.getLogger(__name__).warning(
+                    "billing_api_error caller=billing_current aid=%s http_status=%s fb_code=%s message=%s",
+                    str(aid),
+                    str(http_status),
+                    str(fb_code),
+                    str(msg or ""),
                 )
-                if is_no_access:
+
+                if _is_no_access_error(http_status, msg):
                     no_access.append(str(aid))
                 else:
-                    failed.append(f"{str(aid)}({classify_api_error(err)})")
+                    failed.append(str(aid))
+                continue
+            except Exception as e:
+                logging.getLogger(__name__).warning(
+                    "billing_api_error caller=billing_current aid=%s http_status=%s fb_code=%s message=%s",
+                    str(aid),
+                    "",
+                    "",
+                    str(e),
+                )
+                failed.append(str(aid))
                 continue
 
+            if not isinstance(info, dict):
+                failed.append(str(aid))
+                continue
+
+            name = str(info.get("name") or get_account_name(aid))
             try:
-                status = info.get("account_status")
+                status = int(info.get("account_status"))
             except Exception:
                 status = None
-
-            name = info.get("name", get_account_name(aid))
             try:
                 usd = float(info.get("balance", 0) or 0) / 100.0
             except Exception:
                 usd = 0.0
-            kzt = kzt_round_up_1000(float(usd) * float(rate)) if rate > 0 else 0
 
             billing_detected = (status != 1) or (usd < 0)
             if bool(only_inactive) and status == 1:
                 continue
-            ok_lines.append(
-                f"<b>{name}</b>\n"
-                f"billing_detected={'true' if billing_detected else 'false'}\n"
-                f"account_status={str(status)}\n"
-                f"balance={usd:.2f} $  |  🇰🇿 {fmt_int(kzt)} ₸"
-            )
+            if not billing_detected:
+                continue
+
+            detected += 1
+            try:
+                kzt = kzt_round_up_1000(float(usd) * float(rate)) if rate > 0 else 0
+            except Exception:
+                kzt = 0
+
+            txt = f"🔴 <b>{name}</b>\n💵 {usd:.2f} $ | 🇰🇿 {fmt_int(int(kzt))} ₸"
+            await ctx.bot.send_message(chat_id=chat_id, text=txt, parse_mode="HTML")
 
     lines = []
-    if ok_lines:
-        lines.append("\n\n".join(ok_lines))
-    else:
-        lines.append("📋 Биллинги: нет данных по доступным аккаунтам.")
-
+    if detected <= 0:
+        lines.append("📋 Биллинги: биллингов не обнаружено.")
     if no_access:
         lines.append("⚠️ Нет доступа (ads_read): " + ", ".join(no_access))
     if failed:
         lines.append("⚠️ Ошибки API: " + ", ".join(failed))
-
-    blocks = []
-    if ok_lines:
-        blocks.extend(ok_lines)
-    else:
-        blocks.append("📋 Биллинги: нет данных по доступным аккаунтам.")
-    if no_access:
-        blocks.append("⚠️ Нет доступа (ads_read): " + ", ".join(no_access))
-    if failed:
-        blocks.append("⚠️ Ошибки API: " + ", ".join(failed))
-
-    blocks.append(
-        f"debug: enabled={len(enabled_ids)} ok={len(ok_lines)} no_access={len(no_access)} failed={len(failed)}"
+    lines.append(
+        f"debug: enabled={len(enabled_ids)} detected={int(detected)} no_access={len(no_access)} failed={len(failed)}"
     )
-
-    max_len = 3500
-    buf = ""
-    for b in blocks:
-        chunk = str(b or "").strip()
-        if not chunk:
-            continue
-        if not buf:
-            buf = chunk
-            continue
-        if (len(buf) + 2 + len(chunk)) <= max_len:
-            buf = buf + "\n\n" + chunk
-            continue
-        await ctx.bot.send_message(chat_id=chat_id, text=buf, parse_mode="HTML")
-        buf = chunk
-    if buf:
-        await ctx.bot.send_message(chat_id=chat_id, text=buf, parse_mode="HTML")
+    await ctx.bot.send_message(chat_id=chat_id, text="\n".join(lines))
 
 
 def _compute_billing_forecast_for_account(aid: str, rate_kzt: float, lookback_days: int = 7):
-    with allow_fb_api_calls(reason="billing_forecast"):
-        info = safe_api_call(
-            AdAccount(str(aid)).api_get,
-            fields=["name", "account_status", "balance"],
-            params={},
-            _aid=str(aid),
-            _meta={
-                "endpoint": "adaccount",
-                "path": f"/{str(aid)}",
-                "params": {"fields": "name,account_status,balance"},
-            },
-            _caller="billing_forecast_account",
-        )
+    try:
+        with allow_fb_api_calls(reason="billing_forecast"):
+            info = AdAccount(str(aid)).api_get(fields=["name", "account_status", "balance"])
+            if hasattr(info, "export_all_data"):
+                info = info.export_all_data()
+    except Exception:
+        return None
     if not isinstance(info, dict):
         return None
 
@@ -171,15 +161,11 @@ def _compute_billing_forecast_for_account(aid: str, rate_kzt: float, lookback_da
             "until": until.strftime("%Y-%m-%d"),
         },
     }
-    with allow_fb_api_calls(reason="billing_forecast"):
-        data = safe_api_call(
-            acc.get_insights,
-            fields=["spend"],
-            params=params,
-            _aid=str(aid),
-            _meta={"endpoint": "insights/account", "path": f"/{str(aid)}/insights", "params": params},
-            _caller="billing_forecast_insights",
-        )
+    try:
+        with allow_fb_api_calls(reason="billing_forecast"):
+            data = acc.get_insights(fields=["spend"], params=params)
+    except Exception:
+        data = None
     if not data:
         return None
 
