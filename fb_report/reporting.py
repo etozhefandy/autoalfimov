@@ -1,6 +1,7 @@
 # fb_report/reporting.py
 
 import json
+import os
 from datetime import datetime, timedelta
 import re
 from typing import Any
@@ -38,6 +39,38 @@ def fmt_int(n) -> str:
         return f"{int(float(n)):,}".replace(",", " ")
     except Exception:
         return "0"
+
+
+def _load_report_cache() -> dict:
+    try:
+        with open(REPORT_CACHE_FILE, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_report_cache(d: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(REPORT_CACHE_FILE), exist_ok=True)
+    except Exception:
+        pass
+    tmp = str(REPORT_CACHE_FILE) + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=2)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+        os.replace(tmp, REPORT_CACHE_FILE)
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
 
 
 # ========== ИНСАЙТЫ (сырые данные) ==========

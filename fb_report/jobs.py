@@ -1122,165 +1122,659 @@ async def _heatmap_snapshot_collector_job(
         accounts = {str(manual_aid): accounts.get(str(manual_aid))}
 
     for aid, row in (accounts or {}).items():
-        if not row:
-            continue
-        if not (row or {}).get("enabled", True):
-            continue
-
-        target_start_dt = None
-        target_end_dt = None
-        target_date_str = None
-        target_hour_int = None
-        target_window_label = None
-
         try:
-            search_start = end_dt_base - timedelta(hours=int(backfill_lookback_hours))
-            search_end = end_dt_base - timedelta(hours=1)
-            dt_cur = search_start
-            while dt_cur <= search_end:
-                ds = dt_cur.strftime("%Y-%m-%d")
-                hh = int(dt_cur.strftime("%H"))
-                with deny_fb_api_calls(reason="heatmap_snapshot_collector_backfill_probe"):
-                    s_probe = load_snapshot(str(aid), date_str=str(ds), hour=int(hh))
-                if not s_probe:
-                    target_start_dt = dt_cur
-                    target_end_dt = dt_cur + timedelta(hours=1)
-                    target_date_str = str(ds)
-                    target_hour_int = int(hh)
-                    break
-                dt_cur = dt_cur + timedelta(hours=1)
-        except Exception:
+            if not row:
+                continue
+            if not (row or {}).get("enabled", True):
+                continue
+
             target_start_dt = None
+            target_end_dt = None
+            target_date_str = None
+            target_hour_int = None
+            target_window_label = None
 
-        if not target_start_dt:
-            target_end_dt = end_dt_base
-            target_start_dt = end_dt_base - timedelta(hours=1)
-            target_date_str = target_start_dt.strftime("%Y-%m-%d")
-            target_hour_int = int(target_start_dt.strftime("%H"))
+            try:
+                search_start = end_dt_base - timedelta(hours=int(backfill_lookback_hours))
+                search_end = end_dt_base - timedelta(hours=1)
+                dt_cur = search_start
+                while dt_cur <= search_end:
+                    ds = dt_cur.strftime("%Y-%m-%d")
+                    hh = int(dt_cur.strftime("%H"))
+                    with deny_fb_api_calls(reason="heatmap_snapshot_collector_backfill_probe"):
+                        s_probe = load_snapshot(str(aid), date_str=str(ds), hour=int(hh))
+                    if not s_probe:
+                        target_start_dt = dt_cur
+                        target_end_dt = dt_cur + timedelta(hours=1)
+                        target_date_str = str(ds)
+                        target_hour_int = int(hh)
+                        break
+                    dt_cur = dt_cur + timedelta(hours=1)
+            except Exception:
+                target_start_dt = None
 
-        try:
-            target_window_label = f"{target_start_dt.strftime('%Y-%m-%d %H:00')}–{target_end_dt.strftime('%H:00')}"
-        except Exception:
-            target_window_label = f"{str(target_date_str)} {int(target_hour_int):02d}:00–{(int(target_hour_int) + 1) % 24:02d}:00"
+            if not target_start_dt:
+                target_end_dt = end_dt_base
+                target_start_dt = end_dt_base - timedelta(hours=1)
+                target_date_str = target_start_dt.strftime("%Y-%m-%d")
+                target_hour_int = int(target_start_dt.strftime("%H"))
 
-        snap = load_snapshot(str(aid), date_str=str(target_date_str), hour=int(target_hour_int))
-        if not snap:
-            snap = build_snapshot_shell(
+            try:
+                target_window_label = f"{target_start_dt.strftime('%Y-%m-%d %H:00')}–{target_end_dt.strftime('%H:00')}"
+            except Exception:
+                target_window_label = f"{str(target_date_str)} {int(target_hour_int):02d}:00–{(int(target_hour_int) + 1) % 24:02d}:00"
+
+            snap = load_snapshot(str(aid), date_str=str(target_date_str), hour=int(target_hour_int))
+            if not snap:
+                snap = build_snapshot_shell(
+                    str(aid),
+                    date_str=str(target_date_str),
+                    hour=int(target_hour_int),
+                    start_dt=target_start_dt,
+                    end_dt=target_end_dt,
+                    deadline_dt=collector_deadline_dt,
+                    min_rows_required=min_rows_required,
+                )
+
+            # Ensure snapshot schema fields exist.
+            snap["source"] = "heatmap_cache"
+            if "reason" not in snap:
+                snap["reason"] = "snapshot_collecting"
+            if "rows_count" not in snap:
+                try:
+                    snap["rows_count"] = int(len(snap.get("rows") or []))
+                except Exception:
+                    snap["rows_count"] = 0
+            if "spend" not in snap:
+                snap["spend"] = 0.0
+
+            if str((snap or {}).get("status") or "") == "ready":
+                continue
+
+            attempt_next = int((snap or {}).get("attempts") or 0) + 1
+            window_label = str(target_window_label or "")
+
+            preserve_existing_failure = False
+            try:
+                preserve_existing_failure = str((snap or {}).get("status") or "") == "failed" or _has_real_reason(snap)
+            except Exception:
+                preserve_existing_failure = False
+
+            log.info(
+                "🟦 FB COLLECTOR START aid=%s window=%s attempt=%s/%s allow_fb_api_calls=TRUE",
                 str(aid),
-                date_str=str(target_date_str),
-                hour=int(target_hour_int),
-                start_dt=target_start_dt,
-                end_dt=target_end_dt,
-                deadline_dt=collector_deadline_dt,
-                min_rows_required=min_rows_required,
+                str(window_label),
+                str(attempt_next),
+                str(max_attempts),
             )
 
-        # Ensure snapshot schema fields exist.
-        snap["source"] = "heatmap_cache"
-        if "reason" not in snap:
-            snap["reason"] = "snapshot_collecting"
-        if "rows_count" not in snap:
             try:
-                snap["rows_count"] = int(len(snap.get("rows") or []))
+                dl_raw = (snap or {}).get("deadline_at")
+                dl = datetime.fromisoformat(str(dl_raw)) if dl_raw else collector_deadline_dt
             except Exception:
-                snap["rows_count"] = 0
-        if "spend" not in snap:
-            snap["spend"] = 0.0
+                dl = collector_deadline_dt
 
-        if str((snap or {}).get("status") or "") == "ready":
-            continue
+            if now > dl:
+                err = (snap or {}).get("error")
+                if not isinstance(err, dict):
+                    err = {"type": "api_error"}
 
-        attempt_next = int((snap or {}).get("attempts") or 0) + 1
-        window_label = str(target_window_label or "")
+                existing_reason = str((snap or {}).get("reason") or "")
+                existing_type = str((err or {}).get("type") or "")
+                is_invalid_fields = existing_reason in {"invalid_fields", "fb_invalid_fields"} or existing_type in {
+                    "invalid_fields",
+                    "fb_invalid_fields",
+                }
 
-        preserve_existing_failure = False
-        try:
-            preserve_existing_failure = str((snap or {}).get("status") or "") == "failed" or _has_real_reason(snap)
-        except Exception:
-            preserve_existing_failure = False
-
-        log.info(
-            "🟦 FB COLLECTOR START aid=%s window=%s attempt=%s/%s allow_fb_api_calls=TRUE",
-            str(aid),
-            str(window_label),
-            str(attempt_next),
-            str(max_attempts),
-        )
-
-        try:
-            dl_raw = (snap or {}).get("deadline_at")
-            dl = datetime.fromisoformat(str(dl_raw)) if dl_raw else collector_deadline_dt
-        except Exception:
-            dl = collector_deadline_dt
-
-        if now > dl:
-            err = (snap or {}).get("error")
-            if not isinstance(err, dict):
-                err = {"type": "api_error"}
-
-            existing_reason = str((snap or {}).get("reason") or "")
-            existing_type = str((err or {}).get("type") or "")
-            is_invalid_fields = existing_reason in {"invalid_fields", "fb_invalid_fields"} or existing_type in {
-                "invalid_fields",
-                "fb_invalid_fields",
-            }
-
-            has_any = False
-            try:
-                has_any = bool(snap.get("rows")) and float(snap.get("spend") or 0.0) > 0.0
-            except Exception:
                 has_any = False
+                try:
+                    has_any = bool(snap.get("rows")) and float(snap.get("spend") or 0.0) > 0.0
+                except Exception:
+                    has_any = False
 
-            preserve_now = False
-            try:
-                preserve_now = str((snap or {}).get("status") or "") == "failed" or _has_real_reason(snap)
-            except Exception:
                 preserve_now = False
+                try:
+                    preserve_now = str((snap or {}).get("status") or "") == "failed" or _has_real_reason(snap)
+                except Exception:
+                    preserve_now = False
 
-            if has_any:
+                if has_any:
+                    snap["status"] = "ready_low_confidence"
+                    snap["reason"] = "low_volume"
+                    snap["error"] = None
+                    snap["next_try_at"] = None
+                else:
+                    # Hard rule: if snapshot already failed or has a real reason, do not overwrite.
+                    if preserve_now:
+                        # Preserve reason/error/meta/next_try_at, but finalize as failed after deadline.
+                        try:
+                            if str(snap.get("status") or "") != "failed":
+                                snap["status"] = "failed"
+                        except Exception:
+                            snap["status"] = "failed"
+                        snap["reason"] = snap.get("reason")
+                        snap["error"] = snap.get("error")
+                        snap["meta"] = snap.get("meta")
+                        snap["next_try_at"] = snap.get("next_try_at")
+                    else:
+                        # No real reason yet -> mark as failed with fallback reason.
+                        snap["status"] = "failed"
+                        et = str((err or {}).get("type") or "api_error")
+                        info_like = {}
+                        try:
+                            info_like = {
+                                "code": (err or {}).get("fb_code"),
+                                "subcode": (err or {}).get("fb_subcode"),
+                                "fbtrace_id": (err or {}).get("fbtrace_id"),
+                                "message": (err or {}).get("message") or (err or {}).get("fb_message"),
+                                "http_status": (err or {}).get("http_status"),
+                            }
+                        except Exception:
+                            info_like = {}
+                        rr = "fb_invalid_fields" if is_invalid_fields else _map_fb_reason(info_like, et)
+                        snap["reason"] = rr
+                        snap["error"] = err
+
+                save_snapshot(snap)
+
+                hh = "00"
+                try:
+                    hh = f"{int((snap or {}).get('hour') if isinstance(snap, dict) else 0):02d}"
+                except Exception:
+                    try:
+                        hh = f"{int(target_hour_int):02d}"
+                    except Exception:
+                        hh = "00"
+                date_s_for_path = ""
+                try:
+                    date_s_for_path = str((snap or {}).get("date") or "")
+                except Exception:
+                    date_s_for_path = ""
+                if not date_s_for_path:
+                    try:
+                        date_s_for_path = str(target_date_str or "")
+                    except Exception:
+                        date_s_for_path = ""
+                snap_path = os.path.join(
+                    str(os.getenv("DATA_DIR", "")) or "DATA_DIR",
+                    "heatmap_snapshots",
+                    str(aid),
+                    str(date_s_for_path),
+                    hh,
+                    "snapshot.json",
+                )
+                log.info(
+                    "🟦 SNAPSHOT SAVED aid=%s status=%s reason=%s rows=%s spend=%s window=%s path=%s",
+                    str(aid),
+                    str(snap.get("status") or ""),
+                    str(snap.get("reason") or ""),
+                    str(int(snap.get("rows_count") or 0)),
+                    str(float(snap.get("spend") or 0.0)),
+                    str(window_label),
+                    str(snap_path),
+                )
+                continue
+
+            try:
+                ntry = str((snap or {}).get("next_try_at") or "")
+                if ntry:
+                    ntd = datetime.fromisoformat(ntry)
+                    if not ntd.tzinfo:
+                        ntd = ALMATY_TZ.localize(ntd)
+                    ntd = ntd.astimezone(ALMATY_TZ)
+                    if now < ntd:
+                        mins = int(max(0.0, (ntd - now).total_seconds()) / 60.0)
+                        log.info(
+                            "🟦 FB COLLECTOR WAIT aid=%s until=%s in_min=%s",
+                            str(aid),
+                            str(ntd.isoformat()),
+                            str(mins),
+                        )
+                        continue
+            except Exception:
+                pass
+
+            try:
+                attempts_done = int((snap or {}).get("attempts") or 0)
+            except Exception:
+                attempts_done = 0
+            if attempts_done >= int(max_attempts):
+                snap["status"] = "collecting"
+                snap["reason"] = "snapshot_collecting"
+                snap["error"] = {"type": "attempts_exceeded"}
+                snap["last_try_at"] = snap.get("last_try_at")
+                snap["next_try_at"] = snap.get("deadline_at")
+                save_snapshot(snap)
+                log.info(
+                    "🟦 FB COLLECTOR SKIP aid=%s reason=attempts_exceeded attempts=%s/%s",
+                    str(aid),
+                    str(attempts_done),
+                    str(max_attempts),
+                )
+                continue
+
+            snap["status"] = "collecting"
+            snap["reason"] = "snapshot_collecting"
+            snap["last_try_at"] = now.isoformat()
+            try:
+                delay_min = random.randint(2, 5)
+            except Exception:
+                delay_min = 3
+            try:
+                snap["next_try_at"] = (now + timedelta(minutes=int(delay_min))).isoformat()
+            except Exception:
+                snap["next_try_at"] = None
+
+            if is_rate_limited_now():
+                info = get_last_api_error_info() or {}
+                # Retryable: keep status collecting, but record a real reason + meta.
+                snap["reason"] = "fb_rate_limit"
+                snap["error"] = {
+                    "type": "fb_rate_limit",
+                    "fb_code": (info or {}).get("code") or 17,
+                    "fb_subcode": (info or {}).get("subcode"),
+                    "fbtrace_id": (info or {}).get("fbtrace_id"),
+                    "message": (info or {}).get("message"),
+                    "http_status": (info or {}).get("http_status"),
+                }
+                snap["meta"] = {
+                    "endpoint": (info or {}).get("endpoint") or "insights/adset/hourly",
+                    "fields": None,
+                    "params": (info or {}).get("params"),
+                    "last_http_status": (info or {}).get("http_status"),
+                    "fb_code": (info or {}).get("code") or 17,
+                    "fb_subcode": (info or {}).get("subcode"),
+                    "fbtrace_id": (info or {}).get("fbtrace_id"),
+                    "message": (info or {}).get("message"),
+                }
+                save_snapshot(snap)
+
+                try:
+                    log.warning(
+                        "🟦 FB RATE LIMIT aid=%s retry_after=%ss",
+                        str(aid),
+                        str(rate_limit_retry_after_seconds()),
+                    )
+                except Exception:
+                    pass
+                continue
+
+            try:
+                snap["attempts"] = int((snap or {}).get("attempts") or 0) + 1
+            except Exception:
+                snap["attempts"] = 1
+
+            calls_used = 0
+
+            lead_action_type = None
+            try:
+                from fb_report.storage import get_lead_metric_for_account
+
+                sel = get_lead_metric_for_account(str(aid))
+                if isinstance(sel, dict):
+                    lead_action_type = sel.get("action_type")
+            except Exception:
+                lead_action_type = None
+
+            adset_status_map: dict[str, str] = {}
+            try:
+                cache_obj = _load_adset_status_cache(str(aid))
+                adset_status_map = _adset_status_map_from_cache(cache_obj)
+                if not _is_adset_cache_fresh(cache_obj, ttl_hours=6):
+                    with allow_fb_api_calls(reason="heatmap_snapshot_collector_adset_status"):
+                        refreshed = _refresh_adset_status_cache(str(aid), log=log)
+                    if refreshed:
+                        adset_status_map = dict(refreshed)
+            except Exception:
+                adset_status_map = {}
+
+            data = None
+            with allow_fb_api_calls(reason="heatmap_snapshot_collector"):
+                if max_calls > 0:
+                    calls_used += 1
+                    try:
+                        from facebook_business.adobjects.adaccount import AdAccount
+
+                        acc = AdAccount(str(aid))
+                        params = {
+                            "level": "adset",
+                            "time_range": {"since": str(target_date_str), "until": str(target_date_str)},
+                            "breakdowns": ["hourly_stats_aggregated_by_advertiser_time_zone"],
+                            "time_increment": 1,
+                        }
+                        fields = [
+                            "spend",
+                            "actions",
+                            "impressions",
+                            "clicks",
+                            "frequency",
+                            "adset_id",
+                            "adset_name",
+                            "campaign_id",
+                            "campaign_name",
+                        ]
+
+                        # Persist meta for this attempt (snapshots-only debug relies on it).
+                        try:
+                            snap["meta"] = {
+                                "endpoint": "insights/adset/hourly",
+                                "fields": list(fields or []),
+                                "params": params,
+                                "last_http_status": None,
+                                "fb_code": None,
+                                "fb_subcode": None,
+                                "fbtrace_id": None,
+                                "message": None,
+                            }
+                        except Exception:
+                            pass
+
+                        try:
+                            log.info(
+                                "🟦 FB REQUEST aid=%s endpoint=%s date=%s hour=%s window=%s fields=%s",
+                                str(aid),
+                                "insights/adset/hourly",
+                                str(target_date_str),
+                                str(int(target_hour_int)),
+                                str(window_label),
+                                str(",".join([str(x) for x in (fields or [])])),
+                            )
+                        except Exception:
+                            pass
+
+                        data = safe_api_call(
+                            acc.get_insights,
+                            fields=fields,
+                            params=params,
+                            _meta={"endpoint": "insights/adset/hourly", "params": params},
+                            _caller="heatmap_snapshot_collector",
+                        )
+                    except Exception:
+                        data = None
+
+            if not data:
+                info = get_last_api_error_info() or {}
+                try:
+                    et = str(classify_api_error(info))
+                except Exception:
+                    et = "api_error"
+
+                # Always attach error meta for debug (do not clear existing if preservation rule triggers).
+                try:
+                    if not preserve_existing_failure:
+                        snap_meta = snap.get("meta") if isinstance(snap.get("meta"), dict) else {}
+                        if not isinstance(snap_meta, dict):
+                            snap_meta = {}
+                        snap_meta.update(
+                            {
+                                "endpoint": (info or {}).get("endpoint")
+                                or (snap_meta or {}).get("endpoint")
+                                or "insights/adset/hourly",
+                                "last_http_status": (info or {}).get("http_status"),
+                                "fb_code": (info or {}).get("code"),
+                                "fb_subcode": (info or {}).get("subcode"),
+                                "fbtrace_id": (info or {}).get("fbtrace_id"),
+                                "message": (info or {}).get("message"),
+                                "params": (info or {}).get("params") or (snap_meta or {}).get("params"),
+                            }
+                        )
+                        snap["meta"] = snap_meta
+                except Exception:
+                    pass
+
+                try:
+                    log.warning(
+                        "🟦 FB ERROR aid=%s fb_code=%s message=%s window=%s",
+                        str(aid),
+                        str((info or {}).get("code")),
+                        str((info or {}).get("message") or ""),
+                        str(window_label),
+                    )
+                except Exception:
+                    pass
+
+            rows_out: list[dict] = []
+            if data:
+                for rr in (data or []):
+                    d = _normalize_insight(rr)
+                    raw_hour = str((d or {}).get("hourly_stats_aggregated_by_advertiser_time_zone") or "")
+                    if not raw_hour:
+                        continue
+                    hh_ok = raw_hour.startswith(f"{int(target_hour_int):02d}") or (f" {int(target_hour_int):02d}:" in raw_hour)
+                    if not hh_ok:
+                        continue
+
+                    try:
+                        parsed = parse_insight(d or {}, aid=str(aid), lead_action_type=lead_action_type)
+                    except Exception:
+                        parsed = {"msgs": 0, "leads": 0, "total": 0, "spend": 0.0, "cpa": None}
+
+                    actions_map: dict[str, float] = {}
+                    try:
+                        for a in (d or {}).get("actions") or []:
+                            if not isinstance(a, dict):
+                                continue
+                            at = str(a.get("action_type") or "")
+                            if not at:
+                                continue
+                            try:
+                                v = float(a.get("value") or 0)
+                            except Exception:
+                                v = 0.0
+                            actions_map[at] = actions_map.get(at, 0.0) + float(v)
+                    except Exception:
+                        actions_map = {}
+
+                    try:
+                        started_conversations = int(count_started_conversations_from_actions(actions_map) or 0)
+                    except Exception:
+                        started_conversations = int(parsed.get("msgs") or 0)
+
+                    try:
+                        website_submit = int(count_website_submit_applications_from_actions(actions_map) or 0)
+                    except Exception:
+                        website_submit = 0
+
+                    adset_id = str((d or {}).get("adset_id") or "")
+                    if not adset_id:
+                        continue
+                    blended_total = int((started_conversations or 0) + (website_submit or 0))
+                    spend = float(parsed.get("spend") or 0.0)
+                    stt = None
+                    try:
+                        stt = adset_status_map.get(str(adset_id))
+                    except Exception:
+                        stt = None
+                    rows_out.append(
+                        {
+                            "adset_id": adset_id,
+                            "name": (d or {}).get("adset_name") or (d or {}).get("name"),
+                            "adset_status": str(stt or "UNKNOWN"),
+                            "campaign_id": (d or {}).get("campaign_id"),
+                            "campaign_name": (d or {}).get("campaign_name"),
+                            "spend": spend,
+                            "started_conversations": int(started_conversations or 0),
+                            "website_submit_applications": int(website_submit or 0),
+                            "msgs": int(started_conversations or 0),
+                            "leads": int(website_submit or 0),
+                            "total": int(blended_total or 0),
+                            "results": int(blended_total or 0),
+                            "cpl": parsed.get("cpa"),
+                            "hour": int(target_hour_int),
+                        }
+                    )
+
+            try:
+                log.info(
+                    "🟦 FB RESPONSE aid=%s endpoint=%s rows=%s spend=%s window=%s",
+                    str(aid),
+                    "insights/adset/hourly",
+                    str(int(len(rows_out or []))),
+                    str(float(sum(float((r or {}).get("spend") or 0.0) for r in (rows_out or [])))),
+                    str(window_label),
+                )
+            except Exception:
+                pass
+
+            try:
+                started_total = int(
+                    sum(
+                        int((r or {}).get("started_conversations") or 0)
+                        for r in (rows_out or [])
+                        if isinstance(r, dict)
+                    )
+                )
+            except Exception:
+                started_total = 0
+            try:
+                website_total = int(
+                    sum(
+                        int((r or {}).get("website_submit_applications") or 0)
+                        for r in (rows_out or [])
+                        if isinstance(r, dict)
+                    )
+                )
+            except Exception:
+                website_total = 0
+            try:
+                spend_total_actions = float(
+                    sum(
+                        float((r or {}).get("spend") or 0.0)
+                        for r in (rows_out or [])
+                        if isinstance(r, dict)
+                    )
+                )
+            except Exception:
+                spend_total_actions = 0.0
+            try:
+                log.info(
+                    "🟦 FB ACTIONS PARSED aid=%s started_conversations=%s website_submit_applications=%s spend=%s rows=%s window=%s",
+                    str(aid),
+                    str(int(started_total)),
+                    str(int(website_total)),
+                    str(float(spend_total_actions)),
+                    str(int(len(rows_out or []))),
+                    str(window_label),
+                )
+            except Exception:
+                pass
+
+            snap["rows"] = rows_out
+            snap["collected_rows"] = int(len(rows_out))
+            snap["rows_count"] = int(len(rows_out))
+            try:
+                snap["spend"] = float(sum(float((r or {}).get("spend") or 0.0) for r in (rows_out or [])))
+            except Exception:
+                snap["spend"] = 0.0
+
+            try:
+                rows_cnt = int(len(rows_out or []))
+            except Exception:
+                rows_cnt = 0
+            try:
+                spend_total = float(snap.get("spend") or 0.0)
+            except Exception:
+                spend_total = 0.0
+
+            min_rows = int(snap.get("min_rows_required") or min_rows_required)
+
+            if rows_cnt > 0 and spend_total > 0 and rows_cnt >= min_rows:
+                snap["status"] = "ready"
+                snap["reason"] = ""
+                snap["next_try_at"] = None
+                snap["error"] = None
+            elif rows_cnt > 0 and spend_total > 0:
                 snap["status"] = "ready_low_confidence"
                 snap["reason"] = "low_volume"
-                snap["error"] = None
                 snap["next_try_at"] = None
+                snap["error"] = None
             else:
-                # Hard rule: if snapshot already failed or has a real reason, do not overwrite.
+                info = get_last_api_error_info() or {}
+                et = "api_error"
+                try:
+                    et = str(classify_api_error(info))
+                except Exception:
+                    et = "api_error"
+
+                preserve_now = False
+                try:
+                    preserve_now = str((snap or {}).get("status") or "") == "failed" or _has_real_reason(snap)
+                except Exception:
+                    preserve_now = False
+
+                # If we already have a real reason (or failed), do not overwrite anything.
                 if preserve_now:
-                    # Preserve reason/error/meta/next_try_at, but finalize as failed after deadline.
-                    try:
-                        if str(snap.get("status") or "") != "failed":
-                            snap["status"] = "failed"
-                    except Exception:
-                        snap["status"] = "failed"
                     snap["reason"] = snap.get("reason")
                     snap["error"] = snap.get("error")
                     snap["meta"] = snap.get("meta")
                     snap["next_try_at"] = snap.get("next_try_at")
                 else:
-                    # No real reason yet -> mark as failed with fallback reason.
-                    snap["status"] = "failed"
-                    et = str((err or {}).get("type") or "api_error")
-                    info_like = {}
-                    try:
-                        info_like = {
-                            "code": (err or {}).get("fb_code"),
-                            "subcode": (err or {}).get("fb_subcode"),
-                            "fbtrace_id": (err or {}).get("fbtrace_id"),
-                            "message": (err or {}).get("message") or (err or {}).get("fb_message"),
-                            "http_status": (err or {}).get("http_status"),
-                        }
-                    except Exception:
-                        info_like = {}
-                    rr = "fb_invalid_fields" if is_invalid_fields else _map_fb_reason(info_like, et)
+                    rr = _map_fb_reason(info, et)
                     snap["reason"] = rr
-                    snap["error"] = err
+                    if rr == "fb_invalid_fields":
+                        snap["status"] = "failed"
+                        try:
+                            snap["next_try_at"] = (now + timedelta(hours=6)).isoformat()
+                        except Exception:
+                            snap["next_try_at"] = snap.get("next_try_at")
+                    elif rr in {"fb_auth", "fb_permission"}:
+                        snap["status"] = "failed"
+                    else:
+                        snap["status"] = "collecting"
+
+                    snap["error"] = {
+                        "type": rr,
+                        "fb_code": (info or {}).get("code"),
+                        "fb_subcode": (info or {}).get("subcode"),
+                        "fbtrace_id": (info or {}).get("fbtrace_id"),
+                        "message": (info or {}).get("message"),
+                        "http_status": (info or {}).get("http_status"),
+                    }
+
+                    try:
+                        snap_meta = snap.get("meta") if isinstance(snap.get("meta"), dict) else {}
+                        if not isinstance(snap_meta, dict):
+                            snap_meta = {}
+                        snap_meta.update(
+                            {
+                                "endpoint": (info or {}).get("endpoint") or (snap_meta or {}).get("endpoint"),
+                                "last_http_status": (info or {}).get("http_status"),
+                                "fb_code": (info or {}).get("code"),
+                                "fb_subcode": (info or {}).get("subcode"),
+                                "fbtrace_id": (info or {}).get("fbtrace_id"),
+                                "message": (info or {}).get("message"),
+                                "params": (info or {}).get("params") or (snap_meta or {}).get("params"),
+                            }
+                        )
+                        snap["meta"] = snap_meta
+                    except Exception:
+                        pass
+
             save_snapshot(snap)
 
-            hh = f"{int(hour_int):02d}"
+            hh = "00"
+            try:
+                hh = f"{int((snap or {}).get('hour') if isinstance(snap, dict) else 0):02d}"
+            except Exception:
+                try:
+                    hh = f"{int(target_hour_int):02d}"
+                except Exception:
+                    hh = "00"
+            date_s_for_path = ""
+            try:
+                date_s_for_path = str((snap or {}).get("date") or "")
+            except Exception:
+                date_s_for_path = ""
+            if not date_s_for_path:
+                try:
+                    date_s_for_path = str(target_date_str or "")
+                except Exception:
+                    date_s_for_path = ""
             snap_path = os.path.join(
                 str(os.getenv("DATA_DIR", "")) or "DATA_DIR",
                 "heatmap_snapshots",
                 str(aid),
-                str(date_str),
+                str(date_s_for_path),
                 hh,
                 "snapshot.json",
             )
@@ -1294,462 +1788,32 @@ async def _heatmap_snapshot_collector_job(
                 str(window_label),
                 str(snap_path),
             )
-            continue
-        try:
-            ntry = str((snap or {}).get("next_try_at") or "")
-            if ntry:
-                ntd = datetime.fromisoformat(ntry)
-                if not ntd.tzinfo:
-                    ntd = ALMATY_TZ.localize(ntd)
-                ntd = ntd.astimezone(ALMATY_TZ)
-                if now < ntd:
-                    mins = int(max(0.0, (ntd - now).total_seconds()) / 60.0)
-                    log.info(
-                        "🟦 FB COLLECTOR WAIT aid=%s until=%s in_min=%s",
-                        str(aid),
-                        str(ntd.isoformat()),
-                        str(mins),
-                    )
-                    continue
-        except Exception:
-            pass
-        try:
-            attempts_done = int((snap or {}).get("attempts") or 0)
-        except Exception:
-            attempts_done = 0
-        if attempts_done >= int(max_attempts):
-            snap["status"] = "collecting"
-            snap["reason"] = "snapshot_collecting"
-            snap["error"] = {"type": "attempts_exceeded"}
-            snap["last_try_at"] = snap.get("last_try_at")
-            snap["next_try_at"] = snap.get("deadline_at")
-            save_snapshot(snap)
-            log.info(
-                "🟦 FB COLLECTOR SKIP aid=%s reason=attempts_exceeded attempts=%s/%s",
-                str(aid),
-                str(attempts_done),
-                str(max_attempts),
-            )
-            continue
 
-        snap["status"] = "collecting"
-        snap["reason"] = "snapshot_collecting"
-        snap["last_try_at"] = now.isoformat()
-        try:
-            delay_min = random.randint(2, 5)
-        except Exception:
-            delay_min = 3
-        try:
-            snap["next_try_at"] = (now + timedelta(minutes=int(delay_min))).isoformat()
-        except Exception:
-            snap["next_try_at"] = None
+            if manual and manual_aid:
+                # One attempt in manual mode.
+                break
 
-        if is_rate_limited_now():
-            info = get_last_api_error_info() or {}
-            # Retryable: keep status collecting, but record a real reason + meta.
-            snap["reason"] = "fb_rate_limit"
-            snap["error"] = {
-                "type": "fb_rate_limit",
-                "fb_code": (info or {}).get("code") or 17,
-                "fb_subcode": (info or {}).get("subcode"),
-                "fbtrace_id": (info or {}).get("fbtrace_id"),
-                "message": (info or {}).get("message"),
-                "http_status": (info or {}).get("http_status"),
-            }
-            snap["meta"] = {
-                "endpoint": (info or {}).get("endpoint") or "insights/adset/hourly",
-                "fields": None,
-                "params": (info or {}).get("params"),
-                "last_http_status": (info or {}).get("http_status"),
-                "fb_code": (info or {}).get("code") or 17,
-                "fb_subcode": (info or {}).get("subcode"),
-                "fbtrace_id": (info or {}).get("fbtrace_id"),
-                "message": (info or {}).get("message"),
-            }
-            save_snapshot(snap)
-
+        except Exception as e:
             try:
-                log.warning(
-                    "🟦 FB RATE LIMIT aid=%s retry_after=%ss",
-                    str(aid),
-                    str(rate_limit_retry_after_seconds()),
-                )
+                log.exception("heatmap_snapshot_collector_account_error aid=%s", str(aid), exc_info=e)
             except Exception:
                 pass
-            continue
-
-        try:
-            snap["attempts"] = int((snap or {}).get("attempts") or 0) + 1
-        except Exception:
-            snap["attempts"] = 1
-
-        calls_used = 0
-
-        lead_action_type = None
-        try:
-            from fb_report.storage import get_lead_metric_for_account
-
-            sel = get_lead_metric_for_account(str(aid))
-            if isinstance(sel, dict):
-                lead_action_type = sel.get("action_type")
-        except Exception:
-            lead_action_type = None
-
-        adset_status_map: dict[str, str] = {}
-        try:
-            cache_obj = _load_adset_status_cache(str(aid))
-            adset_status_map = _adset_status_map_from_cache(cache_obj)
-            if not _is_adset_cache_fresh(cache_obj, ttl_hours=6):
-                with allow_fb_api_calls(reason="heatmap_snapshot_collector_adset_status"):
-                    refreshed = _refresh_adset_status_cache(str(aid), log=log)
-                if refreshed:
-                    adset_status_map = dict(refreshed)
-        except Exception:
-            adset_status_map = {}
-
-        data = None
-        with allow_fb_api_calls(reason="heatmap_snapshot_collector"):
-            if max_calls > 0:
-                calls_used += 1
-                try:
-                    from facebook_business.adobjects.adaccount import AdAccount
-
-                    acc = AdAccount(str(aid))
-                    params = {
-                        "level": "adset",
-                        "time_range": {"since": str(target_date_str), "until": str(target_date_str)},
-                        "breakdowns": ["hourly_stats_aggregated_by_advertiser_time_zone"],
-                        "time_increment": 1,
-                    }
-                    fields = [
-                        "spend",
-                        "actions",
-                        "impressions",
-                        "clicks",
-                        "frequency",
-                        "adset_id",
-                        "adset_name",
-                        "campaign_id",
-                        "campaign_name",
-                    ]
-
-                    # Persist meta for this attempt (snapshots-only debug relies on it).
-                    try:
-                        snap["meta"] = {
-                            "endpoint": "insights/adset/hourly",
-                            "fields": list(fields or []),
-                            "params": params,
-                            "last_http_status": None,
-                            "fb_code": None,
-                            "fb_subcode": None,
-                            "fbtrace_id": None,
-                            "message": None,
-                        }
-                    except Exception:
-                        pass
-
-                    try:
-                        log.info(
-                            "🟦 FB REQUEST aid=%s endpoint=%s date=%s hour=%s window=%s fields=%s",
-                            str(aid),
-                            "insights/adset/hourly",
-                            str(target_date_str),
-                            str(int(target_hour_int)),
-                            str(window_label),
-                            str(",".join([str(x) for x in (fields or [])])),
-                        )
-                    except Exception:
-                        pass
-                    data = safe_api_call(
-                        acc.get_insights,
-                        fields=fields,
-                        params=params,
-                        _meta={"endpoint": "insights/adset/hourly", "params": params},
-                        _caller="heatmap_snapshot_collector",
-                    )
-                except Exception:
-                    data = None
-
-        if not data:
-            info = get_last_api_error_info() or {}
             try:
-                et = str(classify_api_error(info))
-            except Exception:
-                et = "api_error"
-
-            # Always attach error meta for debug (do not clear existing if preservation rule triggers).
-            try:
-                if not preserve_existing_failure:
-                    snap_meta = snap.get("meta") if isinstance(snap.get("meta"), dict) else {}
-                    if not isinstance(snap_meta, dict):
-                        snap_meta = {}
-                    snap_meta.update(
-                        {
-                            "endpoint": (info or {}).get("endpoint") or (snap_meta or {}).get("endpoint") or "insights/adset/hourly",
-                            "last_http_status": (info or {}).get("http_status"),
-                            "fb_code": (info or {}).get("code"),
-                            "fb_subcode": (info or {}).get("subcode"),
-                            "fbtrace_id": (info or {}).get("fbtrace_id"),
-                            "message": (info or {}).get("message"),
-                            "params": (info or {}).get("params") or (snap_meta or {}).get("params"),
-                        }
-                    )
-                    snap["meta"] = snap_meta
-            except Exception:
-                pass
-
-            try:
-                log.warning(
-                    "🟦 FB ERROR aid=%s fb_code=%s message=%s window=%s",
-                    str(aid),
-                    str((info or {}).get("code")),
-                    str((info or {}).get("message") or ""),
-                    str(window_label),
-                )
-            except Exception:
-                pass
-
-        rows_out: list[dict] = []
-        if data:
-            for rr in (data or []):
-                d = _normalize_insight(rr)
-                raw_hour = str((d or {}).get("hourly_stats_aggregated_by_advertiser_time_zone") or "")
-                if not raw_hour:
-                    continue
-                hh_ok = raw_hour.startswith(f"{int(target_hour_int):02d}") or (f" {int(target_hour_int):02d}:" in raw_hour)
-                if not hh_ok:
-                    continue
-
-                try:
-                    parsed = parse_insight(d or {}, aid=str(aid), lead_action_type=lead_action_type)
-                except Exception:
-                    parsed = {"msgs": 0, "leads": 0, "total": 0, "spend": 0.0, "cpa": None}
-
-                actions_map: dict[str, float] = {}
-                try:
-                    for a in (d or {}).get("actions") or []:
-                        if not isinstance(a, dict):
-                            continue
-                        at = str(a.get("action_type") or "")
-                        if not at:
-                            continue
+                # Best-effort: if we have a snapshot dict in scope, mark it failed.
+                if "snap" in locals() and isinstance(locals().get("snap"), dict):
+                    s3 = locals().get("snap")
+                    if isinstance(s3, dict):
+                        if str(s3.get("status") or "") != "failed":
+                            s3["status"] = "failed"
+                        if not str(s3.get("reason") or ""):
+                            s3["reason"] = "snapshot_failed"
                         try:
-                            v = float(a.get("value") or 0)
+                            save_snapshot(s3)
                         except Exception:
-                            v = 0.0
-                        actions_map[at] = actions_map.get(at, 0.0) + float(v)
-                except Exception:
-                    actions_map = {}
-
-                try:
-                    started_conversations = int(count_started_conversations_from_actions(actions_map) or 0)
-                except Exception:
-                    started_conversations = int(parsed.get("msgs") or 0)
-
-                try:
-                    website_submit = int(count_website_submit_applications_from_actions(actions_map) or 0)
-                except Exception:
-                    website_submit = 0
-
-                adset_id = str((d or {}).get("adset_id") or "")
-                if not adset_id:
-                    continue
-                blended_total = int((started_conversations or 0) + (website_submit or 0))
-                spend = float(parsed.get("spend") or 0.0)
-                stt = None
-                try:
-                    stt = adset_status_map.get(str(adset_id))
-                except Exception:
-                    stt = None
-                rows_out.append(
-                    {
-                        "adset_id": adset_id,
-                        "name": (d or {}).get("adset_name") or (d or {}).get("name"),
-                        "adset_status": str(stt or "UNKNOWN"),
-                        "campaign_id": (d or {}).get("campaign_id"),
-                        "campaign_name": (d or {}).get("campaign_name"),
-                        "spend": spend,
-                        "started_conversations": int(started_conversations or 0),
-                        "website_submit_applications": int(website_submit or 0),
-                        "msgs": int(started_conversations or 0),
-                        "leads": int(website_submit or 0),
-                        "total": int(blended_total or 0),
-                        "results": int(blended_total or 0),
-                        "cpl": parsed.get("cpa"),
-                        "hour": int(target_hour_int),
-                    }
-                )
-
-        try:
-            log.info(
-                "🟦 FB RESPONSE aid=%s endpoint=%s rows=%s spend=%s window=%s",
-                str(aid),
-                "insights/adset/hourly",
-                str(int(len(rows_out or []))),
-                str(float(sum(float((r or {}).get("spend") or 0.0) for r in (rows_out or [])))),
-                str(window_label),
-            )
-        except Exception:
-            pass
-
-        try:
-            started_total = int(
-                sum(int((r or {}).get("started_conversations") or 0) for r in (rows_out or []) if isinstance(r, dict))
-            )
-        except Exception:
-            started_total = 0
-        try:
-            website_total = int(
-                sum(int((r or {}).get("website_submit_applications") or 0) for r in (rows_out or []) if isinstance(r, dict))
-            )
-        except Exception:
-            website_total = 0
-        try:
-            spend_total_actions = float(
-                sum(float((r or {}).get("spend") or 0.0) for r in (rows_out or []) if isinstance(r, dict))
-            )
-        except Exception:
-            spend_total_actions = 0.0
-        try:
-            log.info(
-                "🟦 FB ACTIONS PARSED aid=%s started_conversations=%s website_submit_applications=%s spend=%s rows=%s window=%s",
-                str(aid),
-                str(int(started_total)),
-                str(int(website_total)),
-                str(float(spend_total_actions)),
-                str(int(len(rows_out or []))),
-                str(window_label),
-            )
-        except Exception:
-            pass
-
-        snap["rows"] = rows_out
-        snap["collected_rows"] = int(len(rows_out))
-        snap["rows_count"] = int(len(rows_out))
-        try:
-            snap["spend"] = float(sum(float((r or {}).get("spend") or 0.0) for r in (rows_out or [])))
-        except Exception:
-            snap["spend"] = 0.0
-
-        try:
-            rows_cnt = int(len(rows_out or []))
-        except Exception:
-            rows_cnt = 0
-        try:
-            spend_total = float(snap.get("spend") or 0.0)
-        except Exception:
-            spend_total = 0.0
-
-        min_rows = int(snap.get("min_rows_required") or min_rows_required)
-
-        if rows_cnt > 0 and spend_total > 0 and rows_cnt >= min_rows:
-            snap["status"] = "ready"
-            snap["reason"] = ""
-            snap["next_try_at"] = None
-            snap["error"] = None
-        elif rows_cnt > 0 and spend_total > 0:
-            snap["status"] = "ready_low_confidence"
-            snap["reason"] = "low_volume"
-            snap["next_try_at"] = None
-            snap["error"] = None
-        else:
-            info = get_last_api_error_info() or {}
-            et = "api_error"
-            try:
-                et = str(classify_api_error(info))
+                            pass
             except Exception:
-                et = "api_error"
-
-            code = None
-            msg = ""
-            try:
-                code = int((info or {}).get("code") or 0)
-            except Exception:
-                code = None
-            try:
-                msg = str((info or {}).get("message") or "")
-            except Exception:
-                msg = ""
-
-            preserve_now = False
-            try:
-                preserve_now = str((snap or {}).get("status") or "") == "failed" or _has_real_reason(snap)
-            except Exception:
-                preserve_now = False
-
-            # If we already have a real reason (or failed), do not overwrite anything.
-            if preserve_now:
-                snap["reason"] = snap.get("reason")
-                snap["error"] = snap.get("error")
-                snap["meta"] = snap.get("meta")
-                snap["next_try_at"] = snap.get("next_try_at")
-            else:
-                rr = _map_fb_reason(info, et)
-                snap["reason"] = rr
-                if rr == "fb_invalid_fields":
-                    snap["status"] = "failed"
-                    try:
-                        snap["next_try_at"] = (now + timedelta(hours=6)).isoformat()
-                    except Exception:
-                        snap["next_try_at"] = snap.get("next_try_at")
-                elif rr in {"fb_auth", "fb_permission"}:
-                    snap["status"] = "failed"
-                else:
-                    snap["status"] = "collecting"
-
-                snap["error"] = {
-                    "type": rr,
-                    "fb_code": (info or {}).get("code"),
-                    "fb_subcode": (info or {}).get("subcode"),
-                    "fbtrace_id": (info or {}).get("fbtrace_id"),
-                    "message": (info or {}).get("message"),
-                    "http_status": (info or {}).get("http_status"),
-                }
-
-                try:
-                    snap_meta = snap.get("meta") if isinstance(snap.get("meta"), dict) else {}
-                    if not isinstance(snap_meta, dict):
-                        snap_meta = {}
-                    snap_meta.update(
-                        {
-                            "endpoint": (info or {}).get("endpoint") or (snap_meta or {}).get("endpoint"),
-                            "last_http_status": (info or {}).get("http_status"),
-                            "fb_code": (info or {}).get("code"),
-                            "fb_subcode": (info or {}).get("subcode"),
-                            "fbtrace_id": (info or {}).get("fbtrace_id"),
-                            "message": (info or {}).get("message"),
-                            "params": (info or {}).get("params") or (snap_meta or {}).get("params"),
-                        }
-                    )
-                    snap["meta"] = snap_meta
-                except Exception:
-                    pass
-
-        save_snapshot(snap)
-
-        hh = f"{int(hour_int):02d}"
-        snap_path = os.path.join(
-            str(os.getenv("DATA_DIR", "")) or "DATA_DIR",
-            "heatmap_snapshots",
-            str(aid),
-            str(date_str),
-            hh,
-            "snapshot.json",
-        )
-        log.info(
-            "🟦 SNAPSHOT SAVED aid=%s status=%s reason=%s rows=%s spend=%s window=%s path=%s",
-            str(aid),
-            str(snap.get("status") or ""),
-            str(snap.get("reason") or ""),
-            str(int(snap.get("rows_count") or 0)),
-            str(float(snap.get("spend") or 0.0)),
-            str(window_label),
-            str(snap_path),
-        )
-
-        if manual and manual_aid:
-            # One attempt in manual mode.
-            break
+                pass
+            continue
 
 
 async def run_heatmap_snapshot_collector_once(
