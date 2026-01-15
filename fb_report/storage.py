@@ -2,6 +2,7 @@
 import json
 import os
 import shutil
+import time
 from datetime import datetime
 
 from facebook_business.adobjects.user import User
@@ -477,6 +478,49 @@ def clear_lead_metric_for_account(aid: str) -> None:
     row = store.get(str(aid)) or {}
     if "lead_metric" in row:
         row.pop("lead_metric", None)
+    store[str(aid)] = row
+    save_accounts(store)
+
+
+def get_lead_metric_catalog_for_account(aid: str) -> dict | None:
+    store = load_accounts() or {}
+    row = store.get(str(aid)) or {}
+    cat = row.get("lead_metric_catalog")
+    if not isinstance(cat, dict):
+        return None
+    ts = cat.get("ts")
+    items = cat.get("items")
+    if not isinstance(items, list):
+        return None
+    try:
+        ts_f = float(ts or 0.0)
+    except Exception:
+        ts_f = 0.0
+    if ts_f <= 0:
+        return None
+    lookback_days = cat.get("lookback_days")
+    try:
+        lookback_days_i = int(lookback_days) if lookback_days not in (None, "") else None
+    except Exception:
+        lookback_days_i = None
+    return {"ts": ts_f, "items": items, "lookback_days": lookback_days_i}
+
+
+def set_lead_metric_catalog_for_account(
+    aid: str,
+    *,
+    items: list[dict],
+    lookback_days: int | None = None,
+) -> None:
+    store = load_accounts() or {}
+    row = store.get(str(aid)) or {}
+    payload: dict = {"ts": float(time.time()), "items": list(items or [])}
+    if lookback_days is not None:
+        try:
+            payload["lookback_days"] = int(lookback_days)
+        except Exception:
+            pass
+    row["lead_metric_catalog"] = payload
     store[str(aid)] = row
     save_accounts(store)
 

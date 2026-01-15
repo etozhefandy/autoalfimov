@@ -49,6 +49,8 @@ from .storage import (
     get_lead_metric_for_account,
     set_lead_metric_for_account,
     clear_lead_metric_for_account,
+    get_lead_metric_catalog_for_account,
+    set_lead_metric_catalog_for_account,
     set_autopilot_chat_id,
     resolve_autopilot_chat_id,
 )
@@ -81,6 +83,7 @@ from .autopilot_format import ap_action_text
 
 from services.facebook_api import (
     pause_ad,
+    fetch_insights_bulk,
     get_last_api_error_info,
     is_rate_limited_now,
     rate_limit_retry_after_seconds,
@@ -1153,6 +1156,196 @@ def _lead_metric_label_for_action_type(action_type: str) -> str:
         return at.replace("_", " ").strip().capitalize()
 
     return at
+
+
+LEAD_METRIC_LOOKBACK_DAYS = 30
+LEAD_METRIC_CATALOG_TTL_S = 12 * 3600
+LEAD_METRIC_PAGE_SIZE = 12
+
+
+def _lead_metric_is_pixel_conversion_action_type(action_type: str) -> bool:
+    at = str(action_type or "").strip()
+    if not at:
+        return False
+    low = at.lower()
+    if low.startswith("offsite_conversion"):
+        return True
+    if low.startswith("website"):
+        return True
+    if low.startswith("omni_"):
+        return True
+    if low in {
+        "lead",
+        "submit_application",
+        "complete_registration",
+        "purchase",
+        "add_payment_info",
+        "initiate_checkout",
+        "contact",
+        "schedule",
+        "view_content",
+    }:
+        return True
+    return False
+
+
+def _lead_metric_discover_catalog_from_insights(
+    aid: str,
+    *,
+    lookback_days: int = LEAD_METRIC_LOOKBACK_DAYS,
+    level: str = "adset",
+) -> list[dict]:
+    now = datetime.now(ALMATY_TZ).date()
+    until = now.strftime("%Y-%m-%d")
+    since = (now - timedelta(days=max(1, int(lookback_days)) - 1)).strftime("%Y-%m-%d")
+    period = {"since": since, "until": until}
+    rows: list[dict] = []
+    with allow_fb_api_calls(reason="lead_metric_catalog_discover"):
+        rows = fetch_insights_bulk(
+            str(aid),
+            period=period,
+            level=str(level),
+            fields=["actions", "action_values"],
+            params_extra={"action_report_time": "conversion", "use_unified_attribution_setting": True},
+        )
+
+    uniq: dict[str, str] = {}
+    for r in (rows or []):
+        for a in (r or {}).get("actions") or []:
+            if not isinstance(a, dict):
+                continue
+            at = str(a.get("action_type") or "").strip()
+            if not at:
+                continue
+            if not _lead_metric_is_pixel_conversion_action_type(at):
+                continue
+            if at not in uniq:
+                uniq[at] = _lead_metric_label_for_action_type(at)
+
+    out = [{"action_type": k, "label": v} for k, v in uniq.items()]
+    out.sort(key=lambda x: (str(x.get("label") or ""), str(x.get("action_type") or "")))
+    return out
+
+
+def _lead_metric_get_catalog_cached(
+    aid: str,
+    *,
+    force_refresh: bool = False,
+    lookback_days: int = LEAD_METRIC_LOOKBACK_DAYS,
+) -> tuple[list[dict], str, float | None]:
+    cat = get_lead_metric_catalog_for_account(str(aid))
+    now_ts = float(pytime.time())
+    if cat and not force_refresh:
+        try:
+            age_s = now_ts - float(cat.get("ts") or 0.0)
+        except Exception:
+            age_s = None
+        if age_s is not None and age_s <= float(LEAD_METRIC_CATALOG_TTL_S):
+            return list(cat.get("items") or []), "cache", age_s
+
+    try:
+        items = _lead_metric_discover_catalog_from_insights(
+            str(aid),
+            lookback_days=int(lookback_days),
+            level="adset",
+        )
+        if items:
+            set_lead_metric_catalog_for_account(str(aid), items=items, lookback_days=int(lookback_days))
+            return items, "fb", 0.0
+    except Exception:
+        pass
+
+    if cat:
+        try:
+            age_s = now_ts - float(cat.get("ts") or 0.0)
+        except Exception:
+            age_s = None
+        return list(cat.get("items") or []), "stale_cache", age_s
+    return [], "empty", None
+
+
+def _lead_metric_human_cache_age(age_s: float | None) -> str:
+    if age_s is None:
+        return "unknown"
+    if age_s < 60:
+        return f"{int(age_s)}s"
+    if age_s < 3600:
+        return f"{int(age_s // 60)}m"
+    return f"{int(age_s // 3600)}h"
+
+
+def _lead_metric_choose_page(
+    *,
+    aid: str,
+    items: list[dict],
+    page: int,
+    query: str,
+) -> tuple[str, InlineKeyboardMarkup]:
+    q = str(query or "").strip().lower()
+    cur = get_lead_metric_for_account(str(aid))
+    cur_at = str((cur or {}).get("action_type") or "").strip() if cur else ""
+    filtered = []
+    for it in (items or []):
+        at = str((it or {}).get("action_type") or "").strip()
+        label = str((it or {}).get("label") or at).strip()
+        if not at:
+            continue
+        if q and (q not in at.lower()) and (q not in label.lower()):
+            continue
+        filtered.append({"action_type": at, "label": label})
+
+    total = len(filtered)
+    if total <= 0:
+        text = "Не найдено конверсий по запросу." if q else "Не найдено конверсий (actions) за lookback."
+        kb = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("🔄 Обновить список", callback_data=f"lead_metric_refresh|{aid}")],
+                [InlineKeyboardButton("🔎 Поиск", callback_data=f"lead_metric_search|{aid}")],
+                [InlineKeyboardButton("⬅️ Назад", callback_data=f"lead_metric|{aid}")],
+            ]
+        )
+        return text, kb
+
+    max_page = max(0, (total - 1) // int(LEAD_METRIC_PAGE_SIZE))
+    p = max(0, min(int(page), int(max_page)))
+    start = p * int(LEAD_METRIC_PAGE_SIZE)
+    end = start + int(LEAD_METRIC_PAGE_SIZE)
+    slice_items = filtered[start:end]
+
+    rows = []
+    for i, it in enumerate(slice_items):
+        idx = start + i
+        label = str(it.get("label") or it.get("action_type"))
+        if cur_at and str(it.get("action_type") or "") == cur_at:
+            label = f"✅ {label}"
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    label,
+                    callback_data=f"lead_metric_set2|{aid}|{idx}",
+                )
+            ]
+        )
+
+    nav = []
+    if p > 0:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"lead_metric_page|{aid}|{p-1}"))
+    nav.append(InlineKeyboardButton(f"{p+1}/{max_page+1}", callback_data=f"lead_metric_page|{aid}|{p}"))
+    if p < max_page:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"lead_metric_page|{aid}|{p+1}"))
+    if nav:
+        rows.append(nav)
+
+    rows.append([InlineKeyboardButton("🔄 Обновить список", callback_data=f"lead_metric_refresh|{aid}")])
+    rows.append([InlineKeyboardButton("🔎 Поиск", callback_data=f"lead_metric_search|{aid}")])
+    if q:
+        rows.append([InlineKeyboardButton("✖️ Сбросить поиск", callback_data=f"lead_metric_choose|{aid}")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"lead_metric|{aid}")])
+
+    text = "Выбери конверсию (Pixel/website) для метрики лидов."
+    if q:
+        text += f"\n\nПоиск: {query}"
+    return text, InlineKeyboardMarkup(rows)
 
 
 def _autopilot_get(aid: str) -> dict:
@@ -6349,14 +6542,19 @@ async def _on_cb_internal(
         aid = data.split("|", 1)[1]
         sel = get_lead_metric_for_account(aid)
         if sel:
-            current = f"✅ {sel.get('label') or sel.get('action_type')}"
+            current = f"✅ {sel.get('label') or sel.get('action_type')} (action_type={sel.get('action_type')})"
         else:
             current = "Стандартная (по умолчанию)"
+
+        _items, src, age_s = _lead_metric_get_catalog_cached(aid, force_refresh=False)
+        src_str = str(src)
+        age_h = _lead_metric_human_cache_age(age_s)
 
         text = (
             f"📊 Метрика лидов — {get_account_name(aid)}\n\n"
             f"Текущая метрика: {current}\n\n"
-            "Если метрика не выбрана, бот считает лиды по стандартным action_type."
+            "Если метрика не выбрана, бот считает лиды по стандартным action_type.\n\n"
+            f"Источник списка конверсий: {src_str} (age={age_h})"
         )
 
         kb = InlineKeyboardMarkup(
@@ -6371,6 +6569,12 @@ async def _on_cb_internal(
                     InlineKeyboardButton(
                         "Сбросить (стандартная)",
                         callback_data=f"lead_metric_clear|{aid}",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🔄 Обновить список",
+                        callback_data=f"lead_metric_refresh|{aid}",
                     )
                 ],
                 [
@@ -6395,19 +6599,24 @@ async def _on_cb_internal(
 
     if data.startswith("lead_metric_debug|"):
         aid = data.split("|", 1)[1]
-        raw = _discover_actions_for_account(aid)
-        if not raw:
-            text = (
-                f"action_type за вчера — {get_account_name(aid)}\n\n"
-                "Нет ненулевых action_type за вчера (или нет доступа)."
-            )
+        sel = get_lead_metric_for_account(aid)
+        items, src, age_s = _lead_metric_get_catalog_cached(aid, force_refresh=False)
+        lines = [f"lead_metric debug — {get_account_name(aid)}", ""]
+        if sel:
+            lines.append(f"selected_action_type={str(sel.get('action_type') or '')}")
         else:
-            lines = [f"action_type за вчера — {get_account_name(aid)}", ""]
-            for it in raw:
-                at = (it or {}).get("action_type")
+            lines.append("selected_action_type=(default)")
+        lines.append(f"catalog_source={str(src)}")
+        lines.append(f"catalog_age={_lead_metric_human_cache_age(age_s)}")
+        lines.append(f"catalog_items={int(len(items or []))}")
+        if items:
+            lines.append("")
+            lines.append("first_items:")
+            for it in list(items or [])[:20]:
+                at = str((it or {}).get("action_type") or "").strip()
                 if at:
                     lines.append(f"- {at}")
-            text = "\n".join(lines)
+        text = "\n".join(lines)
         kb = InlineKeyboardMarkup(
             [[InlineKeyboardButton("⬅️ Назад", callback_data=f"lead_metric|{aid}")]]
         )
@@ -6416,62 +6625,105 @@ async def _on_cb_internal(
 
     if data.startswith("lead_metric_choose|"):
         aid = data.split("|", 1)[1]
-        options = _discover_lead_metrics_for_account(aid)
-        if not options:
-            kb = InlineKeyboardMarkup(
-                [[InlineKeyboardButton("⬅️ Назад", callback_data=f"lead_metric|{aid}")]]
-            )
-            await safe_edit_message(
-                q,
-                "❗️Не найдено метрик лидов с сайта за вчера.\n"
-                "Проверь выбранный период или события в Ads Manager.",
-                reply_markup=kb,
-            )
+        items, src, age_s = _lead_metric_get_catalog_cached(aid, force_refresh=False)
+        context.user_data["lead_metric_catalog"] = {
+            "aid": str(aid),
+            "items": list(items or []),
+            "query": "",
+            "page": 0,
+            "source": str(src),
+            "age_s": age_s,
+        }
+        text, kb = _lead_metric_choose_page(aid=str(aid), items=list(items or []), page=0, query="")
+        await safe_edit_message(q, text, reply_markup=kb)
+        return
+
+    if data.startswith("lead_metric_refresh|"):
+        aid = data.split("|", 1)[1]
+        items, src, age_s = _lead_metric_get_catalog_cached(aid, force_refresh=True)
+        context.user_data["lead_metric_catalog"] = {
+            "aid": str(aid),
+            "items": list(items or []),
+            "query": "",
+            "page": 0,
+            "source": str(src),
+            "age_s": age_s,
+        }
+        try:
+            await q.answer("Список обновлён.")
+        except Exception:
+            pass
+        text, kb = _lead_metric_choose_page(aid=str(aid), items=list(items or []), page=0, query="")
+        await safe_edit_message(q, text, reply_markup=kb)
+        return
+
+    if data.startswith("lead_metric_page|"):
+        try:
+            _p, aid, page_s = data.split("|", 2)
+        except ValueError:
             return
+        stash = context.user_data.get("lead_metric_catalog") or {}
+        if str(stash.get("aid") or "") != str(aid):
+            await q.answer("Список устарел. Нажми 'Сменить' ещё раз.", show_alert=True)
+            return
+        items = list(stash.get("items") or [])
+        query = str(stash.get("query") or "")
+        try:
+            page_i = int(page_s)
+        except Exception:
+            page_i = 0
+        stash["page"] = page_i
+        context.user_data["lead_metric_catalog"] = stash
+        text, kb = _lead_metric_choose_page(aid=str(aid), items=items, page=page_i, query=query)
+        await safe_edit_message(q, text, reply_markup=kb)
+        return
 
-        if len(options) == 1:
-            it = options[0] or {}
-            action_type = it.get("action_type")
-            label = it.get("label")
-            if action_type:
-                set_lead_metric_for_account(
-                    aid,
-                    action_type=str(action_type),
-                    label=str(label or action_type),
-                )
-                try:
-                    await q.answer("Метрика выбрана автоматически.")
-                except Exception:
-                    pass
-                await context.bot.send_message(
-                    chat_id,
-                    f"Метрика лидов выбрана автоматически: {label or action_type}",
-                )
-                new_data = f"lead_metric|{aid}"
-                await _on_cb_internal(update, context, q, chat_id, new_data)
-                return
+    if data.startswith("lead_metric_search|"):
+        aid = data.split("|", 1)[1]
+        context.user_data["await_lead_metric_search_for"] = {"aid": str(aid)}
+        await safe_edit_message(q, "Напиши текст для поиска по label/action_type (например lead или submit).")
+        return
 
-        mapping = {str(i): it for i, it in enumerate(options)}
-        context.user_data["lead_metric_options"] = {"aid": aid, "items": mapping}
-
-        current = get_lead_metric_for_account(aid)
-        current_at = (current or {}).get("action_type") if current else None
-
-        rows = []
-        for i, it in mapping.items():
-            label = it.get("label") or it.get("action_type")
-            if current_at and it.get("action_type") == current_at:
-                label = f"✅ {label}"
-            rows.append(
-                [
-                    InlineKeyboardButton(
-                        str(label),
-                        callback_data=f"lead_metric_set|{aid}|{i}",
-                    )
-                ]
-            )
-        rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"lead_metric|{aid}")])
-        await safe_edit_message(q, "Выбери метрику лидов (за вчера):", reply_markup=InlineKeyboardMarkup(rows))
+    if data.startswith("lead_metric_set2|"):
+        try:
+            _p, aid, idx_s = data.split("|", 2)
+        except ValueError:
+            await q.answer("Некорректные данные выбора метрики.", show_alert=True)
+            return
+        stash = context.user_data.get("lead_metric_catalog") or {}
+        if str(stash.get("aid") or "") != str(aid):
+            await q.answer("Список устарел. Нажми 'Сменить' ещё раз.", show_alert=True)
+            return
+        items = list(stash.get("items") or [])
+        query = str(stash.get("query") or "")
+        filtered = []
+        qlow = query.strip().lower()
+        for it in (items or []):
+            at = str((it or {}).get("action_type") or "").strip()
+            label = str((it or {}).get("label") or at).strip()
+            if not at:
+                continue
+            if qlow and (qlow not in at.lower()) and (qlow not in label.lower()):
+                continue
+            filtered.append({"action_type": at, "label": label})
+        try:
+            idx = int(idx_s)
+        except Exception:
+            idx = -1
+        if idx < 0 or idx >= len(filtered):
+            await q.answer("Метрика не найдена. Обнови список.", show_alert=True)
+            return
+        it = filtered[idx]
+        action_type = it.get("action_type")
+        label = it.get("label")
+        if not action_type:
+            await q.answer("Пустой action_type.", show_alert=True)
+            return
+        set_lead_metric_for_account(aid, action_type=str(action_type), label=str(label or action_type))
+        await q.answer("Метрика лидов обновлена.")
+        await context.bot.send_message(chat_id, "Метрика лидов обновлена. Все отчёты и ИИ теперь считают по ней.")
+        new_data = f"lead_metric|{aid}"
+        await _on_cb_internal(update, context, q, chat_id, new_data)
         return
 
     if data.startswith("lead_metric_set|"):
@@ -7194,6 +7446,40 @@ async def on_text_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = update.message.text.strip()
+
+    if "await_lead_metric_search_for" in context.user_data:
+        payload = context.user_data.pop("await_lead_metric_search_for") or {}
+        aid = str(payload.get("aid") or "")
+        if not aid:
+            await update.message.reply_text("Не удалось применить поиск: контекст аккаунта потерян.")
+            return
+        query = str(text or "").strip()
+        stash = context.user_data.get("lead_metric_catalog") or {}
+        if str(stash.get("aid") or "") != str(aid):
+            items, src, age_s = _lead_metric_get_catalog_cached(aid, force_refresh=False)
+            stash = {
+                "aid": str(aid),
+                "items": list(items or []),
+                "query": "",
+                "page": 0,
+                "source": str(src),
+                "age_s": age_s,
+            }
+        stash["query"] = query
+        stash["page"] = 0
+        context.user_data["lead_metric_catalog"] = stash
+
+        try:
+            text_list, kb = _lead_metric_choose_page(
+                aid=str(aid),
+                items=list(stash.get("items") or []),
+                page=0,
+                query=query,
+            )
+            await update.message.reply_text(text_list, reply_markup=kb)
+        except Exception:
+            await update.message.reply_text("Поиск применён. Открой 'Сменить' ещё раз, чтобы увидеть список.")
+        return
 
     if "await_ap_group_rename" in context.user_data:
         payload = context.user_data.pop("await_ap_group_rename") or {}
