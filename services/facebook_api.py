@@ -179,15 +179,31 @@ def safe_api_call(fn, *args, **kwargs):
     """
     global _LAST_API_ERROR, _LAST_API_ERROR_AT
     meta = kwargs.pop("_meta", None)
+    aid = kwargs.pop("_aid", None)
     endpoint = None
+    path = None
     meta_params = None
     try:
         if isinstance(meta, dict):
             endpoint = meta.get("endpoint") or meta.get("path") or meta.get("name")
+            path = meta.get("path")
             meta_params = meta.get("params")
+            if not aid:
+                aid = meta.get("aid") or meta.get("account_id")
     except Exception:
         endpoint = None
+        path = None
         meta_params = None
+
+    if not aid and path:
+        try:
+            p = str(path)
+            if p.startswith("/"):
+                p = p[1:]
+            if p:
+                aid = p.split("/", 1)[0]
+        except Exception:
+            aid = None
 
     # Policy guard:
     # - if deny_fb_api_calls() is active -> block by default
@@ -221,13 +237,17 @@ def safe_api_call(fn, *args, **kwargs):
             "kind": "blocked_by_policy",
             "message": "FB API call blocked by policy",
             "endpoint": endpoint,
+            "path": path,
+            "aid": str(aid or ""),
             "caller": str(caller or ""),
         }
         _set_last_error_info(info)
         try:
             logging.getLogger(__name__).warning(
-                "🟦 FB BLOCKED BY POLICY endpoint=%s caller=%s allow_reason=%s deny_reason=%s",
+                "🟦 FB BLOCKED BY POLICY endpoint=%s path=%s aid=%s caller=%s allow_reason=%s deny_reason=%s",
                 str(endpoint),
+                str(path or ""),
+                str(aid or ""),
                 str(effective_caller or ""),
                 str(_FB_API_ALLOW_REASON or ""),
                 str(_FB_API_DENY_REASON or ""),
@@ -239,8 +259,10 @@ def safe_api_call(fn, *args, **kwargs):
     if is_rate_limited_now():
         try:
             logging.getLogger(__name__).warning(
-                "🟦 FB RATE LIMIT endpoint=%s retry_after=%ss",
+                "🟦 FB RATE LIMIT endpoint=%s path=%s aid=%s retry_after=%ss",
                 str(endpoint),
+                str(path or ""),
+                str(aid or ""),
                 str(rate_limit_retry_after_seconds()),
             )
         except Exception:
@@ -251,14 +273,19 @@ def safe_api_call(fn, *args, **kwargs):
                 "message": "User request limit reached (rate limited)",
                 "kind": "rate_limit",
                 "endpoint": endpoint,
+                "path": path,
+                "aid": str(aid or ""),
+                "caller": str(effective_caller or ""),
             }
         )
         return None
     try:
         try:
             logging.getLogger(__name__).info(
-                "🟦 FB REQUEST endpoint=%s caller=%s allow_ctx=%s deny_ctx=%s",
+                "🟦 FB REQUEST endpoint=%s path=%s aid=%s caller=%s allow_ctx=%s deny_ctx=%s",
                 str(endpoint),
+                str(path or ""),
+                str(aid or ""),
                 str(effective_caller or ""),
                 "TRUE" if allow_active else "FALSE",
                 "TRUE" if deny_active else "FALSE",
@@ -274,8 +301,10 @@ def safe_api_call(fn, *args, **kwargs):
             except Exception:
                 n = None
             logging.getLogger(__name__).info(
-                "🟦 FB RESPONSE endpoint=%s ok=TRUE items=%s",
+                "🟦 FB RESPONSE endpoint=%s path=%s aid=%s ok=TRUE items=%s",
                 str(endpoint),
+                str(path or ""),
+                str(aid or ""),
                 str(n) if n is not None else "?",
             )
         except Exception:
@@ -317,6 +346,9 @@ def safe_api_call(fn, *args, **kwargs):
             "subcode": subcode,
             "message": _LAST_API_ERROR,
             "endpoint": endpoint,
+            "path": path,
+            "aid": str(aid or ""),
+            "caller": str(effective_caller or ""),
             "http_status": http_status,
             "params": _sanitize_params(meta_params) or _sanitize_params(kwargs.get("params")),
         }
@@ -343,8 +375,10 @@ def safe_api_call(fn, *args, **kwargs):
 
             try:
                 logging.getLogger(__name__).warning(
-                    "🟦 FB RATE LIMIT endpoint=%s retry_after=%ss fb_code=%s fb_subcode=%s",
+                    "🟦 FB RATE LIMIT endpoint=%s path=%s aid=%s retry_after=%ss fb_code=%s fb_subcode=%s",
                     str(endpoint),
+                    str(path or ""),
+                    str(aid or ""),
                     str(rate_limit_retry_after_seconds()),
                     str(code),
                     str(subcode),
@@ -354,8 +388,10 @@ def safe_api_call(fn, *args, **kwargs):
 
         try:
             logging.getLogger(__name__).warning(
-                "🟦 FB ERROR endpoint=%s fb_code=%s fb_subcode=%s message=%s",
+                "🟦 FB ERROR endpoint=%s path=%s aid=%s fb_code=%s fb_subcode=%s message=%s",
                 str(endpoint),
+                str(path or ""),
+                str(aid or ""),
                 str(code),
                 str(subcode),
                 str(_LAST_API_ERROR or ""),
@@ -372,11 +408,22 @@ def safe_api_call(fn, *args, **kwargs):
             _LAST_API_ERROR_AT = datetime.utcnow().isoformat()
         except Exception:
             _LAST_API_ERROR_AT = None
-        _set_last_error_info({"kind": "exception", "message": _LAST_API_ERROR})
+        _set_last_error_info(
+            {
+                "kind": "exception",
+                "message": _LAST_API_ERROR,
+                "endpoint": endpoint,
+                "path": path,
+                "aid": str(aid or ""),
+                "caller": str(effective_caller or ""),
+            }
+        )
         try:
             logging.getLogger(__name__).warning(
-                "🟦 FB ERROR endpoint=%s message=%s",
+                "🟦 FB ERROR endpoint=%s path=%s aid=%s message=%s",
                 str(endpoint),
+                str(path or ""),
+                str(aid or ""),
                 str(_LAST_API_ERROR or ""),
             )
         except Exception:

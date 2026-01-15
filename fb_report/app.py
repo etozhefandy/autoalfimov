@@ -6005,8 +6005,8 @@ async def _on_cb_internal(
         )
         return
     if data == "billing_current":
-        await safe_edit_message(q, "📋 Биллинги (неактивные аккаунты):")
-        await send_billing(context, chat_id)
+        await safe_edit_message(q, "📋 Биллинги (все аккаунты):")
+        await send_billing(context, chat_id, only_inactive=False)
         return
     if data == "billing_forecast":
         await safe_edit_message(q, "🔮 Считаю прогноз списаний…")

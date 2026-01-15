@@ -106,7 +106,8 @@ async def _billing_followup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             AdAccount(str(aid)).api_get,
             fields=["balance"],
             params={},
-            _meta={"endpoint": "adaccount", "params": {"fields": "balance"}},
+            _aid=str(aid),
+            _meta={"endpoint": "adaccount", "path": f"/{str(aid)}", "params": {"fields": "balance"}},
             _caller="billing_followup",
         )
     if isinstance(info, dict):
@@ -176,7 +177,12 @@ async def _billing_watch_job(
                 AdAccount(str(aid)).api_get,
                 fields=["name", "account_status", "balance"],
                 params={},
-                _meta={"endpoint": "adaccount", "params": {"fields": "name,account_status,balance"}},
+                _aid=str(aid),
+                _meta={
+                    "endpoint": "adaccount",
+                    "path": f"/{str(aid)}",
+                    "params": {"fields": "name,account_status,balance"},
+                },
                 _caller="billing_watch_poll",
             )
         if not isinstance(info, dict):
