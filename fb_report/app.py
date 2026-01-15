@@ -3228,6 +3228,24 @@ def _build_heatmap_debug_last_text(*, aid: str) -> str:
     cov_today, miss_today = _coverage_for(today_s)
     cov_yday, miss_yday = _coverage_for(yday_s)
 
+    last_failed = None
+    try:
+        cur2 = now.replace(minute=0, second=0, microsecond=0)
+        for _ in range(int(max_lookback)):
+            cur2 = cur2 - timedelta(hours=1)
+            ds2 = cur2.strftime("%Y-%m-%d")
+            hh2 = int(cur2.strftime("%H"))
+            with deny_fb_api_calls(reason="heatmap_debug_last_failed"):
+                s2 = load_snapshot(str(aid), date_str=str(ds2), hour=int(hh2))
+            if not s2:
+                continue
+            if str(s2.get("status") or "") != "failed":
+                continue
+            last_failed = s2
+            break
+    except Exception:
+        last_failed = None
+
     lines: list[str] = []
     lines.append(f"🧪 heatmap_debug_last — {get_account_name(aid)}")
     lines.append(f"account_id={aid}")
@@ -3237,6 +3255,14 @@ def _build_heatmap_debug_last_text(*, aid: str) -> str:
     lines.append("")
     lines.append(f"coverage_today={cov_today}/24 missing_hours={','.join(miss_today)}")
     lines.append(f"coverage_yday={cov_yday}/24 missing_hours={','.join(miss_yday)}")
+    if last_failed:
+        try:
+            lf_date = str(last_failed.get("date") or "")
+            lf_hour = int(last_failed.get("hour") or 0)
+            lf_reason = str(last_failed.get("reason") or "snapshot_failed")
+            lines.append(f"last_failed_hour={lf_date} {lf_hour:02d} reason={lf_reason}")
+        except Exception:
+            pass
 
     if not last_snap:
         lines.append("")
@@ -3342,6 +3368,133 @@ async def cmd_heatmap_debug_last(update: Update, context: ContextTypes.DEFAULT_T
 
     txt = _build_heatmap_debug_last_text(aid=str(aid))
     await update.message.reply_text(txt)
+
+
+async def cmd_heatmap_debug_hour(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _allowed(update):
+        return
+
+    parts = (update.message.text or "").strip().split()
+    if len(parts) < 4:
+        await update.message.reply_text(
+            "Формат: /heatmap_debug_hour act_xxx YYYY-MM-DD HH"
+        )
+        return
+
+    aid = str(parts[1] or "").strip()
+    if not aid.startswith("act_"):
+        aid = "act_" + aid
+    date_s = str(parts[2] or "").strip()
+    hour_raw = str(parts[3] or "").strip()
+    try:
+        hour_i = int(hour_raw)
+    except Exception:
+        hour_i = 0
+    if hour_i < 0:
+        hour_i = 0
+    if hour_i > 23:
+        hour_i = 23
+
+    with deny_fb_api_calls(reason="heatmap_debug_hour"):
+        snap = load_snapshot(str(aid), date_str=str(date_s), hour=int(hour_i))
+
+    lines: list[str] = []
+    lines.append(f"🧪 heatmap_debug_hour — {get_account_name(aid)}")
+    lines.append(f"account_id={aid}")
+    lines.append(f"date={date_s} hour={hour_i:02d}")
+
+    if not snap:
+        lines.append("")
+        lines.append("snapshot=missing")
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    stt = str(snap.get("status") or "")
+    rsn = str(snap.get("reason") or "")
+    attempts = str(snap.get("attempts") or "")
+    last_try = str(snap.get("last_try_at") or "")
+    next_try = str(snap.get("next_try_at") or "")
+    deadline = str(snap.get("deadline_at") or "")
+    meta = snap.get("meta") if isinstance(snap.get("meta"), dict) else {}
+    if not isinstance(meta, dict):
+        meta = {}
+    err = snap.get("error") if isinstance(snap.get("error"), dict) else {}
+    if not isinstance(err, dict):
+        err = {}
+    rows = snap.get("rows") or []
+
+    lines.append("")
+    lines.append(f"snapshot_status={stt} snapshot_reason={rsn}")
+    lines.append(f"attempts={attempts} last_try_at={last_try} next_try_at={next_try}")
+    if deadline:
+        lines.append(f"deadline_at={deadline}")
+
+    try:
+        endpoint = meta.get("endpoint")
+        fields = meta.get("fields")
+        params = meta.get("params")
+        http_status = meta.get("last_http_status")
+        fb_code = meta.get("fb_code")
+        fbtrace_id = meta.get("fbtrace_id")
+        msg = meta.get("message")
+
+        if http_status in (None, ""):
+            http_status = err.get("http_status")
+        if fb_code in (None, ""):
+            fb_code = err.get("fb_code")
+        if fbtrace_id in (None, ""):
+            fbtrace_id = err.get("fbtrace_id")
+        if msg in (None, ""):
+            msg = err.get("message")
+
+        if any(x not in (None, "") for x in [endpoint, fields, params, http_status, fb_code, fbtrace_id, msg]):
+            lines.append("diagnostics:")
+            if endpoint:
+                lines.append(f"  endpoint={endpoint}")
+            if fields not in (None, ""):
+                lines.append(f"  fields={fields}")
+            if params not in (None, ""):
+                lines.append(f"  params={params}")
+            if http_status not in (None, ""):
+                lines.append(f"  last_http_status={http_status}")
+            if fb_code not in (None, ""):
+                lines.append(f"  fb_code={fb_code}")
+            if fbtrace_id not in (None, ""):
+                lines.append(f"  fbtrace_id={fbtrace_id}")
+            if msg not in (None, ""):
+                lines.append(f"  message={msg}")
+    except Exception:
+        pass
+
+    try:
+        started = 0
+        website = 0
+        spend = 0.0
+        used = 0
+        for r in (rows or []):
+            if not isinstance(r, dict):
+                continue
+            used += 1
+            try:
+                started += int(r.get("started_conversations") or r.get("msgs") or 0)
+            except Exception:
+                pass
+            try:
+                website += int(r.get("website_submit_applications") or r.get("leads") or 0)
+            except Exception:
+                pass
+            try:
+                spend += float(r.get("spend") or 0.0)
+            except Exception:
+                pass
+        lines.append(f"rows_count={int(len(rows) or 0)}")
+        lines.append(
+            f"sums started_conversations={int(started)} website_submit_applications={int(website)} blended={int(started + website)} spend={float(spend):.2f} rows_used={int(used)}"
+        )
+    except Exception:
+        pass
+
+    await update.message.reply_text("\n".join(lines))
 
 
 async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7645,6 +7798,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("heatmap", cmd_heatmap))
     app.add_handler(CommandHandler("heatmap_status", cmd_heatmap_status))
     app.add_handler(CommandHandler("heatmap_debug_last", cmd_heatmap_debug_last))
+    app.add_handler(CommandHandler("heatmap_debug_hour", cmd_heatmap_debug_hour))
 
     app.add_handler(CallbackQueryHandler(on_cb))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_any))

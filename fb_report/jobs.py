@@ -1085,11 +1085,17 @@ async def _heatmap_snapshot_collector_job(
     from services.heatmap_store import load_snapshot, save_snapshot, build_snapshot_shell
 
     now = datetime.now(ALMATY_TZ)
-    end_dt = now.replace(minute=0, second=0, microsecond=0)
-    start_dt = end_dt - timedelta(hours=1)
-    date_str = start_dt.strftime("%Y-%m-%d")
-    hour_int = int(start_dt.strftime("%H"))
-    deadline_dt = end_dt + timedelta(minutes=30)
+    end_dt_base = now.replace(minute=0, second=0, microsecond=0)
+    collector_deadline_dt = end_dt_base + timedelta(minutes=30)
+
+    try:
+        backfill_lookback_hours = int(os.getenv("HEATMAP_BACKFILL_LOOKBACK_HOURS", "48") or 48)
+    except Exception:
+        backfill_lookback_hours = 48
+    if backfill_lookback_hours < 1:
+        backfill_lookback_hours = 1
+    if backfill_lookback_hours > 96:
+        backfill_lookback_hours = 96
 
     try:
         min_rows_required = int(os.getenv("HEATMAP_MIN_ROWS_REQUIRED", "30") or 30)
@@ -1121,15 +1127,51 @@ async def _heatmap_snapshot_collector_job(
         if not (row or {}).get("enabled", True):
             continue
 
-        snap = load_snapshot(str(aid), date_str=date_str, hour=hour_int)
+        target_start_dt = None
+        target_end_dt = None
+        target_date_str = None
+        target_hour_int = None
+        target_window_label = None
+
+        try:
+            search_start = end_dt_base - timedelta(hours=int(backfill_lookback_hours))
+            search_end = end_dt_base - timedelta(hours=1)
+            dt_cur = search_start
+            while dt_cur <= search_end:
+                ds = dt_cur.strftime("%Y-%m-%d")
+                hh = int(dt_cur.strftime("%H"))
+                with deny_fb_api_calls(reason="heatmap_snapshot_collector_backfill_probe"):
+                    s_probe = load_snapshot(str(aid), date_str=str(ds), hour=int(hh))
+                if not s_probe:
+                    target_start_dt = dt_cur
+                    target_end_dt = dt_cur + timedelta(hours=1)
+                    target_date_str = str(ds)
+                    target_hour_int = int(hh)
+                    break
+                dt_cur = dt_cur + timedelta(hours=1)
+        except Exception:
+            target_start_dt = None
+
+        if not target_start_dt:
+            target_end_dt = end_dt_base
+            target_start_dt = end_dt_base - timedelta(hours=1)
+            target_date_str = target_start_dt.strftime("%Y-%m-%d")
+            target_hour_int = int(target_start_dt.strftime("%H"))
+
+        try:
+            target_window_label = f"{target_start_dt.strftime('%Y-%m-%d %H:00')}–{target_end_dt.strftime('%H:00')}"
+        except Exception:
+            target_window_label = f"{str(target_date_str)} {int(target_hour_int):02d}:00–{(int(target_hour_int) + 1) % 24:02d}:00"
+
+        snap = load_snapshot(str(aid), date_str=str(target_date_str), hour=int(target_hour_int))
         if not snap:
             snap = build_snapshot_shell(
                 str(aid),
-                date_str=date_str,
-                hour=hour_int,
-                start_dt=start_dt,
-                end_dt=end_dt,
-                deadline_dt=deadline_dt,
+                date_str=str(target_date_str),
+                hour=int(target_hour_int),
+                start_dt=target_start_dt,
+                end_dt=target_end_dt,
+                deadline_dt=collector_deadline_dt,
                 min_rows_required=min_rows_required,
             )
 
@@ -1149,10 +1191,7 @@ async def _heatmap_snapshot_collector_job(
             continue
 
         attempt_next = int((snap or {}).get("attempts") or 0) + 1
-        try:
-            window_label = f"{start_dt.strftime('%Y-%m-%d %H:00')}–{end_dt.strftime('%H:00')}"
-        except Exception:
-            window_label = f"{date_str} {hour_int:02d}:00–{(hour_int + 1) % 24:02d}:00"
+        window_label = str(target_window_label or "")
 
         preserve_existing_failure = False
         try:
@@ -1170,9 +1209,9 @@ async def _heatmap_snapshot_collector_job(
 
         try:
             dl_raw = (snap or {}).get("deadline_at")
-            dl = datetime.fromisoformat(str(dl_raw)) if dl_raw else deadline_dt
+            dl = datetime.fromisoformat(str(dl_raw)) if dl_raw else collector_deadline_dt
         except Exception:
-            dl = deadline_dt
+            dl = collector_deadline_dt
 
         if now > dl:
             err = (snap or {}).get("error")
@@ -1378,7 +1417,7 @@ async def _heatmap_snapshot_collector_job(
                     acc = AdAccount(str(aid))
                     params = {
                         "level": "adset",
-                        "time_range": {"since": date_str, "until": date_str},
+                        "time_range": {"since": str(target_date_str), "until": str(target_date_str)},
                         "breakdowns": ["hourly_stats_aggregated_by_advertiser_time_zone"],
                         "time_increment": 1,
                     }
@@ -1414,8 +1453,8 @@ async def _heatmap_snapshot_collector_job(
                             "🟦 FB REQUEST aid=%s endpoint=%s date=%s hour=%s window=%s fields=%s",
                             str(aid),
                             "insights/adset/hourly",
-                            str(date_str),
-                            str(int(hour_int)),
+                            str(target_date_str),
+                            str(int(target_hour_int)),
                             str(window_label),
                             str(",".join([str(x) for x in (fields or [])])),
                         )
@@ -1477,7 +1516,7 @@ async def _heatmap_snapshot_collector_job(
                 raw_hour = str((d or {}).get("hourly_stats_aggregated_by_advertiser_time_zone") or "")
                 if not raw_hour:
                     continue
-                hh_ok = raw_hour.startswith(f"{hour_int:02d}") or (f" {hour_int:02d}:" in raw_hour)
+                hh_ok = raw_hour.startswith(f"{int(target_hour_int):02d}") or (f" {int(target_hour_int):02d}:" in raw_hour)
                 if not hh_ok:
                     continue
 
@@ -1537,7 +1576,7 @@ async def _heatmap_snapshot_collector_job(
                         "total": int(blended_total or 0),
                         "results": int(blended_total or 0),
                         "cpl": parsed.get("cpa"),
-                        "hour": int(hour_int),
+                        "hour": int(target_hour_int),
                     }
                 )
 
