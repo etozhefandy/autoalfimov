@@ -15,6 +15,24 @@ from services.storage import load_accounts
 from fb_report.constants import ALMATY_TZ
 
 
+STARTED_CONVERSATIONS_ACTION_TYPE = "onsite_conversion.messaging_conversation_started_7d"
+WEBSITE_SUBMIT_APPLICATIONS_ACTION_TYPE = "offsite_conversion.fb_pixel_submit_application"
+
+
+def count_started_conversations_from_actions(actions: Dict[str, float]) -> int:
+    try:
+        return int(float((actions or {}).get(STARTED_CONVERSATIONS_ACTION_TYPE, 0) or 0))
+    except Exception:
+        return 0
+
+
+def count_website_submit_applications_from_actions(actions: Dict[str, float]) -> int:
+    try:
+        return int(float((actions or {}).get(WEBSITE_SUBMIT_APPLICATIONS_ACTION_TYPE, 0) or 0))
+    except Exception:
+        return 0
+
+
 def _parse_action_type_patterns(raw: str) -> Tuple[set[str], List[str]]:
     exact: set[str] = set()
     prefixes: List[str] = []

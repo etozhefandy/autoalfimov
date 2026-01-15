@@ -278,6 +278,13 @@ def monitoring_accounts_kb() -> InlineKeyboardMarkup:
 
 
 def _autopilot_hm_kb(aid: str) -> InlineKeyboardMarkup:
+    store = load_accounts() or {}
+    row = store.get(str(aid)) or {}
+    hm = (row or {}).get("heatmap") or {}
+    if not isinstance(hm, dict):
+        hm = {}
+    include_paused = bool(hm.get("include_paused", False))
+    toggle_label = f"Показывать PAUSED: {'ON' if include_paused else 'OFF'}"
     return InlineKeyboardMarkup(
         [
             [
@@ -285,6 +292,7 @@ def _autopilot_hm_kb(aid: str) -> InlineKeyboardMarkup:
                 InlineKeyboardButton("Вчера", callback_data=f"ap_hm_p|{aid}|yday"),
             ],
             [InlineKeyboardButton("7 дней", callback_data=f"ap_hm_p|{aid}|7d")],
+            [InlineKeyboardButton(toggle_label, callback_data=f"ap_hm_toggle_paused|{aid}")],
             [InlineKeyboardButton("⬅️ Назад", callback_data=f"ap_analyze|{aid}")],
             [InlineKeyboardButton("⬅️ К аккаунтам", callback_data="autopilot_menu")],
             [InlineKeyboardButton("⬅️ В меню", callback_data="menu")],
@@ -3063,6 +3071,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/whoami — показать user_id/chat_id\n"
         "/heatmap <act_id> — тепловая карта адсетов за 7 дней\n"
         "/heatmap_status <act_id> — статус слепка теплокарты за предыдущий полный час\n"
+        "/heatmap_debug_last <act_id> — отладка: последний слепок + суммы + coverage(today/yday)\n"
         "/version — показать текущую версию бота и краткое описание\n"
         "\n"
         "🚀 Функции автопилота:\n"
@@ -3141,6 +3150,144 @@ async def cmd_heatmap_status(update: Update, context: ContextTypes.DEFAULT_TYPE)
         aid = "act_" + aid
     text = build_heatmap_status_text(aid=aid)
     await update.message.reply_text(text)
+
+
+def _build_heatmap_debug_last_text(*, aid: str) -> str:
+    st = load_accounts() or {}
+    row = st.get(str(aid)) or {}
+    hm = (row or {}).get("heatmap") or {}
+    if not isinstance(hm, dict):
+        hm = {}
+    include_paused = bool(hm.get("include_paused", False))
+    result_mode = str(hm.get("result_mode") or "").strip().lower() or None
+
+    now = datetime.now(ALMATY_TZ)
+    max_lookback = 48
+    last_snap = None
+    cur = now.replace(minute=0, second=0, microsecond=0)
+    for _ in range(int(max_lookback)):
+        cur = cur - timedelta(hours=1)
+        date_str = cur.strftime("%Y-%m-%d")
+        hour_int = int(cur.strftime("%H"))
+        with deny_fb_api_calls(reason="heatmap_debug_last"):
+            s = load_snapshot(str(aid), date_str=str(date_str), hour=int(hour_int))
+        if s:
+            last_snap = s
+            break
+
+    def _sum_rows(rows: list[dict], *, active_only: bool) -> tuple[int, int, float, int]:
+        started = 0
+        website = 0
+        spend = 0.0
+        used = 0
+        for r in (rows or []):
+            if not isinstance(r, dict):
+                continue
+            if active_only:
+                stt = r.get("adset_status")
+                if stt and str(stt).upper() not in {"ACTIVE"}:
+                    continue
+            used += 1
+            try:
+                started += int(r.get("started_conversations") or r.get("msgs") or 0)
+            except Exception:
+                pass
+            try:
+                website += int(r.get("website_submit_applications") or r.get("leads") or 0)
+            except Exception:
+                pass
+            try:
+                spend += float(r.get("spend") or 0.0)
+            except Exception:
+                pass
+        return int(started), int(website), float(spend), int(used)
+
+    def _coverage_for(date_s: str) -> tuple[int, list[str]]:
+        cov = 0
+        missing: list[str] = []
+        with deny_fb_api_calls(reason="heatmap_debug_coverage"):
+            have_hours = set(list_snapshot_hours(str(aid), date_str=str(date_s)) or [])
+            for h in range(24):
+                if h not in have_hours:
+                    missing.append(f"{h:02d}")
+                    continue
+                snap = load_snapshot(str(aid), date_str=str(date_s), hour=int(h)) or {}
+                stt = str(snap.get("status") or "")
+                if stt in {"ready", "ready_low_confidence"}:
+                    cov += 1
+                else:
+                    missing.append(f"{h:02d}")
+        return int(cov), list(missing)
+
+    today_s = now.strftime("%Y-%m-%d")
+    yday_s = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+    cov_today, miss_today = _coverage_for(today_s)
+    cov_yday, miss_yday = _coverage_for(yday_s)
+
+    lines: list[str] = []
+    lines.append(f"🧪 heatmap_debug_last — {get_account_name(aid)}")
+    lines.append(f"account_id={aid}")
+    lines.append(f"include_paused={'true' if include_paused else 'false'}")
+    if result_mode:
+        lines.append(f"result_mode={result_mode}")
+    lines.append("")
+    lines.append(f"coverage_today={cov_today}/24 missing_hours={','.join(miss_today)}")
+    lines.append(f"coverage_yday={cov_yday}/24 missing_hours={','.join(miss_yday)}")
+
+    if not last_snap:
+        lines.append("")
+        lines.append("last_snapshot=missing")
+        return "\n".join(lines)
+
+    snap_date = str(last_snap.get("date") or "")
+    snap_hour = str(last_snap.get("hour") or "")
+    snap_status = str(last_snap.get("status") or "")
+    snap_reason = str(last_snap.get("reason") or "")
+    snap_rows = last_snap.get("rows") or []
+
+    st_all, ws_all, sp_all, used_all = _sum_rows(list(snap_rows), active_only=False)
+    st_act, ws_act, sp_act, used_act = _sum_rows(list(snap_rows), active_only=True)
+
+    computed_status = "ready"
+    computed_reason = ""
+    if int(st_all) <= 0 and int(ws_all) <= 0:
+        computed_status = "ready_low_confidence"
+        computed_reason = "no_actions"
+
+    lines.append("")
+    lines.append(f"last_snapshot_date={snap_date} hour={snap_hour}")
+    lines.append(f"snapshot_status={snap_status} snapshot_reason={snap_reason}")
+    lines.append(f"computed_status={computed_status} computed_reason={computed_reason}")
+    lines.append(f"rows_count={int(len(snap_rows) or 0)}")
+
+    lines.append(
+        f"sums_all started_conversations={st_all} website_submit_applications={ws_all} blended={int(st_all + ws_all)} spend={sp_all:.2f} rows_used={used_all}"
+    )
+    lines.append(
+        f"sums_active_only started_conversations={st_act} website_submit_applications={ws_act} blended={int(st_act + ws_act)} spend={sp_act:.2f} rows_used={used_act}"
+    )
+
+    return "\n".join(lines)
+
+
+async def cmd_heatmap_debug_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _allowed(update):
+        return
+
+    parts = update.message.text.strip().split()
+    if len(parts) == 1:
+        await update.message.reply_text(
+            "Выберите аккаунт для heatmap debug:",
+            reply_markup=accounts_kb("hmdebug"),
+        )
+        return
+
+    aid = parts[1].strip()
+    if not aid.startswith("act_"):
+        aid = "act_" + aid
+
+    txt = _build_heatmap_debug_last_text(aid=str(aid))
+    await update.message.reply_text(txt)
 
 
 async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3745,6 +3892,8 @@ async def _on_cb_internal(
             await q.answer("Некорректный период.", show_alert=True)
             return
 
+        context.user_data["ap_hm_last"] = {"aid": str(aid), "mode": str(mode)}
+
         await safe_edit_message(q, f"Строю heatmap для {get_account_name(aid)}…")
 
         append_autopilot_event(
@@ -3764,6 +3913,45 @@ async def _on_cb_internal(
         extra = _autopilot_hm_summary(summary or {})
         text = str(heat_txt or "") + "\n\n" + str(extra or "")
         await safe_edit_message(q, text, reply_markup=_autopilot_hm_kb(aid))
+        return
+
+    if data.startswith("ap_hm_toggle_paused|"):
+        aid = data.split("|", 1)[1]
+        st = load_accounts() or {}
+        row = st.get(str(aid)) or {}
+        hm = (row or {}).get("heatmap") or {}
+        if not isinstance(hm, dict):
+            hm = {}
+        cur = bool(hm.get("include_paused", False))
+        hm["include_paused"] = not cur
+        row["heatmap"] = hm
+        st[str(aid)] = row
+        save_accounts(st)
+
+        await q.answer("Фильтр обновлён")
+
+        last = context.user_data.get("ap_hm_last") or {}
+        last_aid = str((last or {}).get("aid") or "")
+        last_mode = str((last or {}).get("mode") or "")
+        if last_aid == str(aid) and last_mode:
+            try:
+                heat_txt, summary = build_hourly_heatmap_for_account(
+                    aid,
+                    get_account_name_fn=get_account_name,
+                    mode=str(last_mode),
+                )
+            except Exception:
+                heat_txt, summary = ("Не удалось построить тепловую карту.", {})
+            extra = _autopilot_hm_summary(summary or {})
+            text = str(heat_txt or "") + "\n\n" + str(extra or "")
+            await safe_edit_message(q, text, reply_markup=_autopilot_hm_kb(aid))
+            return
+
+        await safe_edit_message(
+            q,
+            "Фильтр обновлён. Выберите период для рекомендаций по часам:",
+            reply_markup=_autopilot_hm_kb(aid),
+        )
         return
 
     if data.startswith("aphmforce|"):
@@ -5272,6 +5460,14 @@ async def _on_cb_internal(
             f"Выберите период тепловой карты для {get_account_name(aid)}:",
             reply_markup=heatmap_menu(aid),
         )
+        return
+
+    if data.startswith("hmdebug|"):
+        aid = data.split("|", 1)[1]
+        if not aid.startswith("act_"):
+            aid = "act_" + aid
+        txt = _build_heatmap_debug_last_text(aid=str(aid))
+        await safe_edit_message(q, txt, reply_markup=main_menu())
         return
 
     if data.startswith("hm7|"):
@@ -7394,6 +7590,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("sync_accounts", cmd_sync))
     app.add_handler(CommandHandler("heatmap", cmd_heatmap))
     app.add_handler(CommandHandler("heatmap_status", cmd_heatmap_status))
+    app.add_handler(CommandHandler("heatmap_debug_last", cmd_heatmap_debug_last))
 
     app.add_handler(CallbackQueryHandler(on_cb))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_any))

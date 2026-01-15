@@ -27,7 +27,11 @@ except Exception:  # noqa: BLE001
 
 try:  # pragma: no cover
     from services.facebook_api import safe_api_call, _normalize_insight
-    from services.analytics import parse_insight
+    from services.analytics import (
+        parse_insight,
+        count_started_conversations_from_actions,
+        count_website_submit_applications_from_actions,
+    )
     from services.facebook_api import (
         is_rate_limited_now,
         rate_limit_retry_after_seconds,
@@ -45,6 +49,12 @@ except Exception:  # noqa: BLE001
 
     def parse_insight(_ins: dict, **_kwargs) -> dict:  # type: ignore[override]
         return {"msgs": 0, "leads": 0, "total": 0, "spend": 0.0, "cpa": None}
+
+    def count_started_conversations_from_actions(_actions: dict) -> int:  # type: ignore[override]
+        return 0
+
+    def count_website_submit_applications_from_actions(_actions: dict) -> int:  # type: ignore[override]
+        return 0
 
     def is_rate_limited_now() -> bool:  # type: ignore[override]
         return False
@@ -1049,11 +1059,12 @@ async def _heatmap_snapshot_collector_job(
                 "snapshot.json",
             )
             log.info(
-                "🟦 SNAPSHOT SAVED aid=%s status=%s rows=%s spend=%s path=%s",
+                "🟦 SNAPSHOT SAVED aid=%s status=%s rows=%s spend=%s window=%s path=%s",
                 str(aid),
                 str(snap.get("status") or ""),
                 str(int(snap.get("rows_count") or 0)),
                 str(float(snap.get("spend") or 0.0)),
+                str(window_label),
                 str(snap_path),
             )
             continue
@@ -1167,9 +1178,21 @@ async def _heatmap_snapshot_collector_job(
                         "frequency",
                         "adset_id",
                         "adset_name",
+                        "adset_effective_status",
                         "campaign_id",
                         "campaign_name",
                     ]
+                    try:
+                        log.info(
+                            "🟦 FB REQUEST aid=%s endpoint=%s date=%s hour=%s window=%s",
+                            str(aid),
+                            "insights/adset/hourly",
+                            str(date_str),
+                            str(int(hour_int)),
+                            str(window_label),
+                        )
+                    except Exception:
+                        pass
                     data = safe_api_call(
                         acc.get_insights,
                         fields=fields,
@@ -1196,22 +1219,51 @@ async def _heatmap_snapshot_collector_job(
                 except Exception:
                     parsed = {"msgs": 0, "leads": 0, "total": 0, "spend": 0.0, "cpa": None}
 
+                actions_map: dict[str, float] = {}
+                try:
+                    for a in (d or {}).get("actions") or []:
+                        if not isinstance(a, dict):
+                            continue
+                        at = str(a.get("action_type") or "")
+                        if not at:
+                            continue
+                        try:
+                            v = float(a.get("value") or 0)
+                        except Exception:
+                            v = 0.0
+                        actions_map[at] = actions_map.get(at, 0.0) + float(v)
+                except Exception:
+                    actions_map = {}
+
+                try:
+                    started_conversations = int(count_started_conversations_from_actions(actions_map) or 0)
+                except Exception:
+                    started_conversations = int(parsed.get("msgs") or 0)
+
+                try:
+                    website_submit = int(count_website_submit_applications_from_actions(actions_map) or 0)
+                except Exception:
+                    website_submit = 0
+
                 adset_id = str((d or {}).get("adset_id") or "")
                 if not adset_id:
                     continue
-                total = int(parsed.get("total") or 0)
+                blended_total = int((started_conversations or 0) + (website_submit or 0))
                 spend = float(parsed.get("spend") or 0.0)
                 rows_out.append(
                     {
                         "adset_id": adset_id,
                         "name": (d or {}).get("adset_name") or (d or {}).get("name"),
+                        "adset_status": (d or {}).get("adset_effective_status") or (d or {}).get("adset_status"),
                         "campaign_id": (d or {}).get("campaign_id"),
                         "campaign_name": (d or {}).get("campaign_name"),
                         "spend": spend,
-                        "msgs": int(parsed.get("msgs") or 0),
-                        "leads": int(parsed.get("leads") or 0),
-                        "total": total,
-                        "results": total,
+                        "started_conversations": int(started_conversations or 0),
+                        "website_submit_applications": int(website_submit or 0),
+                        "msgs": int(started_conversations or 0),
+                        "leads": int(website_submit or 0),
+                        "total": int(blended_total or 0),
+                        "results": int(blended_total or 0),
                         "cpl": parsed.get("cpa"),
                         "hour": int(hour_int),
                     }
@@ -1223,6 +1275,37 @@ async def _heatmap_snapshot_collector_job(
                 str(aid),
                 str(int(len(rows_out or []))),
                 str(float(sum(float((r or {}).get("spend") or 0.0) for r in (rows_out or [])))),
+            )
+        except Exception:
+            pass
+
+        try:
+            started_total = int(
+                sum(int((r or {}).get("started_conversations") or 0) for r in (rows_out or []) if isinstance(r, dict))
+            )
+        except Exception:
+            started_total = 0
+        try:
+            website_total = int(
+                sum(int((r or {}).get("website_submit_applications") or 0) for r in (rows_out or []) if isinstance(r, dict))
+            )
+        except Exception:
+            website_total = 0
+        try:
+            spend_total_actions = float(
+                sum(float((r or {}).get("spend") or 0.0) for r in (rows_out or []) if isinstance(r, dict))
+            )
+        except Exception:
+            spend_total_actions = 0.0
+        try:
+            log.info(
+                "🟦 FB ACTIONS PARSED aid=%s started_conversations=%s website_submit_applications=%s spend=%s rows=%s window=%s",
+                str(aid),
+                str(int(started_total)),
+                str(int(website_total)),
+                str(float(spend_total_actions)),
+                str(int(len(rows_out or []))),
+                str(window_label),
             )
         except Exception:
             pass
@@ -1283,11 +1366,12 @@ async def _heatmap_snapshot_collector_job(
             "snapshot.json",
         )
         log.info(
-            "🟦 SNAPSHOT SAVED aid=%s status=%s rows=%s spend=%s path=%s",
+            "🟦 SNAPSHOT SAVED aid=%s status=%s rows=%s spend=%s window=%s path=%s",
             str(aid),
             str(snap.get("status") or ""),
             str(int(snap.get("rows_count") or 0)),
             str(float(snap.get("spend") or 0.0)),
+            str(window_label),
             str(snap_path),
         )
 

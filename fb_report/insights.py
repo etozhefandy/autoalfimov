@@ -1,5 +1,6 @@
 # fb_report/insights.py
 
+import os
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional, Any
 
@@ -12,9 +13,13 @@ from services.heatmap_store import load_snapshot, list_snapshot_hours
 from services.facebook_api import deny_fb_api_calls
 
 from .constants import ALMATY_TZ
-from .storage import get_account_name
+from .storage import get_account_name, load_accounts
 
-from services.analytics import count_leads_from_actions
+from services.analytics import (
+    count_leads_from_actions,
+    count_started_conversations_from_actions,
+    count_website_submit_applications_from_actions,
+)
 
 
 # ================== ЛОКАЛЬНЫЙ КЭШ ИНСАЙТОВ ==================
@@ -83,11 +88,9 @@ def _blend_totals(ins: dict, *, aid: Optional[str] = None):
     acts = extract_actions(ins)
     spend = float(ins.get("spend", 0) or 0)
 
-    msgs = int(
-        acts.get("onsite_conversion.messaging_conversation_started_7d", 0) or 0
-    )
+    msgs = int(count_started_conversations_from_actions(acts) or 0)
 
-    leads = count_leads_from_actions(acts, aid=aid)
+    leads = int(count_website_submit_applications_from_actions(acts) or 0)
 
     total = msgs + leads
     blended = (spend / total) if total > 0 else None
@@ -189,17 +192,19 @@ def _get_daily_stats_from_snapshots(aid: str, day: datetime) -> Optional[Dict[st
                 if not isinstance(r, dict):
                     continue
                 try:
-                    msgs += int(r.get("msgs") or 0)
+                    msgs += int(r.get("started_conversations") or r.get("msgs") or 0)
                 except Exception:
                     pass
                 try:
-                    leads += int(r.get("leads") or 0)
+                    leads += int(r.get("website_submit_applications") or r.get("leads") or 0)
                 except Exception:
                     pass
                 try:
                     t = r.get("total")
                     if t is None:
-                        t = int(r.get("msgs") or 0) + int(r.get("leads") or 0)
+                        t = int(r.get("started_conversations") or r.get("msgs") or 0) + int(
+                            r.get("website_submit_applications") or r.get("leads") or 0
+                        )
                     total += int(t or 0)
                 except Exception:
                     pass
@@ -261,50 +266,41 @@ def build_hourly_heatmap_for_account(
     acc_name = get_account_name_fn(aid)
     mode_label = _hourly_mode_label(mode)
 
-    def _get_hour_bucket(date_str: str, hour_key: str) -> dict:
+    def _resolve_result_mode() -> str:
         try:
-            h_int = int(str(hour_key))
+            store = load_accounts() or {}
+            row = store.get(str(aid)) or {}
+            hm = (row or {}).get("heatmap") or {}
+            if isinstance(hm, dict):
+                v = str(hm.get("result_mode") or "").strip().lower()
+                if v in {"messages", "website", "blended"}:
+                    return v
+            v = str(os.getenv("RESULT_MODE", "blended") or "blended").strip().lower()
+            return v if v in {"messages", "website", "blended"} else "blended"
         except Exception:
-            return {}
+            return "blended"
 
-        with deny_fb_api_calls(reason="insights_hour_bucket"):
-            snap = load_snapshot(str(aid), date_str=str(date_str), hour=int(h_int)) or {}
-        if str(snap.get("status") or "") not in {"ready", "ready_low_confidence"}:
-            return {}
+    def _resolve_include_paused() -> bool:
+        try:
+            store = load_accounts() or {}
+            row = store.get(str(aid)) or {}
+            hm = (row or {}).get("heatmap") or {}
+            if isinstance(hm, dict) and "include_paused" in hm:
+                return bool(hm.get("include_paused", False))
+        except Exception:
+            pass
+        raw = str(os.getenv("INCLUDE_PAUSED", "0") or "0").strip().lower()
+        return raw in {"1", "true", "yes", "on"}
 
-        msgs = 0
-        leads = 0
-        total = 0
-        spend = 0.0
-        for r in (snap.get("rows") or []):
-            if not isinstance(r, dict):
-                continue
-            try:
-                msgs += int(r.get("msgs") or 0)
-            except Exception:
-                pass
-            try:
-                leads += int(r.get("leads") or 0)
-            except Exception:
-                pass
-            try:
-                t = r.get("total")
-                if t is None:
-                    t = int(r.get("msgs") or 0) + int(r.get("leads") or 0)
-                total += int(t or 0)
-            except Exception:
-                pass
-            try:
-                spend += float(r.get("spend") or 0.0)
-            except Exception:
-                pass
+    result_mode = _resolve_result_mode()
+    include_paused = _resolve_include_paused()
 
-        return {
-            "messages": int(msgs or 0),
-            "leads": int(leads or 0),
-            "total": int(total or 0),
-            "spend": float(spend or 0.0),
-        }
+    def _events_label() -> str:
+        if result_mode == "messages":
+            return "events: messages (conversation_started)"
+        if result_mode == "website":
+            return "events: website_submit_applications"
+        return "events: messages + website_submit_applications"
 
     days = _iter_days_for_hourly_mode(mode)
     hours = [f"{h:02d}" for h in range(24)]
@@ -317,15 +313,68 @@ def build_hourly_heatmap_for_account(
     for day in days:
         day_key = day.strftime("%Y-%m-%d")
 
+        coverage_hours = 0
+        missing_hours: list[str] = []
+
         row_totals: List[int] = []
         row_spends: List[float] = []
         day_total = 0
         day_spend = 0.0
 
         for h in hours:
-            bucket = _get_hour_bucket(day_key, h)
-            val = int(bucket.get("total", 0) or 0)
-            sp = float(bucket.get("spend", 0.0) or 0.0)
+            try:
+                h_int = int(str(h))
+            except Exception:
+                h_int = 0
+
+            with deny_fb_api_calls(reason="insights_hour_bucket"):
+                snap = load_snapshot(str(aid), date_str=str(day_key), hour=int(h_int))
+            if not snap:
+                missing_hours.append(f"{h}")
+                val = 0
+                sp = 0.0
+            else:
+                st = str(snap.get("status") or "missing")
+                if st not in {"ready", "ready_low_confidence"}:
+                    missing_hours.append(f"{h}")
+                    val = 0
+                    sp = 0.0
+                else:
+                    coverage_hours += 1
+                    started = 0
+                    website = 0
+                    spend = 0.0
+                    for r in (snap.get("rows") or []):
+                        if not isinstance(r, dict):
+                            continue
+                        row_status = r.get("adset_status")
+                        if not include_paused:
+                            try:
+                                if row_status and str(row_status).upper() not in {"ACTIVE"}:
+                                    continue
+                            except Exception:
+                                pass
+                        try:
+                            started += int(r.get("started_conversations") or r.get("msgs") or 0)
+                        except Exception:
+                            pass
+                        try:
+                            website += int(r.get("website_submit_applications") or r.get("leads") or 0)
+                        except Exception:
+                            pass
+                        try:
+                            spend += float(r.get("spend") or 0.0)
+                        except Exception:
+                            pass
+
+                    if result_mode == "messages":
+                        val = int(started or 0)
+                    elif result_mode == "website":
+                        val = int(website or 0)
+                    else:
+                        val = int((started or 0) + (website or 0))
+                    sp = float(spend or 0.0)
+
             row_totals.append(val)
             row_spends.append(sp)
             day_total += val
@@ -344,22 +393,33 @@ def build_hourly_heatmap_for_account(
                 "spend_per_hour": row_spends,
                 "total_conversions": day_total,
                 "spend": day_spend,
+                "coverage_hours": int(coverage_hours),
+                "missing_hours": list(missing_hours),
             }
         )
 
     # Текстовая визуализация
     lines: List[str] = []
-    lines.append(f"🔥 Тепловая карта по часам (заявки 💬+📩) — {acc_name}")
+    lines.append(f"🔥 Тепловая карта по часам — {acc_name}")
     lines.append(f"Период: {mode_label}")
+    if mode in {"today", "yday"}:
+        cov = int((matrix[0] or {}).get("coverage_hours") or 0) if matrix else 0
+        lines.append(f"result_mode={result_mode} | include_paused={'true' if include_paused else 'false'}")
+        lines.append(f"coverage_hours={cov}/24")
+    else:
+        lines.append(f"result_mode={result_mode} | include_paused={'true' if include_paused else 'false'}")
+        lines.append("coverage_hours=multi-day")
+    lines.append(_events_label())
     lines.append("")
 
     if not matrix or total_convs_all == 0:
         lines.append("За выбранный период нет заявок (💬+📩) по часам.")
     else:
         lines.append(
-            f"Итого за период: {total_convs_all} заявок, затраты: {total_spend_all:.2f} $"
+            f"Итого за период: total_results={total_convs_all}, total_spend={total_spend_all:.2f} $"
         )
         lines.append("")
+        lines.append("Часы — бакеты 00:00–00:59 … 23:00–23:59")
         lines.append("Строки — дни, символы — часы 00–23:")
         lines.append("")
 
@@ -377,6 +437,14 @@ def build_hourly_heatmap_for_account(
         lines.append("▤ — средняя активность")
         lines.append("▦ — высокая активность")
         lines.append("▩ — пиковая активность")
+
+        if mode in {"today", "yday"} and matrix:
+            miss = (matrix[0] or {}).get("missing_hours") or []
+            cov = int((matrix[0] or {}).get("coverage_hours") or 0)
+            if cov < 24:
+                miss_s = ", ".join([str(x) for x in (miss or [])])
+                lines.append("")
+                lines.append(f"Данные неполные: missing_hours={miss_s}")
 
     text = "\n".join(lines)
 
@@ -397,6 +465,10 @@ def build_hourly_heatmap_for_account(
         ],
         "total_conversions_all": total_convs_all,
         "total_spend_all": total_spend_all,
+        "result_mode": result_mode,
+        "include_paused": include_paused,
+        "coverage_hours": int((matrix[0] or {}).get("coverage_hours") or 0) if (mode in {"today", "yday"} and matrix) else None,
+        "missing_hours": (matrix[0] or {}).get("missing_hours") if (mode in {"today", "yday"} and matrix) else None,
         "live_today": {},
     }
 

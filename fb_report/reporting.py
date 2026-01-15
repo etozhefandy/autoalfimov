@@ -113,17 +113,19 @@ def fetch_insight(aid: str, period):
                     except Exception:
                         pass
                     try:
-                        msgs += int(r.get("msgs") or 0)
+                        msgs += int(r.get("started_conversations") or r.get("msgs") or 0)
                     except Exception:
                         pass
                     try:
-                        leads += int(r.get("leads") or 0)
+                        leads += int(r.get("website_submit_applications") or r.get("leads") or 0)
                     except Exception:
                         pass
                     try:
                         t = r.get("total")
                         if t is None:
-                            t = int(r.get("msgs") or 0) + int(r.get("leads") or 0)
+                            t = int(r.get("started_conversations") or r.get("msgs") or 0) + int(
+                                r.get("website_submit_applications") or r.get("leads") or 0
+                            )
                         total += int(t or 0)
                     except Exception:
                         pass
@@ -147,7 +149,7 @@ def fetch_insight(aid: str, period):
         "spend": float(spend),
         "actions": [
             {"action_type": "onsite_conversion.messaging_conversation_started_7d", "value": int(msgs)},
-            {"action_type": "lead", "value": int(leads)},
+            {"action_type": "offsite_conversion.fb_pixel_submit_application", "value": int(leads)},
             {"action_type": "link_click", "value": 0},
         ],
         "cost_per_action_type": [],
@@ -550,17 +552,23 @@ def build_account_report(
             except Exception:
                 pass
             try:
-                a["msgs"] = int(a.get("msgs") or 0) + int((r or {}).get("msgs") or 0)
+                a["msgs"] = int(a.get("msgs") or 0) + int(
+                    (r or {}).get("started_conversations") or (r or {}).get("msgs") or 0
+                )
             except Exception:
                 pass
             try:
-                a["leads"] = int(a.get("leads") or 0) + int((r or {}).get("leads") or 0)
+                a["leads"] = int(a.get("leads") or 0) + int(
+                    (r or {}).get("website_submit_applications") or (r or {}).get("leads") or 0
+                )
             except Exception:
                 pass
             try:
                 t = (r or {}).get("total")
                 if t is None:
-                    t = int((r or {}).get("msgs") or 0) + int((r or {}).get("leads") or 0)
+                    t = int((r or {}).get("started_conversations") or (r or {}).get("msgs") or 0) + int(
+                        (r or {}).get("website_submit_applications") or (r or {}).get("leads") or 0
+                    )
                 a["total"] = int(a.get("total") or 0) + int(t or 0)
             except Exception:
                 pass
