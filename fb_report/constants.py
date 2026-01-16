@@ -114,15 +114,17 @@ EXCLUDED_NAME_KEYWORDS = {"kense", "кенсе"}
 
 # ========= ГЛОБАЛЬНЫЕ ACTION TYPES =========
 
-# Стандартные pixel events Meta, которые считаем как "Лиды/Отправить заявку".
-# Этот список не редактируется пользователем и используется везде.
-LEAD_ACTION_TYPES = {
-    "lead",
-    "omni_lead",
-    "submit_application",
-    "offsite_conversion.fb_pixel_lead",
-    "offsite_conversion.fb_pixel_submit_application",
-}
+# Единственная правильная метрика лидов:
+# - Website Submit Applications
+# - SubmitApplication
+# (без выбора из UI и без fallback'ов)
+LEADS_ACTIONS = [
+    "Website Submit Applications",
+    "SubmitApplication",
+]
+
+# Backward-compatible name used across the codebase.
+LEAD_ACTION_TYPES = set(LEADS_ACTIONS)
 
 BOT_VERSION = "1.3.0"
 

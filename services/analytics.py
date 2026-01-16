@@ -94,20 +94,13 @@ def count_leads_from_actions(
     aid: Optional[str] = None,
     lead_action_type: Optional[str] = None,
 ) -> int:
-    if lead_action_type is None and aid:
-        lead_action_type = get_selected_lead_action_type(aid)
-
     total = 0
     for t, v in (actions or {}).items():
         if not t:
             continue
 
-        if _is_standard_leads_mode(lead_action_type):
-            if str(t) not in LEAD_ACTION_TYPES:
-                continue
-        else:
-            if str(t) != str(lead_action_type):
-                continue
+        if str(t) not in LEAD_ACTION_TYPES:
+            continue
 
         try:
             total += int(float(v or 0))
@@ -123,9 +116,6 @@ def lead_cost_and_count(
     aid: Optional[str] = None,
     lead_action_type: Optional[str] = None,
 ) -> Tuple[int, float]:
-    if lead_action_type is None and aid:
-        lead_action_type = get_selected_lead_action_type(aid)
-
     total_cnt = 0
     total_cost = 0.0
 
@@ -133,12 +123,8 @@ def lead_cost_and_count(
         if not t:
             continue
 
-        if _is_standard_leads_mode(lead_action_type):
-            if str(t) not in LEAD_ACTION_TYPES:
-                continue
-        else:
-            if str(t) != str(lead_action_type):
-                continue
+        if str(t) not in LEAD_ACTION_TYPES:
+            continue
         try:
             cnt = int(float(v or 0))
         except Exception:

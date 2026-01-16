@@ -3157,12 +3157,6 @@ def settings_kb(aid: str) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
-                    "📊 Метрика лидов",
-                    callback_data=f"lead_metric|{aid}",
-                )
-            ],
-            [
-                InlineKeyboardButton(
                     "⬅️ Назад к списку",
                     callback_data="choose_acc_settings",
                 )
@@ -4740,6 +4734,20 @@ async def _on_cb_internal(
 
     if data == "insta_links_menu":
         # Сценарий получения ссылок на активную инста-рекламу.
+        store = load_accounts() or {}
+        enabled_ids = [aid for aid, row in (store or {}).items() if (row or {}).get("enabled", True)]
+        try:
+            logging.getLogger(__name__).info(
+                "caller=ads_links enabled_accounts=%s",
+                int(len(enabled_ids)),
+            )
+        except Exception:
+            pass
+
+        if not enabled_ids:
+            await safe_edit_message(q, "Нет включённых аккаунтов")
+            return
+
         await safe_edit_message(
             q,
             "Выберите рекламный аккаунт для получения ссылок на активную рекламу в Instagram:",
@@ -4805,6 +4813,15 @@ async def _on_cb_internal(
     if data.startswith("insta_links_acc|"):
         aid = data.split("|", 1)[1]
         account_name = get_account_name(aid)
+
+        try:
+            st = load_accounts() or {}
+            row = (st or {}).get(str(aid)) or {}
+            if not bool(row.get("enabled", True)):
+                await safe_edit_message(q, "Этот аккаунт выключен в настройках. Включи его и повтори.")
+                return
+        except Exception:
+            pass
 
         await safe_edit_message(
             q,
@@ -6627,226 +6644,23 @@ async def _on_cb_internal(
         )
         return
 
-    if data.startswith("lead_metric|"):
-        aid = data.split("|", 1)[1]
-        sel = get_lead_metric_for_account(aid)
-        if sel:
-            current = f"✅ {sel.get('label') or sel.get('action_type')}"
-        else:
-            current = "Стандартная (по умолчанию)"
-
-        _items, src, age_s = _lead_metric_get_catalog_cached(aid, force_refresh=False)
-        src_str = str(src)
-        age_h = _lead_metric_human_cache_age(age_s)
-
-        text = (
-            f"📊 Метрика лидов — {get_account_name(aid)}\n\n"
-            f"Текущая метрика: {current}\n\n"
-            "Если метрика не выбрана, бот считает лиды по стандартным action_type.\n\n"
-            f"Источник списка конверсий: {src_str} (age={age_h})"
-        )
-
-        kb = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton(
-                        "Сменить",
-                        callback_data=f"lead_metric_choose|{aid}",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "Сбросить (стандартная)",
-                        callback_data=f"lead_metric_clear|{aid}",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "🔄 Обновить список",
-                        callback_data=f"lead_metric_refresh|{aid}",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "Показать action_type (debug)",
-                        callback_data=f"lead_metric_debug|{aid}",
-                    )
-                ],
-                [InlineKeyboardButton("⬅️ Назад", callback_data=f"set1|{aid}")],
-            ]
-        )
-        await safe_edit_message(q, text, reply_markup=kb)
-        return
-
-    if data.startswith("lead_metric_clear|"):
-        aid = data.split("|", 1)[1]
-        clear_lead_metric_for_account(aid)
-        await q.answer("Метрика лидов сброшена.")
-        new_data = f"lead_metric|{aid}"
-        await _on_cb_internal(update, context, q, chat_id, new_data)
-        return
-
-    if data.startswith("lead_metric_debug|"):
-        aid = data.split("|", 1)[1]
-        sel = get_lead_metric_for_account(aid)
-        items, src, age_s = _lead_metric_get_catalog_cached(aid, force_refresh=False)
-        lines = [f"lead_metric debug — {get_account_name(aid)}", ""]
-        if sel:
-            lines.append(f"selected_action_type={str(sel.get('action_type') or '')}")
-        else:
-            lines.append("selected_action_type=(default)")
-        lines.append(f"catalog_source={str(src)}")
-        lines.append(f"catalog_age={_lead_metric_human_cache_age(age_s)}")
-        lines.append(f"catalog_items={int(len(items or []))}")
-        if items:
-            lines.append("")
-            lines.append("first_items:")
-            for it in list(items or [])[:20]:
-                at = str((it or {}).get("action_type") or "").strip()
-                if at:
-                    lines.append(f"- {at}")
-        text = "\n".join(lines)
-        kb = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("⬅️ Назад", callback_data=f"lead_metric|{aid}")]]
-        )
-        await safe_edit_message(q, text, reply_markup=kb)
-        return
-
-    if data.startswith("lead_metric_choose|"):
-        aid = data.split("|", 1)[1]
-        items, src, age_s = _lead_metric_get_catalog_cached(aid, force_refresh=False)
-        context.user_data["lead_metric_catalog"] = {
-            "aid": str(aid),
-            "items": list(items or []),
-            "query": "",
-            "page": 0,
-            "source": str(src),
-            "age_s": age_s,
-        }
-        text, kb = _lead_metric_choose_page(aid=str(aid), items=list(items or []), page=0, query="")
-        await safe_edit_message(q, text, reply_markup=kb)
-        return
-
-    if data.startswith("lead_metric_refresh|"):
-        aid = data.split("|", 1)[1]
-        items, src, age_s = _lead_metric_get_catalog_cached(aid, force_refresh=True)
-        context.user_data["lead_metric_catalog"] = {
-            "aid": str(aid),
-            "items": list(items or []),
-            "query": "",
-            "page": 0,
-            "source": str(src),
-            "age_s": age_s,
-        }
+    if data.startswith("lead_metric"):
         try:
-            await q.answer("Список обновлён.")
+            aid = data.split("|", 1)[1]
+        except Exception:
+            aid = ""
+        try:
+            await q.answer("Метрика лидов фиксирована: Website Submit Applications / SubmitApplication", show_alert=True)
         except Exception:
             pass
-        text, kb = _lead_metric_choose_page(aid=str(aid), items=list(items or []), page=0, query="")
-        await safe_edit_message(q, text, reply_markup=kb)
-        return
-
-    if data.startswith("lead_metric_page|"):
-        try:
-            _p, aid, page_s = data.split("|", 2)
-        except ValueError:
-            return
-        stash = context.user_data.get("lead_metric_catalog") or {}
-        if str(stash.get("aid") or "") != str(aid):
-            await q.answer("Список устарел. Нажми 'Сменить' ещё раз.", show_alert=True)
-            return
-        items = list(stash.get("items") or [])
-        query = str(stash.get("query") or "")
-        try:
-            page_i = int(page_s)
-        except Exception:
-            page_i = 0
-        stash["page"] = page_i
-        context.user_data["lead_metric_catalog"] = stash
-        text, kb = _lead_metric_choose_page(aid=str(aid), items=items, page=page_i, query=query)
-        await safe_edit_message(q, text, reply_markup=kb)
-        return
-
-    if data.startswith("lead_metric_search|"):
-        aid = data.split("|", 1)[1]
-        context.user_data["await_lead_metric_search_for"] = {"aid": str(aid)}
-        await safe_edit_message(q, "Напиши текст для поиска по label/action_type (например lead или submit).")
-        return
-
-    if data.startswith("lead_metric_set2|"):
-        try:
-            _p, aid, idx_s = data.split("|", 2)
-        except ValueError:
-            await q.answer("Некорректные данные выбора метрики.", show_alert=True)
-            return
-        stash = context.user_data.get("lead_metric_catalog") or {}
-        if str(stash.get("aid") or "") != str(aid):
-            await q.answer("Список устарел. Нажми 'Сменить' ещё раз.", show_alert=True)
-            return
-        items = list(stash.get("items") or [])
-        query = str(stash.get("query") or "")
-        filtered = []
-        qlow = query.strip().lower()
-        for it in (items or []):
-            at = str((it or {}).get("action_type") or "").strip()
-            label = str((it or {}).get("label") or at).strip()
-            if not at:
-                continue
-            if qlow and (qlow not in at.lower()) and (qlow not in label.lower()):
-                continue
-            filtered.append({"action_type": at, "label": label})
-        try:
-            idx = int(idx_s)
-        except Exception:
-            idx = -1
-        if idx < 0 or idx >= len(filtered):
-            await q.answer("Метрика не найдена. Обнови список.", show_alert=True)
-            return
-        it = filtered[idx]
-        action_type = it.get("action_type")
-        label = it.get("label")
-        if not action_type:
-            await q.answer("Пустой action_type.", show_alert=True)
-            return
-        set_lead_metric_for_account(aid, action_type=str(action_type), label=str(label or action_type))
-        await q.answer("Метрика лидов обновлена.")
-        await context.bot.send_message(chat_id, "Метрика лидов обновлена. Все отчёты и ИИ теперь считают по ней.")
-        new_data = f"lead_metric|{aid}"
-        await _on_cb_internal(update, context, q, chat_id, new_data)
-        return
-
-    if data.startswith("lead_metric_set|"):
-        try:
-            _p, aid, idx = data.split("|", 2)
-        except ValueError:
-            await q.answer("Некорректные данные выбора метрики.", show_alert=True)
-            return
-
-        stash = context.user_data.get("lead_metric_options") or {}
-        if stash.get("aid") != aid:
-            await q.answer("Список метрик устарел. Нажми 'Сменить' ещё раз.", show_alert=True)
-            return
-
-        items = stash.get("items") or {}
-        it = items.get(str(idx))
-        if not it:
-            await q.answer("Метрика не найдена. Нажми 'Сменить' ещё раз.", show_alert=True)
-            return
-
-        action_type = it.get("action_type")
-        label = it.get("label")
-        if not action_type:
-            await q.answer("Пустой action_type.", show_alert=True)
-            return
-
-        set_lead_metric_for_account(aid, action_type=str(action_type), label=str(label or action_type))
-        await q.answer("Метрика лидов обновлена.")
-        await context.bot.send_message(
-            chat_id,
-            "Метрика лидов обновлена. Все отчёты и ИИ теперь считают по ней.",
+        kb = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("⬅️ Назад", callback_data=f"set1|{aid}")]]
         )
-        new_data = f"lead_metric|{aid}"
-        await _on_cb_internal(update, context, q, chat_id, new_data)
+        await safe_edit_message(
+            q,
+            "📩 Лиды считаются строго по: Website Submit Applications / SubmitApplication",
+            reply_markup=kb,
+        )
         return
 
     if data.startswith("toggle_enabled|"):

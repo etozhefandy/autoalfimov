@@ -439,47 +439,15 @@ def metrics_flags(aid: str) -> dict:
 
 
 def get_lead_metric_for_account(aid: str) -> dict | None:
-    store = load_accounts() or {}
-    row = store.get(str(aid)) or {}
-    sel = row.get("lead_metric")
-    if not sel:
-        return None
-    if isinstance(sel, dict):
-        action_type = (sel.get("action_type") or "").strip()
-        label = (sel.get("label") or "").strip()
-        if action_type:
-            return {
-                "action_type": action_type,
-                "label": label or action_type,
-            }
-        return None
-    action_type = str(sel).strip()
-    return {"action_type": action_type, "label": action_type} if action_type else None
+    return None
 
 
 def set_lead_metric_for_account(aid: str, *, action_type: str, label: str | None = None) -> None:
-    at = (action_type or "").strip()
-    if not at:
-        return
-    store = load_accounts() or {}
-    row = store.get(str(aid)) or {}
-    row["lead_metric"] = {
-        "action_type": at,
-        "label": (label or "").strip() or at,
-    }
-    row["metrics"] = row.get("metrics") or {}
-    row["metrics"]["leads"] = True
-    store[str(aid)] = row
-    save_accounts(store)
+    return
 
 
 def clear_lead_metric_for_account(aid: str) -> None:
-    store = load_accounts() or {}
-    row = store.get(str(aid)) or {}
-    if "lead_metric" in row:
-        row.pop("lead_metric", None)
-    store[str(aid)] = row
-    save_accounts(store)
+    return
 
 
 def get_lead_metric_catalog_for_account(aid: str) -> dict | None:
