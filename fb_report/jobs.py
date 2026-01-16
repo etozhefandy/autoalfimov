@@ -7,11 +7,19 @@ import json
 import logging
 import os
 import uuid
+import time as _time
+from typing import Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes, Application
 
-from .constants import ALMATY_TZ, DEFAULT_REPORT_CHAT, AUTOPILOT_CHAT_ID, ALLOWED_USER_IDS
+from .constants import (
+    ALMATY_TZ,
+    DEFAULT_REPORT_CHAT,
+    AUTOPILOT_CHAT_ID,
+    ALLOWED_USER_IDS,
+    MORNING_REPORT_STATE_FILE,
+)
 from .storage import load_accounts, get_account_name, resolve_autopilot_chat_id
 from .cpa_monitoring import format_cpa_anomaly_message
 from .autopilot_format import ap_action_text
@@ -508,6 +516,147 @@ async def daily_report_job(context: ContextTypes.DEFAULT_TYPE):
         "daily_report_job_disabled reason=heatmap_snapshots_single_source_of_truth"
     )
     return
+
+
+def _atomic_write_json(path: str, obj: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+    except Exception:
+        pass
+    tmp = str(path) + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+
+
+def _load_morning_report_state() -> dict:
+    try:
+        with open(MORNING_REPORT_STATE_FILE, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_morning_report_state(d: dict) -> None:
+    _atomic_write_json(MORNING_REPORT_STATE_FILE, d if isinstance(d, dict) else {})
+
+
+def _job_next_run_str(job: Any) -> str:
+    for attr in ("next_t", "next_run_time", "next_run_at"):
+        try:
+            v = getattr(job, attr, None)
+            if v:
+                return str(v)
+        except Exception:
+            continue
+    try:
+        return str(job)
+    except Exception:
+        return ""
+
+
+async def morning_report_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    log = logging.getLogger(__name__)
+    t0 = _time.time()
+    log.info("job_start name=morning_report")
+    try:
+        from fb_report.reporting import build_morning_report_text, build_account_report
+
+        now = datetime.now(ALMATY_TZ)
+        today = now.date().strftime("%Y-%m-%d")
+        period = {"since": (now.date() - timedelta(days=1)).strftime("%Y-%m-%d"), "until": (now.date() - timedelta(days=1)).strftime("%Y-%m-%d")}
+
+        accounts = load_accounts() or {}
+        selected: list[tuple[str, str]] = []
+        for aid, row in (accounts or {}).items():
+            if not isinstance(row, dict) or not row.get("enabled", True):
+                continue
+            mr = row.get("morning_report") or {}
+            if not isinstance(mr, dict):
+                mr = {}
+            level = str(mr.get("level", "ACCOUNT") or "ACCOUNT").upper()
+            if level == "OFF":
+                continue
+            selected.append((str(aid), level))
+
+        log.info(
+            "morning_report selected_accounts=%s",
+            ",".join([f"{aid}:{lvl}" for aid, lvl in selected])
+        )
+
+        chat_id = str(DEFAULT_REPORT_CHAT)
+        txt, dbg = build_morning_report_text(period="yesterday")
+        await context.bot.send_message(chat_id=chat_id, text=str(txt))
+
+        for aid, lvl in selected:
+            if lvl not in {"CAMPAIGN", "ADSET"}:
+                continue
+            log.info("morning_report mode=%s aid=%s", str(lvl), str(aid))
+            t = build_account_report(str(aid), period, level=str(lvl))
+            if t:
+                await context.bot.send_message(chat_id=chat_id, text=str(t), parse_mode="HTML")
+
+        st = _load_morning_report_state() or {}
+        st["last_sent_date"] = str(today)
+        st["last_sent_ts"] = int(_time.time())
+        _save_morning_report_state(st)
+
+        dur_ms = int((_time.time() - t0) * 1000.0)
+        log.info("job_done name=morning_report duration_ms=%s", str(dur_ms))
+    except Exception as e:
+        log.exception("morning_report_error", exc_info=e)
+
+
+def schedule_morning_report(app: Application) -> None:
+    log = logging.getLogger(__name__)
+    job = app.job_queue.run_daily(
+        morning_report_job,
+        time=time(hour=9, minute=0, tzinfo=ALMATY_TZ),
+        name="morning_report",
+    )
+    log.info(
+        "job_registered name=morning_report next_run_at=%s",
+        _job_next_run_str(job),
+    )
+
+    now = datetime.now(ALMATY_TZ)
+    today = now.date().strftime("%Y-%m-%d")
+    st = _load_morning_report_state() or {}
+    last_sent = str(st.get("last_sent_date") or "")
+    try:
+        start = now.replace(hour=8, minute=55, second=0, microsecond=0)
+        end = now.replace(hour=9, minute=5, second=0, microsecond=0)
+    except Exception:
+        start = now
+        end = now
+
+    if start <= now <= end and last_sent != today:
+        try:
+            app.job_queue.run_once(
+                morning_report_job,
+                when=timedelta(seconds=5),
+                name="morning_report_catchup",
+            )
+            log.info(
+                "morning_report_catchup scheduled=true now=%s last_sent_date=%s",
+                str(now.isoformat()),
+                str(last_sent),
+            )
+        except Exception as e:
+            log.exception("morning_report_catchup_error", exc_info=e)
 
 
 def _parse_totals_from_report_text(txt: str):

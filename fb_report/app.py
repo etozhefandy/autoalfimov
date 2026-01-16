@@ -76,6 +76,7 @@ from .billing import send_billing, send_billing_forecast, billing_digest_job
 from .jobs import (
     schedule_cpa_alerts,
     _resolve_account_cpa,
+    schedule_morning_report,
     build_heatmap_status_text,
     run_heatmap_snapshot_collector_once,
 )
@@ -8204,6 +8205,8 @@ def build_app() -> Application:
         billing_digest_job,
         time=time(hour=9, minute=45, tzinfo=ALMATY_TZ),
     )
+
+    schedule_morning_report(app)
 
     schedule_cpa_alerts(app)
 

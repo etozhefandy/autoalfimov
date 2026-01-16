@@ -52,6 +52,10 @@ REPO_ACCOUNTS_JSON = os.path.join(os.path.dirname(__file__), "accounts.json")
 REPORT_CACHE_FILE = os.path.join(DATA_DIR, "report_cache.json")
 REPORT_CACHE_TTL = int(os.getenv("REPORT_CACHE_TTL", "3600"))  # сек, по умолчанию 1 час
 
+MORNING_REPORT_STATE_FILE = os.path.join(DATA_DIR, "morning_report_state.json")
+MORNING_REPORT_CACHE_FILE = os.path.join(DATA_DIR, "morning_report_cache.json")
+MORNING_REPORT_CACHE_TTL = int(os.getenv("MORNING_REPORT_CACHE_TTL", "43200"))
+
 SYNC_META_FILE = os.path.join(DATA_DIR, "sync_meta.json")
 
 # ========= КУРС USD→KZT =========

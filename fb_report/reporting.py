@@ -4,6 +4,9 @@ import json
 import os
 from datetime import datetime, timedelta
 import re
+import time
+import hashlib
+import logging
 from typing import Any
 
 from telegram.ext import ContextTypes
@@ -13,6 +16,8 @@ from .constants import (
     REPORT_CACHE_FILE,
     REPORT_CACHE_TTL,
     DEFAULT_REPORT_CHAT,
+    MORNING_REPORT_CACHE_FILE,
+    MORNING_REPORT_CACHE_TTL,
 )
 from .storage import (
     get_account_name,
@@ -35,6 +40,346 @@ from services.facebook_api import allow_fb_api_calls, fetch_insights_bulk, safe_
 
 
 REPORT_TEXT_CACHE_VERSION = 2
+
+
+def _load_morning_report_cache() -> dict:
+    try:
+        with open(MORNING_REPORT_CACHE_FILE, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_morning_report_cache(d: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(MORNING_REPORT_CACHE_FILE), exist_ok=True)
+    except Exception:
+        pass
+    tmp = str(MORNING_REPORT_CACHE_FILE) + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=2)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+        os.replace(tmp, MORNING_REPORT_CACHE_FILE)
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+
+
+def _metrics_hash(metrics_set: str, lead_action_type: str | None) -> str:
+    s = str(metrics_set or "") + "|" + (str(lead_action_type or "").strip() or "")
+    return hashlib.md5(s.encode("utf-8")).hexdigest()[:10]
+
+
+def _cache_key(*, scope: str, scope_id: str, since: str, until: str, mode: str, metrics_hash: str) -> str:
+    return f"{str(scope)}:{str(scope_id)}:{str(since)}:{str(until)}:{str(mode)}:{str(metrics_hash)}"
+
+
+def _cache_get_morning(key: str) -> tuple[dict | None, bool]:
+    store = _load_morning_report_cache() or {}
+    item = store.get(str(key))
+    now_ts = time.time()
+    hit = False
+    if isinstance(item, dict):
+        try:
+            ts = float(item.get("ts") or 0.0)
+        except Exception:
+            ts = 0.0
+        if ts and (now_ts - ts) <= float(MORNING_REPORT_CACHE_TTL):
+            val = item.get("value")
+            if isinstance(val, dict):
+                hit = True
+                logging.getLogger(__name__).info("cache_read key=%s hit=true", str(key))
+                return val, True
+    logging.getLogger(__name__).info("cache_read key=%s hit=false", str(key))
+    return None, False
+
+
+def _cache_set_morning(key: str, value: dict) -> None:
+    store = _load_morning_report_cache() or {}
+    store[str(key)] = {"ts": time.time(), "value": value}
+    try:
+        size_bytes = len(json.dumps(store[str(key)], ensure_ascii=False).encode("utf-8"))
+    except Exception:
+        size_bytes = 0
+    _save_morning_report_cache(store)
+    logging.getLogger(__name__).info(
+        "cache_write key=%s size_bytes=%s",
+        str(key),
+        str(int(size_bytes)) if size_bytes else "",
+    )
+
+
+def _yesterday_range_almaty() -> tuple[str, str]:
+    now = datetime.now(ALMATY_TZ)
+    ds = (now.date() - timedelta(days=1)).strftime("%Y-%m-%d")
+    return ds, ds
+
+
+def _autopilot_tracked_group_ids_from_row(row: dict) -> list[str]:
+    ap = (row or {}).get("autopilot") or {}
+    if not isinstance(ap, dict):
+        ap = {}
+    ids = ap.get("active_group_ids")
+    if not isinstance(ids, list):
+        ids = []
+    out = []
+    seen = set()
+    for x in ids:
+        s = str(x).strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    gid = str(ap.get("active_group_id") or "").strip()
+    if gid and gid not in seen:
+        out.append(gid)
+    return out
+
+
+def _autopilot_group_from_row(row: dict, gid: str) -> dict:
+    ap = (row or {}).get("autopilot") or {}
+    if not isinstance(ap, dict):
+        ap = {}
+    groups = ap.get("campaign_groups") or {}
+    if not isinstance(groups, dict):
+        groups = {}
+    grp = groups.get(str(gid))
+    return grp if isinstance(grp, dict) else {}
+
+
+def _parse_group_lead_action_type(grp: dict) -> str | None:
+    lm = (grp or {}).get("lead_metric")
+    if isinstance(lm, dict):
+        at = lm.get("action_type")
+    else:
+        at = lm
+    at = str(at or "").strip()
+    return at or None
+
+
+def _sum_metrics_from_insight_rows(rows: list[dict], *, aid: str, lead_action_type: str | None) -> dict:
+    spend = 0.0
+    msgs = 0
+    leads = 0
+    for r in rows or []:
+        if not isinstance(r, dict):
+            continue
+        try:
+            spend += float(r.get("spend", 0) or 0)
+        except Exception:
+            pass
+        try:
+            actions_map = extract_actions(r)
+        except Exception:
+            actions_map = {}
+        try:
+            msgs += int(count_started_conversations_from_actions(actions_map) or 0)
+        except Exception:
+            pass
+        try:
+            leads += int(count_leads_from_actions(actions_map, aid=str(aid), lead_action_type=lead_action_type) or 0)
+        except Exception:
+            pass
+
+    blended = int(msgs) + int(leads)
+    cpa = (float(spend) / float(blended)) if blended > 0 else None
+    return {
+        "spend": float(spend),
+        "msgs": int(msgs),
+        "leads": int(leads),
+        "blended": int(blended),
+        "blended_cpa": float(cpa) if cpa is not None else None,
+    }
+
+
+def build_morning_report_text(*, period: str = "yesterday") -> tuple[str, dict]:
+    t0 = time.time()
+    if str(period or "") != "yesterday":
+        period = "yesterday"
+
+    since, until = _yesterday_range_almaty()
+    store = load_accounts() or {}
+    enabled_ids = [aid for aid, row in (store or {}).items() if (row or {}).get("enabled", True)]
+
+    cache_hit = 0
+    cache_miss = 0
+
+    entities_out: list[dict] = []
+    accounts_out: list[dict] = []
+
+    for aid in enabled_ids:
+        row = (store or {}).get(str(aid)) or {}
+        mr = (row or {}).get("morning_report") or {}
+        if not isinstance(mr, dict):
+            mr = {}
+        level = str(mr.get("level", "ACCOUNT") or "ACCOUNT").upper()
+        if level == "OFF":
+            continue
+
+        tracked_gids = _autopilot_tracked_group_ids_from_row(row)
+        for gid in tracked_gids:
+            grp = _autopilot_group_from_row(row, gid)
+            name = str((grp or {}).get("name") or gid)
+            cids = (grp or {}).get("campaign_ids") or []
+            if not isinstance(cids, list):
+                cids = []
+            cset = {str(x) for x in cids if str(x).strip()}
+            if not cset:
+                continue
+
+            lat = _parse_group_lead_action_type(grp)
+            mh = _metrics_hash("blended", lat)
+            key = _cache_key(
+                scope="entity",
+                scope_id=f"{str(aid)}:{str(gid)}",
+                since=since,
+                until=until,
+                mode="ENTITY",
+                metrics_hash=mh,
+            )
+            cached, hit = _cache_get_morning(key)
+            if hit and cached is not None:
+                cache_hit += 1
+                metrics = cached
+            else:
+                cache_miss += 1
+                period_for_api: Any = {"since": since, "until": until}
+                params_extra = {"action_report_time": "conversion", "use_unified_attribution_setting": True}
+                with allow_fb_api_calls(reason="morning_report_entity"):
+                    rows = fetch_insights_bulk(
+                        str(aid),
+                        period=period_for_api,
+                        level="campaign",
+                        fields=["campaign_id", "campaign_name", "spend", "actions"],
+                        params_extra=dict(params_extra),
+                    )
+                rows_f = [r for r in (rows or []) if str((r or {}).get("campaign_id") or "") in cset]
+                metrics = _sum_metrics_from_insight_rows(rows_f, aid=str(aid), lead_action_type=lat)
+                _cache_set_morning(key, dict(metrics))
+
+            entities_out.append(
+                {
+                    "aid": str(aid),
+                    "gid": str(gid),
+                    "name": name,
+                    **{k: metrics.get(k) for k in ["spend", "msgs", "leads", "blended", "blended_cpa"]},
+                }
+            )
+
+        if level == "ACCOUNT":
+            mh = _metrics_hash("blended", None)
+            key = _cache_key(
+                scope="account",
+                scope_id=str(aid),
+                since=since,
+                until=until,
+                mode="ACCOUNT",
+                metrics_hash=mh,
+            )
+            cached, hit = _cache_get_morning(key)
+            if hit and cached is not None:
+                cache_hit += 1
+                metrics = cached
+            else:
+                cache_miss += 1
+                period_for_api = {"since": since, "until": until}
+                params_extra = {"action_report_time": "conversion", "use_unified_attribution_setting": True}
+                with allow_fb_api_calls(reason="morning_report_account"):
+                    rows = fetch_insights_bulk(
+                        str(aid),
+                        period=period_for_api,
+                        level="account",
+                        fields=["spend", "actions"],
+                        params_extra=dict(params_extra),
+                    )
+                metrics = _sum_metrics_from_insight_rows(list(rows or []), aid=str(aid), lead_action_type=None)
+                _cache_set_morning(key, dict(metrics))
+
+            accounts_out.append(
+                {
+                    "aid": str(aid),
+                    "name": get_account_name(str(aid)),
+                    **{k: metrics.get(k) for k in ["spend", "msgs", "leads", "blended", "blended_cpa"]},
+                }
+            )
+
+    def _fmt_money(v: float | None) -> str:
+        try:
+            return f"{float(v or 0):.2f} $"
+        except Exception:
+            return "0.00 $"
+
+    def _fmt_int(v: int | None) -> str:
+        try:
+            return str(int(v or 0))
+        except Exception:
+            return "0"
+
+    def _fmt_cpa(v: float | None) -> str:
+        if v is None:
+            return "—"
+        try:
+            return f"{float(v):.2f} $"
+        except Exception:
+            return "—"
+
+    lines: list[str] = []
+    lines.append(f"🌅 Утренний отчёт — {since}")
+    lines.append(f"Период: вчера ({since}–{until})")
+    lines.append("")
+
+    if entities_out:
+        lines.append("🏙 Группы/Сущности")
+        for e in entities_out:
+            lines.append(f"\n🏙 {str(e.get('name') or '')}")
+            lines.append(f"💵 Spend: {_fmt_money(e.get('spend'))}")
+            lines.append(f"💬 Переписки: {_fmt_int(e.get('msgs'))}")
+            lines.append(f"📩 Заявки с сайта: {_fmt_int(e.get('leads'))}")
+            lines.append(f"🧮 Blended: {_fmt_int(e.get('blended'))}")
+            lines.append(f"🎯 Blended CPA: {_fmt_cpa(e.get('blended_cpa'))}")
+        lines.append("")
+
+    if accounts_out:
+        lines.append("🏷 Остальные аккаунты")
+        for a in accounts_out:
+            lines.append(f"\n🏷 {str(a.get('name') or '')}")
+            lines.append(f"💵 Spend: {_fmt_money(a.get('spend'))}")
+            lines.append(f"💬 Переписки: {_fmt_int(a.get('msgs'))}")
+            lines.append(f"📩 Заявки с сайта: {_fmt_int(a.get('leads'))}")
+            lines.append(f"🧮 Blended: {_fmt_int(a.get('blended'))}")
+            lines.append(f"🎯 Blended CPA: {_fmt_cpa(a.get('blended_cpa'))}")
+        lines.append("")
+
+    dur_ms = int((time.time() - t0) * 1000.0)
+    lines.append(
+        "debug: mode=ACCOUNT entities={e} accounts={a} cache_hit={h} cache_miss={m} duration_ms={d}".format(
+            e=int(len(entities_out)),
+            a=int(len(accounts_out)),
+            h=int(cache_hit),
+            m=int(cache_miss),
+            d=int(dur_ms),
+        )
+    )
+
+    debug = {
+        "since": since,
+        "until": until,
+        "entities": int(len(entities_out)),
+        "accounts": int(len(accounts_out)),
+        "cache_hit": int(cache_hit),
+        "cache_miss": int(cache_miss),
+        "duration_ms": int(dur_ms),
+    }
+    return "\n".join(lines), debug
 
 
 def _account_timezone_info(aid: str) -> dict:
