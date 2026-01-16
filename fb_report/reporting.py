@@ -18,6 +18,7 @@ from .constants import (
     DEFAULT_REPORT_CHAT,
     MORNING_REPORT_CACHE_FILE,
     MORNING_REPORT_CACHE_TTL,
+    DAILY_REPORT_CACHE_FILE,
 )
 from .storage import (
     get_account_name,
@@ -37,9 +38,281 @@ from .insights import (
 from services.analytics import count_leads_from_actions, count_started_conversations_from_actions
 
 from services.facebook_api import allow_fb_api_calls, fetch_insights_bulk, safe_api_call
+from services.facebook_api import deny_fb_api_calls
+from services.heatmap_store import load_snapshot, list_snapshot_hours
 
 
-REPORT_TEXT_CACHE_VERSION = 2
+REPORT_TEXT_CACHE_VERSION = 3
+
+
+def _load_daily_report_cache() -> dict:
+    try:
+        with open(DAILY_REPORT_CACHE_FILE, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_daily_report_cache(d: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(DAILY_REPORT_CACHE_FILE), exist_ok=True)
+    except Exception:
+        pass
+    tmp = str(DAILY_REPORT_CACHE_FILE) + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=2)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+        os.replace(tmp, DAILY_REPORT_CACHE_FILE)
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+
+
+def _daily_cache_key(*, scope: str, scope_id: str, date_str: str, level: str, metrics_hash: str) -> str:
+    return f"daily:{str(scope)}:{str(scope_id)}:{str(date_str)}:{str(level)}:{str(metrics_hash)}"
+
+
+def _daily_ttl_seconds(*, date_str: str) -> int:
+    try:
+        today = datetime.now(ALMATY_TZ).date().strftime("%Y-%m-%d")
+    except Exception:
+        today = ""
+    if str(date_str) == str(today):
+        return int(60 * 60 * 2)
+    return int(60 * 60 * 48)
+
+
+def _daily_cache_get(key: str, *, ttl_seconds: int) -> tuple[Any | None, bool]:
+    store = _load_daily_report_cache() or {}
+    item = store.get(str(key))
+    now_ts = time.time()
+    if isinstance(item, dict):
+        try:
+            ts = float(item.get("ts") or 0.0)
+        except Exception:
+            ts = 0.0
+        if ts and (now_ts - ts) <= float(ttl_seconds):
+            return item.get("value"), True
+    return None, False
+
+
+def _daily_cache_set(key: str, value: Any) -> None:
+    store = _load_daily_report_cache() or {}
+    store[str(key)] = {"ts": time.time(), "value": value}
+    _save_daily_report_cache(store)
+
+
+def _report_source_footer_lines(*, mode: str, cache_state: str) -> list[str]:
+    lines: list[str] = []
+    if str(mode) != "hourly_cache":
+        lines.append("ℹ️ почасовых данных нет — показан дневной отчёт (кэширован)")
+    if str(mode) == "hourly_cache":
+        lines.append("ℹ️ Источник данных: почасовой кэш")
+    else:
+        if str(cache_state) == "hit":
+            lines.append("ℹ️ Источник данных: дневной кэш")
+        else:
+            lines.append("ℹ️ Источник данных: прямой запрос Facebook API")
+    return lines
+
+
+def _strip_source_footer(text: str) -> tuple[str, list[str]]:
+    if not text:
+        return text, []
+    lines = [ln for ln in str(text).split("\n")]
+    tail: list[str] = []
+    while lines and (
+        str(lines[-1]).startswith("ℹ️ Источник данных:")
+        or str(lines[-1]).startswith("ℹ️ почасовых данных нет")
+        or str(lines[-1]).strip() == ""
+    ):
+        ln = lines.pop()
+        if str(ln).strip():
+            tail.append(str(ln))
+    tail.reverse()
+    return "\n".join(lines).rstrip(), tail
+
+
+def _actions_list_from_map(actions_map: dict[str, float]) -> list[dict]:
+    out: list[dict] = []
+    for k, v in (actions_map or {}).items():
+        try:
+            out.append({"action_type": str(k), "value": float(v or 0.0)})
+        except Exception:
+            continue
+    return out
+
+
+def _aggregate_account_day_from_hourly_snapshots(aid: str, *, date_str: str) -> dict | None:
+    with deny_fb_api_calls(reason="reporting_hourly_account"):
+        hours = list_snapshot_hours(str(aid), date_str=str(date_str))
+        if not hours:
+            return None
+
+        spend = 0.0
+        impressions = 0
+        clicks = 0
+        actions_map: dict[str, float] = {}
+        any_ready = False
+
+        for h in hours:
+            snap = load_snapshot(str(aid), date_str=str(date_str), hour=int(h)) or {}
+            if str(snap.get("status") or "") not in {"ready", "ready_low_confidence"}:
+                continue
+            rows = snap.get("rows") or []
+            if not isinstance(rows, list) or not rows:
+                continue
+            any_ready = True
+            for r in rows:
+                if not isinstance(r, dict):
+                    continue
+                try:
+                    spend += float(r.get("spend") or 0.0)
+                except Exception:
+                    pass
+                try:
+                    impressions += int((r or {}).get("impressions") or 0)
+                except Exception:
+                    pass
+                try:
+                    clicks += int((r or {}).get("clicks") or 0)
+                except Exception:
+                    pass
+                acts = (r or {}).get("actions")
+                if isinstance(acts, dict) and acts:
+                    for k, v in acts.items():
+                        try:
+                            actions_map[str(k)] = float(actions_map.get(str(k), 0.0) or 0.0) + float(v or 0.0)
+                        except Exception:
+                            continue
+
+        if not any_ready:
+            return None
+
+        cpm = (float(spend) / float(impressions) * 1000.0) if int(impressions) > 0 else 0.0
+        cpc = (float(spend) / float(clicks)) if int(clicks) > 0 else 0.0
+        return {
+            "impressions": int(impressions),
+            "cpm": float(cpm),
+            "clicks": int(clicks),
+            "cpc": float(cpc),
+            "spend": float(spend),
+            "actions": _actions_list_from_map(actions_map),
+            "cost_per_action_type": [],
+            "_source": "hourly_cache",
+            "_meta": {"date": str(date_str), "level": "account"},
+        }
+
+
+def _fetch_account_day_insight(
+    *,
+    aid: str,
+    kind: str,
+    caller: str,
+) -> tuple[dict | None, str, str, str]:
+    log = logging.getLogger(__name__)
+    now = datetime.now(ALMATY_TZ)
+    date_str = now.strftime("%Y-%m-%d") if str(kind) == "today" else (now - timedelta(days=1)).strftime("%Y-%m-%d")
+    mh = _metrics_hash("account", None)
+    key = _daily_cache_key(scope="account", scope_id=str(aid), date_str=str(date_str), level="ACCOUNT", metrics_hash=mh)
+
+    hourly = _aggregate_account_day_from_hourly_snapshots(str(aid), date_str=str(date_str))
+    if isinstance(hourly, dict) and hourly:
+        try:
+            log.info(
+                "caller=%s mode=hourly_cache cache=hit scope=account scope_id=%s date=%s level=ACCOUNT",
+                str(caller),
+                str(aid),
+                str(date_str),
+            )
+        except Exception:
+            pass
+        return hourly, "hourly_cache", "hit", str(date_str)
+
+    ttl = _daily_ttl_seconds(date_str=str(date_str))
+    cached, hit = _daily_cache_get(key, ttl_seconds=int(ttl))
+    if hit and isinstance(cached, dict):
+        try:
+            log.info(
+                "caller=%s mode=daily_fallback cache=hit scope=account scope_id=%s date=%s level=ACCOUNT",
+                str(caller),
+                str(aid),
+                str(date_str),
+            )
+        except Exception:
+            pass
+        cached["_source"] = "daily_cache"
+        return cached, "daily_fallback", "hit", str(date_str)
+
+    try:
+        log.info(
+            "caller=%s mode=daily_fallback cache=miss scope=account scope_id=%s date=%s level=ACCOUNT",
+            str(caller),
+            str(aid),
+            str(date_str),
+        )
+    except Exception:
+        pass
+
+    fields = [
+        "impressions",
+        "cpm",
+        "clicks",
+        "cpc",
+        "spend",
+        "actions",
+        "cost_per_action_type",
+    ]
+    params_extra = {
+        "action_report_time": "conversion",
+        "use_unified_attribution_setting": True,
+    }
+    rows: list[dict] = []
+    with allow_fb_api_calls(reason="reporting_daily_fallback"):
+        rows = fetch_insights_bulk(
+            str(aid),
+            period=str(kind),
+            level="account",
+            fields=list(fields),
+            params_extra=dict(params_extra),
+        )
+
+    ins_dict = (rows[0] if rows else None) or {}
+    if not isinstance(ins_dict, dict):
+        ins_dict = {}
+    try:
+        ins_dict["_source"] = "fb_api"
+        ins_dict["_meta"] = {
+            "period_input": str(kind),
+            "period_effective": str(kind),
+            "level": "account",
+            "fields": list(fields),
+            "params_extra": dict(params_extra),
+            "date": str(date_str),
+        }
+    except Exception:
+        pass
+
+    _daily_cache_set(key, dict(ins_dict))
+    try:
+        log.info(
+            "caller=%s mode=daily_fallback cache=write scope=account scope_id=%s date=%s level=ACCOUNT",
+            str(caller),
+            str(aid),
+            str(date_str),
+        )
+    except Exception:
+        pass
+    return ins_dict, "daily_fallback", "write", str(date_str)
 
 
 def _load_morning_report_cache() -> dict:
@@ -212,6 +485,7 @@ def build_morning_report_text(*, period: str = "yesterday") -> tuple[str, dict]:
 
     cache_hit = 0
     cache_miss = 0
+    any_fb_calls = False
 
     entities_out: list[dict] = []
     accounts_out: list[dict] = []
@@ -250,8 +524,25 @@ def build_morning_report_text(*, period: str = "yesterday") -> tuple[str, dict]:
             if hit and cached is not None:
                 cache_hit += 1
                 metrics = cached
+                try:
+                    logging.getLogger(__name__).info(
+                        "caller=morning_report mode=daily_fallback cache=hit scope=entity_group scope_id=%s date=%s level=ENTITY",
+                        str(f"{aid}:{gid}"),
+                        str(since),
+                    )
+                except Exception:
+                    pass
             else:
                 cache_miss += 1
+                any_fb_calls = True
+                try:
+                    logging.getLogger(__name__).info(
+                        "caller=morning_report mode=daily_fallback cache=miss scope=entity_group scope_id=%s date=%s level=ENTITY",
+                        str(f"{aid}:{gid}"),
+                        str(since),
+                    )
+                except Exception:
+                    pass
                 period_for_api: Any = {"since": since, "until": until}
                 params_extra = {"action_report_time": "conversion", "use_unified_attribution_setting": True}
                 with allow_fb_api_calls(reason="morning_report_entity"):
@@ -265,6 +556,14 @@ def build_morning_report_text(*, period: str = "yesterday") -> tuple[str, dict]:
                 rows_f = [r for r in (rows or []) if str((r or {}).get("campaign_id") or "") in cset]
                 metrics = _sum_metrics_from_insight_rows(rows_f, aid=str(aid), lead_action_type=lat)
                 _cache_set_morning(key, dict(metrics))
+                try:
+                    logging.getLogger(__name__).info(
+                        "caller=morning_report mode=daily_fallback cache=write scope=entity_group scope_id=%s date=%s level=ENTITY",
+                        str(f"{aid}:{gid}"),
+                        str(since),
+                    )
+                except Exception:
+                    pass
 
             entities_out.append(
                 {
@@ -289,8 +588,25 @@ def build_morning_report_text(*, period: str = "yesterday") -> tuple[str, dict]:
             if hit and cached is not None:
                 cache_hit += 1
                 metrics = cached
+                try:
+                    logging.getLogger(__name__).info(
+                        "caller=morning_report mode=daily_fallback cache=hit scope=account scope_id=%s date=%s level=ACCOUNT",
+                        str(aid),
+                        str(since),
+                    )
+                except Exception:
+                    pass
             else:
                 cache_miss += 1
+                any_fb_calls = True
+                try:
+                    logging.getLogger(__name__).info(
+                        "caller=morning_report mode=daily_fallback cache=miss scope=account scope_id=%s date=%s level=ACCOUNT",
+                        str(aid),
+                        str(since),
+                    )
+                except Exception:
+                    pass
                 period_for_api = {"since": since, "until": until}
                 params_extra = {"action_report_time": "conversion", "use_unified_attribution_setting": True}
                 with allow_fb_api_calls(reason="morning_report_account"):
@@ -303,6 +619,14 @@ def build_morning_report_text(*, period: str = "yesterday") -> tuple[str, dict]:
                     )
                 metrics = _sum_metrics_from_insight_rows(list(rows or []), aid=str(aid), lead_action_type=None)
                 _cache_set_morning(key, dict(metrics))
+                try:
+                    logging.getLogger(__name__).info(
+                        "caller=morning_report mode=daily_fallback cache=write scope=account scope_id=%s date=%s level=ACCOUNT",
+                        str(aid),
+                        str(since),
+                    )
+                except Exception:
+                    pass
 
             accounts_out.append(
                 {
@@ -369,6 +693,10 @@ def build_morning_report_text(*, period: str = "yesterday") -> tuple[str, dict]:
             d=int(dur_ms),
         )
     )
+
+    mr_cache_state = "write" if bool(any_fb_calls) else "hit"
+    foot = _report_source_footer_lines(mode="daily_fallback", cache_state=str(mr_cache_state))
+    lines.extend([str(x) for x in foot if str(x).strip()])
 
     debug = {
         "since": since,
@@ -764,8 +1092,30 @@ def build_report(aid: str, period, label: str = "") -> str:
     - CPC / затраты
     - переписки / лиды / blended CPA (как в старом боте)
     """
+    caller = "report"
     try:
-        name, ins = fetch_insight(aid, period)
+        if isinstance(period, dict):
+            caller = "report"
+        elif str(period) == "today":
+            caller = "rep_today"
+        elif str(period) == "yesterday":
+            caller = "rep_yday"
+    except Exception:
+        caller = "report"
+
+    return build_report_with_caller(aid, period, label=label, caller=caller)
+
+
+def build_report_with_caller(aid: str, period, label: str = "", *, caller: str) -> str:
+    mode = ""
+    cache_state = ""
+    date_str = ""
+    try:
+        if isinstance(period, str) and str(period) in {"today", "yesterday"}:
+            ins, mode, cache_state, date_str = _fetch_account_day_insight(aid=str(aid), kind=str(period), caller=str(caller))
+            name = get_account_name(aid)
+        else:
+            name, ins = fetch_insight(aid, period)
     except Exception as e:
         err = str(e)
         if "code: 200" in err or "403" in err or "permissions" in err.lower():
@@ -877,7 +1227,11 @@ def build_report(aid: str, period, label: str = "") -> str:
     if flags.get("messaging") and flags.get("leads") and msgs > 0 and leads > 0:
         body.extend(format_blended_block(spend, msgs, leads).split("\n"))
 
-    return hdr + "\n".join(body)
+    out = hdr + "\n".join(body)
+    if isinstance(period, str) and str(period) in {"today", "yesterday"}:
+        foot = _report_source_footer_lines(mode=str(mode or "daily_fallback"), cache_state=str(cache_state or "write"))
+        out = (out.rstrip() + "\n\n" + "\n".join([str(x) for x in foot if str(x).strip()])).rstrip()
+    return out
 
 
 def format_blended_block(total_spend: float, msgs: int, leads: int) -> str:
@@ -1049,9 +1403,20 @@ def build_account_report(
     if lvl == "OFF":
         return ""
 
-    base = build_report(aid, period, label)
+    caller = "report"
+    try:
+        if isinstance(period, str) and str(period) == "today":
+            caller = "rep_today"
+        elif isinstance(period, str) and str(period) == "yesterday":
+            caller = "rep_yday"
+    except Exception:
+        caller = "report"
+
+    base = build_report_with_caller(aid, period, label, caller=caller)
     if not base:
         return ""
+
+    base_no_footer, footer_lines = _strip_source_footer(base)
 
     flags = metrics_flags(aid)
 
@@ -1128,6 +1493,116 @@ def build_account_report(
                 for r in (snap.get("rows") or []):
                     if isinstance(r, dict):
                         all_rows.append(r)
+
+    entity_mode = "hourly_cache" if all_rows else "daily_fallback"
+    entity_cache_state = "hit" if all_rows else "write"
+    entity_date_str = ""
+    if not all_rows:
+        if isinstance(period, str) and str(period) in {"today", "yesterday"}:
+            entity_date_str = now.strftime("%Y-%m-%d") if str(period) == "today" else (now - timedelta(days=1)).strftime("%Y-%m-%d")
+            mh = _metrics_hash("entities_" + str(lvl), None)
+            key = _daily_cache_key(scope="account", scope_id=str(aid), date_str=str(entity_date_str), level=str(lvl), metrics_hash=mh)
+            ttl = _daily_ttl_seconds(date_str=str(entity_date_str))
+            cached, hit = _daily_cache_get(key, ttl_seconds=int(ttl))
+            if hit and isinstance(cached, list):
+                all_rows = [r for r in (cached or []) if isinstance(r, dict)]
+                entity_cache_state = "hit"
+            else:
+                fields = ["spend", "actions", "campaign_id", "campaign_name"]
+                if lvl == "ADSET":
+                    fields.extend(["adset_id", "adset_name"])
+                params_extra = {"action_report_time": "conversion", "use_unified_attribution_setting": True}
+                with allow_fb_api_calls(reason="reporting_daily_entities"):
+                    rows = fetch_insights_bulk(
+                        str(aid),
+                        period=str(period),
+                        level=str(lvl).lower(),
+                        fields=list(fields),
+                        params_extra=dict(params_extra),
+                    )
+
+                out_rows: list[dict] = []
+                for rr in (rows or []):
+                    if not isinstance(rr, dict):
+                        continue
+                    acts = extract_actions(rr)
+                    try:
+                        started = int(count_started_conversations_from_actions(acts) or 0)
+                    except Exception:
+                        started = 0
+                    try:
+                        website = int(count_leads_from_actions(acts, aid=str(aid), lead_action_type=None) or 0)
+                    except Exception:
+                        website = 0
+                    try:
+                        spend_v = float(rr.get("spend") or 0.0)
+                    except Exception:
+                        spend_v = 0.0
+                    row_out = {
+                        "campaign_id": rr.get("campaign_id"),
+                        "campaign_name": rr.get("campaign_name"),
+                        "adset_id": rr.get("adset_id"),
+                        "name": rr.get("adset_name") or rr.get("name"),
+                        "spend": spend_v,
+                        "started_conversations": int(started),
+                        "website_submit_applications": int(website),
+                        "actions": dict(acts or {}),
+                        "msgs": int(started),
+                        "leads": int(website),
+                        "total": int(started + website),
+                    }
+                    out_rows.append(row_out)
+
+                all_rows = out_rows
+                _daily_cache_set(key, list(out_rows))
+                entity_cache_state = "write"
+
+        else:
+            fields = ["spend", "actions", "campaign_id", "campaign_name"]
+            if lvl == "ADSET":
+                fields.extend(["adset_id", "adset_name"])
+            params_extra = {"action_report_time": "conversion", "use_unified_attribution_setting": True}
+            with allow_fb_api_calls(reason="reporting_range_entities"):
+                rows = fetch_insights_bulk(
+                    str(aid),
+                    period=period,
+                    level=str(lvl).lower(),
+                    fields=list(fields),
+                    params_extra=dict(params_extra),
+                )
+            out_rows = []
+            for rr in (rows or []):
+                if not isinstance(rr, dict):
+                    continue
+                acts = extract_actions(rr)
+                try:
+                    started = int(count_started_conversations_from_actions(acts) or 0)
+                except Exception:
+                    started = 0
+                try:
+                    website = int(count_leads_from_actions(acts, aid=str(aid), lead_action_type=None) or 0)
+                except Exception:
+                    website = 0
+                try:
+                    spend_v = float(rr.get("spend") or 0.0)
+                except Exception:
+                    spend_v = 0.0
+                row_out = {
+                    "campaign_id": rr.get("campaign_id"),
+                    "campaign_name": rr.get("campaign_name"),
+                    "adset_id": rr.get("adset_id"),
+                    "name": rr.get("adset_name") or rr.get("name"),
+                    "spend": spend_v,
+                    "started_conversations": int(started),
+                    "website_submit_applications": int(website),
+                    "actions": dict(acts or {}),
+                    "msgs": int(started),
+                    "leads": int(website),
+                    "total": int(started + website),
+                }
+                out_rows.append(row_out)
+            all_rows = out_rows
+            entity_cache_state = "write"
 
     def _group_rows(key_field: str, name_field: str) -> list[dict]:
         agg: dict[str, dict] = {}
@@ -1288,8 +1763,24 @@ def build_account_report(
                 current_chars += len(sep) + len(acc_blended_after_sections)
 
     # Разделитель обязателен между блоками.
-    out = base + sep + sep.join(chunks)
-    return _collapse_double_separators(out)
+    out = str(base_no_footer) + sep + sep.join(chunks)
+    out = _collapse_double_separators(out)
+    if isinstance(period, str) and str(period) in {"today", "yesterday"}:
+        try:
+            logging.getLogger(__name__).info(
+                "caller=%s mode=%s cache=%s scope=account scope_id=%s date=%s level=%s",
+                str(caller),
+                str(entity_mode),
+                str(entity_cache_state),
+                str(aid),
+                str(entity_date_str or ""),
+                str(lvl),
+            )
+        except Exception:
+            pass
+        foot = _report_source_footer_lines(mode=str(entity_mode), cache_state=str(entity_cache_state))
+        out = (out.rstrip() + "\n\n" + "\n".join([str(x) for x in foot if str(x).strip()])).rstrip()
+    return out
 
 
 async def send_period_report(
@@ -1307,12 +1798,18 @@ async def send_period_report(
 
     store = load_accounts()
 
+    caller = "report"
+    if str(period) == "today":
+        caller = "rep_today"
+    elif str(period) == "yesterday":
+        caller = "rep_yday"
+
     for aid in get_enabled_accounts_in_order():
         if not store.get(aid, {}).get("enabled", True):
             continue
 
         if period == "today":
-            txt = build_report(aid, period, label)
+            txt = build_report_with_caller(aid, period, label, caller=caller)
         else:
             txt = get_cached_report(aid, period, label)
 

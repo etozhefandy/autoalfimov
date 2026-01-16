@@ -1745,6 +1745,8 @@ async def _heatmap_snapshot_collector_job(
                         "adset_status": str(stt or "UNKNOWN"),
                         "campaign_id": (d or {}).get("campaign_id"),
                         "campaign_name": (d or {}).get("campaign_name"),
+                        "impressions": int((d or {}).get("impressions") or 0),
+                        "clicks": int((d or {}).get("clicks") or 0),
                         "spend": spend,
                         "started_conversations": int(started_conversations or 0),
                         "website_submit_applications": int(website_submit or 0),
