@@ -573,11 +573,20 @@ async def morning_report_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     t0 = _time.time()
     log.info("job_start name=morning_report")
     try:
-        from fb_report.reporting import build_morning_report_text, build_account_report
+        from fb_report.reporting import (
+            build_account_report,
+            build_morning_account_message,
+            build_morning_blended_message,
+            build_morning_group_message,
+            _autopilot_tracked_group_ids_from_row,
+            _autopilot_group_from_row,
+            _strip_fb_technical_lines,
+        )
 
         now = datetime.now(ALMATY_TZ)
         today = now.date().strftime("%Y-%m-%d")
-        period = {"since": (now.date() - timedelta(days=1)).strftime("%Y-%m-%d"), "until": (now.date() - timedelta(days=1)).strftime("%Y-%m-%d")}
+        yday = (now.date() - timedelta(days=1)).strftime("%Y-%m-%d")
+        period = {"since": str(yday), "until": str(yday)}
 
         accounts = load_accounts() or {}
         selected: list[tuple[str, str]] = []
@@ -598,16 +607,69 @@ async def morning_report_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
         chat_id = str(DEFAULT_REPORT_CHAT)
-        txt, dbg = build_morning_report_text(period="yesterday")
-        await context.bot.send_message(chat_id=chat_id, text=str(txt))
-
         for aid, lvl in selected:
-            if lvl not in {"CAMPAIGN", "ADSET"}:
-                continue
-            log.info("morning_report mode=%s aid=%s", str(lvl), str(aid))
-            t = build_account_report(str(aid), period, level=str(lvl))
-            if t:
-                await context.bot.send_message(chat_id=chat_id, text=str(t), parse_mode="HTML")
+            row = (accounts or {}).get(str(aid)) or {}
+
+            try:
+                txt = build_morning_account_message(aid=str(aid), date_str=str(yday), period=dict(period))
+            except Exception:
+                txt = ""
+            if txt:
+                await context.bot.send_message(chat_id=chat_id, text=str(txt))
+
+            try:
+                btxt = build_morning_blended_message(aid=str(aid), name=get_account_name(str(aid)), period=dict(period))
+            except Exception:
+                btxt = ""
+            if btxt:
+                await context.bot.send_message(chat_id=chat_id, text=str(btxt))
+
+            try:
+                gids = _autopilot_tracked_group_ids_from_row(row)
+            except Exception:
+                gids = []
+            for gid in gids:
+                try:
+                    grp = _autopilot_group_from_row(row, str(gid))
+                    gtxt = build_morning_group_message(aid=str(aid), gid=str(gid), grp=grp, since=str(yday), until=str(yday))
+                except Exception:
+                    gtxt = ""
+                if gtxt:
+                    await context.bot.send_message(chat_id=chat_id, text=str(gtxt))
+
+            if lvl in {"CAMPAIGN", "ADSET"}:
+                log.info("morning_report mode=%s aid=%s", str(lvl), str(aid))
+                t = build_account_report(str(aid), dict(period), level=str(lvl))
+                if t:
+                    try:
+                        parts = [p for p in str(t).split("\n────────────\n") if str(p).strip()]
+                    except Exception:
+                        parts = [str(t)]
+                    if parts:
+                        base = parts[0]
+                        blocks = parts[1:]
+                    else:
+                        base = ""
+                        blocks = []
+
+                    kept: list[str] = []
+                    for blk in blocks:
+                        s = str(blk).strip()
+                        if s == "📣 Кампании\nнет данных за период":
+                            continue
+                        if s == "🧩 Адсеты\nнет данных за период":
+                            continue
+                        if s == "🎯 Объявления\nнет данных за период":
+                            continue
+                        if "🧮" in s and "blended" in s.lower():
+                            continue
+                        kept.append(blk)
+
+                    if kept:
+                        out = str(base).rstrip() + "\n────────────\n" + "\n────────────\n".join([str(x).strip() for x in kept if str(x).strip()])
+                        out = _strip_fb_technical_lines(out)
+                        if out.strip():
+                            await context.bot.send_message(chat_id=chat_id, text=str(out), parse_mode="HTML")
 
         st = _load_morning_report_state() or {}
         st["last_sent_date"] = str(today)

@@ -710,6 +710,220 @@ def build_morning_report_text(*, period: str = "yesterday") -> tuple[str, dict]:
     return "\n".join(lines), debug
 
 
+def _strip_fb_technical_lines(text: str) -> str:
+    if not text:
+        return text
+    out: list[str] = []
+    for line in str(text).split("\n"):
+        s = str(line)
+        s_strip = s.strip()
+        if s_strip.startswith("⚙"):
+            continue
+        low = s_strip.lower()
+        if "action_report_time" in low:
+            continue
+        if "attribution" in low:
+            continue
+        if "timezone" in low or " tz=" in low:
+            continue
+        out.append(s)
+    return "\n".join(out).strip()
+
+
+def build_morning_account_message(*, aid: str, date_str: str, period: dict) -> str:
+    try:
+        name, ins = fetch_insight(str(aid), period)
+    except Exception as e:
+        err = str(e)
+        if "code: 200" in err or "403" in err or "permissions" in err.lower():
+            return ""
+        return ""
+
+    if not isinstance(ins, dict) or not ins:
+        return ""
+
+    impressions = 0
+    clicks_all = 0
+    link_clicks = 0
+    spend = 0.0
+    cpm = 0.0
+    cpc = 0.0
+    try:
+        impressions = int(ins.get("impressions") or 0)
+    except Exception:
+        impressions = 0
+    try:
+        clicks_all = int(ins.get("clicks") or 0)
+    except Exception:
+        clicks_all = 0
+    try:
+        spend = float(ins.get("spend") or 0.0)
+    except Exception:
+        spend = 0.0
+    try:
+        cpm = float(ins.get("cpm") or 0.0)
+    except Exception:
+        cpm = 0.0
+    try:
+        cpc = float(ins.get("cpc") or 0.0)
+    except Exception:
+        cpc = 0.0
+
+    acts = extract_actions(ins)
+    try:
+        link_clicks = int((acts or {}).get("link_click", 0) or 0)
+    except Exception:
+        link_clicks = 0
+
+    ctr_all = (float(clicks_all) / float(impressions) * 100.0) if impressions > 0 else 0.0
+    ctr_link = (float(link_clicks) / float(impressions) * 100.0) if impressions > 0 else 0.0
+
+    msgs = 0
+    try:
+        msgs = int(count_started_conversations_from_actions(acts) or 0)
+    except Exception:
+        msgs = 0
+
+    msg_cpa = None
+    try:
+        _msgs_cnt, _spend_msgs_only, cps = _msg_cps_account_level(str(aid), period)
+        msg_cpa = cps
+    except Exception:
+        msg_cpa = None
+
+    all_zero = (
+        int(impressions) <= 0
+        and int(clicks_all) <= 0
+        and int(link_clicks) <= 0
+        and float(spend) <= 0.0
+        and int(msgs) <= 0
+    )
+    if all_zero:
+        return ""
+
+    lines: list[str] = []
+    lines.append(f"🟢 {str(name or get_account_name(str(aid)))} ({str(date_str)})")
+    lines.append("")
+    lines.append(f"👁 Показы: {fmt_int(impressions)}")
+    lines.append(f"🎯 CPM: {float(cpm):.2f} $")
+    lines.append(f"🖱 Клики (все): {fmt_int(clicks_all)}")
+    lines.append(f"📈 CTR (все клики): {float(ctr_all):.2f} %")
+    lines.append(f"🔗 Клики (по ссылке): {fmt_int(link_clicks)}")
+    lines.append(f"📈 CTR (по ссылке): {float(ctr_link):.2f} %")
+    lines.append(f"💸 CPC: {float(cpc):.2f} $" if float(cpc) > 0 else "💸 CPC: —")
+    lines.append(f"💵 Затраты: {float(spend):.2f} $" if float(spend) > 0 else "💵 Затраты: —")
+    lines.append("")
+    lines.append(f"✉️ Переписки: {fmt_int(int(msgs))}")
+    if msg_cpa is not None and float(msg_cpa) > 0:
+        lines.append(f"💬💲 Цена переписки: {float(msg_cpa):.2f} $")
+    else:
+        lines.append("💬💲 Цена переписки: —")
+
+    return _strip_fb_technical_lines("\n".join(lines))
+
+
+def build_morning_blended_message(*, aid: str, name: str, period: dict) -> str:
+    flags = metrics_flags(str(aid))
+    if not (bool(flags.get("messaging")) and bool(flags.get("leads"))):
+        return ""
+
+    try:
+        _, ins = fetch_insight(str(aid), period)
+    except Exception:
+        return ""
+    if not isinstance(ins, dict) or not ins:
+        return ""
+
+    spend = 0.0
+    msgs = 0
+    leads = 0
+    total = 0
+    cpa = None
+    try:
+        spend, msgs, leads, total, cpa = _blend_totals(ins, aid=str(aid))
+    except Exception:
+        spend, msgs, leads, total, cpa = (0.0, 0, 0, 0, None)
+
+    if int(msgs) <= 0 and int(leads) <= 0 and float(spend) <= 0.0:
+        return ""
+
+    lines: list[str] = []
+    lines.append(f"🧮 Blended отчёт — {str(name or get_account_name(str(aid)))}")
+    lines.append("")
+    lines.append(f"💬 Переписки: {fmt_int(int(msgs))}")
+    lines.append(f"📩 Заявки с сайта: {fmt_int(int(leads))}")
+    lines.append(f"👥 Всего заявок: {fmt_int(int(total))}")
+    lines.append("")
+    lines.append(f"💵 Затраты: {float(spend):.2f} $" if float(spend) > 0 else "💵 Затраты: —")
+    if cpa is not None and float(cpa) > 0:
+        lines.append(f"🎯 Blended CPA: {float(cpa):.2f} $")
+    else:
+        lines.append("🎯 Blended CPA: —")
+    return _strip_fb_technical_lines("\n".join(lines))
+
+
+def build_morning_group_message(*, aid: str, gid: str, grp: dict, since: str, until: str) -> str:
+    cids = (grp or {}).get("campaign_ids") or []
+    if not isinstance(cids, list):
+        cids = []
+    cset = {str(x) for x in cids if str(x).strip()}
+    if not cset:
+        return ""
+
+    name = str((grp or {}).get("name") or gid)
+    lat = _parse_group_lead_action_type(grp)
+    mh = _metrics_hash("blended", lat)
+    key = _cache_key(
+        scope="entity",
+        scope_id=f"{str(aid)}:{str(gid)}",
+        since=str(since),
+        until=str(until),
+        mode="ENTITY",
+        metrics_hash=mh,
+    )
+    cached, hit = _cache_get_morning(key)
+    if hit and cached is not None:
+        metrics = cached
+    else:
+        period_for_api: Any = {"since": str(since), "until": str(until)}
+        params_extra = {"action_report_time": "conversion", "use_unified_attribution_setting": True}
+        with allow_fb_api_calls(reason="morning_report_entity"):
+            rows = fetch_insights_bulk(
+                str(aid),
+                period=period_for_api,
+                level="campaign",
+                fields=["campaign_id", "campaign_name", "spend", "actions"],
+                params_extra=dict(params_extra),
+            )
+        rows_f = [r for r in (rows or []) if str((r or {}).get("campaign_id") or "") in cset]
+        metrics = _sum_metrics_from_insight_rows(rows_f, aid=str(aid), lead_action_type=lat)
+        _cache_set_morning(key, dict(metrics))
+
+    spend = float((metrics or {}).get("spend") or 0.0)
+    msgs = int((metrics or {}).get("msgs") or 0)
+    leads = int((metrics or {}).get("leads") or 0)
+    total = int((metrics or {}).get("blended") or (msgs + leads))
+    cpa = (float(spend) / float(total)) if total > 0 else None
+
+    if int(msgs) <= 0 and int(leads) <= 0 and float(spend) <= 0.0:
+        return ""
+
+    lines: list[str] = []
+    lines.append(f"🧮 Blended отчёт — {str(name)}")
+    lines.append("")
+    lines.append(f"💬 Переписки: {fmt_int(int(msgs))}")
+    lines.append(f"📩 Заявки с сайта: {fmt_int(int(leads))}")
+    lines.append(f"👥 Всего заявок: {fmt_int(int(total))}")
+    lines.append("")
+    lines.append(f"💵 Затраты: {float(spend):.2f} $" if float(spend) > 0 else "💵 Затраты: —")
+    if cpa is not None and float(cpa) > 0:
+        lines.append(f"🎯 Blended CPA: {float(cpa):.2f} $")
+    else:
+        lines.append("🎯 Blended CPA: —")
+    return _strip_fb_technical_lines("\n".join(lines))
+
+
+
 def _account_timezone_info(aid: str) -> dict:
     try:
         from facebook_business.adobjects.adaccount import AdAccount
