@@ -13,12 +13,15 @@ from datetime import datetime, timedelta
 import json
 import os
 import logging
+import time
 
 from facebook_business.adobjects.adaccount import AdAccount
 from facebook_business.exceptions import FacebookRequestError
 from telegram.ext import Application, ContextTypes
 
 from fb_report.constants import ALMATY_TZ, DATA_DIR, kzt_round_up_1000
+
+from fb_report.storage import load_accounts
 
 from services.facebook_api import allow_fb_api_calls
 
@@ -28,6 +31,46 @@ _pending_recheck: Dict[str, Dict[str, Any]] = {}
 
 
 _FOLLOWUPS_FILE = os.path.join(DATA_DIR, "billing_followups.json")
+_BILLING_CACHE_FILE = os.path.join(DATA_DIR, "billing_cache.json")
+
+BILLING_BALANCE_EPSILON_USD = 0.01
+
+
+def _load_billing_cache() -> dict:
+    try:
+        with open(_BILLING_CACHE_FILE, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_billing_cache(obj: dict) -> None:
+    try:
+        _atomic_write_json(_BILLING_CACHE_FILE, obj if isinstance(obj, dict) else {})
+    except Exception:
+        pass
+
+
+def _billing_cache_get_usd(aid: str) -> float | None:
+    st = _load_billing_cache() or {}
+    item = st.get(str(aid))
+    if not isinstance(item, dict):
+        return None
+    try:
+        return float(item.get("last_usd"))
+    except Exception:
+        return None
+
+
+def _billing_cache_write(aid: str, usd: float) -> None:
+    st = _load_billing_cache() or {}
+    st[str(aid)] = {"last_usd": float(usd), "last_ts": int(time.time())}
+    _save_billing_cache(st)
+    try:
+        logging.getLogger(__name__).info("billing_cache_write aid=%s usd=%.2f", str(aid), float(usd))
+    except Exception:
+        pass
 
 
 def _atomic_write_json(path: str, obj: dict) -> None:
@@ -112,6 +155,22 @@ async def _billing_followup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     if not aid or not group_chat_id:
         return
 
+    try:
+        store = load_accounts() or {}
+    except Exception:
+        store = {}
+    if store and not (store.get(str(aid), {}) or {}).get("enabled", True):
+        try:
+            state = _load_state() or {}
+            followups = state.get("followups") if isinstance(state.get("followups"), dict) else {}
+            if isinstance(followups, dict):
+                followups.pop(str(aid), None)
+            state["followups"] = followups
+            _save_state(state)
+        except Exception:
+            pass
+        return
+
     state = _load_state() or {}
     followups = state.get("followups") if isinstance(state.get("followups"), dict) else {}
     item = followups.get(str(aid)) if isinstance(followups, dict) else None
@@ -174,15 +233,31 @@ async def _billing_followup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         _log_api_error("billing_followup", str(aid), None, None, str(e))
         return
 
-    billing_detected = (status != 1) or (float(cur_usd) < 0)
-    if not billing_detected:
-        try:
-            if isinstance(followups, dict):
-                followups.pop(str(aid), None)
-            state["followups"] = followups
-            _save_state(state)
-        except Exception:
-            pass
+    _billing_cache_write(str(aid), float(cur_usd))
+
+    changed = False
+    try:
+        changed = abs(float(cur_usd) - float(first_usd)) >= float(BILLING_BALANCE_EPSILON_USD)
+    except Exception:
+        changed = False
+    try:
+        logging.getLogger(__name__).info(
+            "billing_followup aid=%s changed=%s",
+            str(aid),
+            "true" if changed else "false",
+        )
+    except Exception:
+        pass
+
+    try:
+        if isinstance(followups, dict):
+            followups.pop(str(aid), None)
+        state["followups"] = followups
+        _save_state(state)
+    except Exception:
+        pass
+
+    if not changed:
         return
 
     try:
@@ -193,19 +268,15 @@ async def _billing_followup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception:
         kzt = 0
 
-    text = f"🚨 {name}! у нас биллинг — Итоговая сумма: {float(cur_usd):.2f} $ — ≈ {int(kzt)} ₸\n@Zz11mmaa"
+    text = (
+        f"🔄 {name} — сумма биллинга обновлена\n"
+        f"💵 {float(cur_usd):.2f} $ | 🇰🇿 {int(kzt)} ₸\n"
+        "@Zz11mmaa"
+    )
     try:
         await context.bot.send_message(chat_id=group_chat_id, text=text)
     except Exception:
         return
-
-    try:
-        if isinstance(followups, dict):
-            followups.pop(str(aid), None)
-        state["followups"] = followups
-        _save_state(state)
-    except Exception:
-        pass
 
 
 async def _billing_watch_job(
@@ -241,7 +312,28 @@ async def _billing_watch_job(
     except Exception:
         rate = 0.0
 
-    for aid in get_enabled_accounts():
+    try:
+        store = load_accounts() or {}
+    except Exception:
+        store = {}
+
+    all_ids = list(get_enabled_accounts() or [])
+    enabled_count = 0
+    processed = 0
+    skipped_disabled = 0
+    if store:
+        for _aid in all_ids:
+            if (store.get(str(_aid), {}) or {}).get("enabled", True):
+                enabled_count += 1
+            else:
+                skipped_disabled += 1
+    else:
+        enabled_count = int(len(all_ids))
+
+    for aid in all_ids:
+        if store and not (store.get(str(aid), {}) or {}).get("enabled", True):
+            continue
+        processed += 1
         try:
             with allow_fb_api_calls(reason="billing_watch_poll"):
                 info = AdAccount(str(aid)).api_get(fields=["name", "account_status", "balance"])
@@ -286,6 +378,8 @@ async def _billing_watch_job(
         except Exception:
             balance_usd = 0.0
 
+        _billing_cache_write(str(aid), float(balance_usd))
+
         billing_detected = (status != 1) or (float(balance_usd) < 0)
 
         prev_detected = _last_status.get(aid)
@@ -329,7 +423,7 @@ async def _billing_watch_job(
             except Exception:
                 pass
 
-            due = now + timedelta(minutes=30)
+            due = now + timedelta(hours=1)
             if isinstance(st_followups, dict):
                 st_followups[str(aid)] = {
                     "due_at": _dt_iso(due),
@@ -339,9 +433,17 @@ async def _billing_watch_job(
                     "group_chat_id": str(group_chat_id),
                 }
             try:
+                logging.getLogger(__name__).info(
+                    "billing_followup scheduled aid=%s run_at=%s",
+                    str(aid),
+                    str(_dt_iso(due)),
+                )
+            except Exception:
+                pass
+            try:
                 context.job_queue.run_once(
                     _billing_followup_job,
-                    when=timedelta(minutes=30),
+                    when=timedelta(hours=1),
                     data={"aid": str(aid), "group_chat_id": str(group_chat_id)},
                     name=f"billing_followup|{str(aid)}",
                 )
@@ -353,6 +455,16 @@ async def _billing_watch_job(
     state["prelim_sent_at"] = st_prelim if isinstance(st_prelim, dict) else {}
     state["followups"] = st_followups if isinstance(st_followups, dict) else {}
     _save_state(state)
+
+    try:
+        logging.getLogger(__name__).info(
+            "caller=billing_watch_poll enabled=%s processed=%s skipped_disabled=%s",
+            str(int(enabled_count)),
+            str(int(processed)),
+            str(int(skipped_disabled)),
+        )
+    except Exception:
+        pass
 
 
 def init_billing_watch(
@@ -367,11 +479,18 @@ def init_billing_watch(
     # Restore pending followups on startup.
     try:
         now = datetime.now(ALMATY_TZ)
+        try:
+            store = load_accounts() or {}
+        except Exception:
+            store = {}
         state = _load_state() or {}
         followups = state.get("followups") if isinstance(state.get("followups"), dict) else {}
         if isinstance(followups, dict):
             for aid, item in list(followups.items()):
                 if not isinstance(item, dict):
+                    continue
+                if store and not (store.get(str(aid), {}) or {}).get("enabled", True):
+                    followups.pop(str(aid), None)
                     continue
                 due_at = _parse_dt(item.get("due_at"))
                 gchat = str(item.get("group_chat_id") or group_chat_id or "")
@@ -387,6 +506,11 @@ def init_billing_watch(
                     data={"aid": str(aid), "group_chat_id": str(gchat)},
                     name=f"billing_followup|{str(aid)}",
                 )
+        try:
+            state["followups"] = followups
+            _save_state(state)
+        except Exception:
+            pass
     except Exception:
         pass
 
