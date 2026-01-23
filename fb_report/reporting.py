@@ -1346,21 +1346,6 @@ def build_report_with_caller(aid: str, period, label: str = "", *, caller: str) 
     if not ins:
         return hdr + "Нет данных за выбранный период"
 
-    try:
-        meta = ins.get("_meta") if isinstance(ins, dict) else None
-        if not isinstance(meta, dict):
-            meta = {}
-        tz_name = str(meta.get("timezone_name") or "")
-        params_extra = meta.get("params_extra") if isinstance(meta.get("params_extra"), dict) else {}
-        if not isinstance(params_extra, dict):
-            params_extra = {}
-        art = str(params_extra.get("action_report_time") or "")
-        # use_unified_attribution_setting=True => Ads Manager account default (unified)
-        if tz_name or art:
-            hdr = hdr + f"⚙ attribution=account_default action_report_time={art or 'unknown'} tz={tz_name or 'unknown'}\n"
-    except Exception:
-        pass
-
     # Базовые метрики
     impressions = int(ins.get("impressions", 0) or 0)
     cpm = float(ins.get("cpm", 0) or 0)
