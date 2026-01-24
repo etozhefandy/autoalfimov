@@ -257,9 +257,6 @@ async def _billing_followup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception:
         pass
 
-    if not changed:
-        return
-
     try:
         if rate > 0:
             kzt = int(kzt_round_up_1000(float(cur_usd) * float(rate)))
@@ -268,11 +265,11 @@ async def _billing_followup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception:
         kzt = 0
 
-    text = (
-        f"🔄 {name} — сумма биллинга обновлена\n"
-        f"💵 {float(cur_usd):.2f} $ | 🇰🇿 {int(kzt)} ₸\n"
-        "@Zz11mmaa"
-    )
+    if changed:
+        head = f"🔄 {name} — сумма биллинга обновлена"
+    else:
+        head = f"🔄 {name} — сумма биллинга подтверждена"
+    text = f"{head}\n💵 {float(cur_usd):.2f} $ | 🇰🇿 {int(kzt)} ₸\n@Zz11mmaa"
     try:
         await context.bot.send_message(chat_id=group_chat_id, text=text)
     except Exception:
@@ -423,7 +420,7 @@ async def _billing_watch_job(
             except Exception:
                 pass
 
-            due = now + timedelta(hours=1)
+            due = now + timedelta(minutes=30)
             if isinstance(st_followups, dict):
                 st_followups[str(aid)] = {
                     "due_at": _dt_iso(due),
@@ -443,7 +440,7 @@ async def _billing_watch_job(
             try:
                 context.job_queue.run_once(
                     _billing_followup_job,
-                    when=timedelta(hours=1),
+                    when=timedelta(minutes=30),
                     data={"aid": str(aid), "group_chat_id": str(group_chat_id)},
                     name=f"billing_followup|{str(aid)}",
                 )
