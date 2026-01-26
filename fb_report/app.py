@@ -4159,6 +4159,7 @@ async def _on_cb_internal(
                 await safe_edit_message(q, "Готовлю отчёт за вчера…")
                 yday_dt = (datetime.now(ALMATY_TZ) - timedelta(days=1))
                 label = yday_dt.strftime("%d.%m.%Y")
+                sent_any = False
                 for aid in [str(x) for x in aids if str(x).strip()]:
                     prof = resolve_report_profile(str(aid)) or {}
                     lvl = str((prof or {}).get("level") or "ACCOUNT").upper()
@@ -4170,7 +4171,21 @@ async def _on_cb_internal(
                         lvl_map = {"CAMPAIGN": "CAMPAIGN", "ADSET": "ADSET", "AD": "AD"}
                         txt = build_account_report(str(aid), "yesterday", lvl_map.get(lvl, "ACCOUNT"), label=label)
                     if txt:
+                        sent_any = True
                         await context.bot.send_message(chat_id=str(chat_id), text=str(txt), parse_mode="HTML")
+                    else:
+                        logging.getLogger(__name__).info(
+                            "client_group_report_empty chat_id=%s aid=%s period=yesterday level=%s source=c_morning_yday",
+                            str(chat_id),
+                            str(aid),
+                            str(lvl),
+                        )
+                if not sent_any:
+                    await context.bot.send_message(
+                        chat_id=str(chat_id),
+                        text=f"🔴 <b>Отчёт за {label}</b>\nНет данных или данные временно недоступны.",
+                        parse_mode="HTML",
+                    )
                 return
 
             if str(data) == "c_billing_current":
@@ -4224,6 +4239,18 @@ async def _on_cb_internal(
                     txt = build_account_report(str(aid), "yesterday", "AD", label=label)
                 if txt:
                     await context.bot.send_message(chat_id=str(chat_id), text=str(txt), parse_mode="HTML")
+                else:
+                    logging.getLogger(__name__).info(
+                        "client_group_report_empty chat_id=%s aid=%s period=yesterday level=%s source=c_rep_yday_acc",
+                        str(chat_id),
+                        str(aid),
+                        str(lvl),
+                    )
+                    await context.bot.send_message(
+                        chat_id=str(chat_id),
+                        text=f"🔴 <b>{get_account_name(str(aid))}</b> ({label})\nНет данных или данные временно недоступны.",
+                        parse_mode="HTML",
+                    )
                 return
 
             if str(data).startswith("c_rep_week_acc|"):
