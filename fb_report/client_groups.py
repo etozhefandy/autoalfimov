@@ -191,37 +191,33 @@ def _today_key() -> str:
         return datetime.utcnow().date().isoformat()
 
 
+def _hour_key() -> str:
+    try:
+        return datetime.now(ALMATY_TZ).strftime("%Y-%m-%d:%H")
+    except Exception:
+        return datetime.utcnow().strftime("%Y-%m-%d:%H")
+
+
 def check_rate_limit_and_touch(*, chat_id: str, user_id: int) -> tuple[bool, str]:
     if is_superadmin(user_id):
         return True, ""
 
     st = _load_json(CLIENT_RATE_LIMITS_FILE)
 
-    today = _today_key()
-    k_count = f"{str(chat_id)}:{int(user_id)}:{today}"
-    k_last = f"{str(chat_id)}:{int(user_id)}"
+    hour = _hour_key()
+    k_count = f"{str(chat_id)}:{int(user_id)}:{hour}"
 
     now_ts = int(time.time())
 
-    count_today = 0
+    count_hour = 0
     try:
-        count_today = int((st.get(k_count) or {}).get("count") or 0)
+        count_hour = int((st.get(k_count) or {}).get("count") or 0)
     except Exception:
-        count_today = 0
+        count_hour = 0
 
-    last_ts = 0
-    try:
-        last_ts = int((st.get(k_last) or {}).get("ts") or 0)
-    except Exception:
-        last_ts = 0
-
-    if last_ts and (now_ts - last_ts) < 300:
+    if count_hour >= 10:
         return False, "Лимит запросов. Попробуй позже."
 
-    if count_today >= 10:
-        return False, "Лимит запросов. Попробуй позже."
-
-    st[k_last] = {"ts": int(now_ts)}
-    st[k_count] = {"count": int(count_today) + 1, "ts": int(now_ts)}
+    st[k_count] = {"count": int(count_hour) + 1, "ts": int(now_ts)}
     _save_json(CLIENT_RATE_LIMITS_FILE, st)
     return True, ""
