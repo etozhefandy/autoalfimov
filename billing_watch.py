@@ -152,7 +152,12 @@ async def _billing_followup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     data = getattr(getattr(context, "job", None), "data", None) or {}
     aid = str((data or {}).get("aid") or "")
     group_chat_id = str((data or {}).get("group_chat_id") or "")
-    if not aid or not group_chat_id:
+    group_chat_ids = (data or {}).get("group_chat_ids")
+    if not isinstance(group_chat_ids, list):
+        group_chat_ids = []
+    group_chat_ids = [str(x) for x in group_chat_ids if str(x).strip()]
+
+    if not aid:
         return
 
     try:
@@ -185,6 +190,11 @@ async def _billing_followup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     name = str(item.get("name") or "")
     first_usd = float(item.get("first_usd") or 0.0)
     rate = float(item.get("rate") or 0.0)
+    stored_ids = item.get("group_chat_ids")
+    if isinstance(stored_ids, list):
+        group_chat_ids = [str(x) for x in stored_ids if str(x).strip()]
+    if group_chat_id and group_chat_id not in set(group_chat_ids):
+        group_chat_ids.append(str(group_chat_id))
 
     cur_usd = first_usd
     status = None
@@ -265,15 +275,19 @@ async def _billing_followup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception:
         kzt = 0
 
-    if changed:
-        head = f"🔄 {name} — сумма биллинга обновлена"
-    else:
-        head = f"🔄 {name} — сумма биллинга подтверждена"
-    text = f"{head}\n💵 {float(cur_usd):.2f} $ | 🇰🇿 {int(kzt)} ₸\n@Zz11mmaa"
-    try:
-        await context.bot.send_message(chat_id=group_chat_id, text=text)
-    except Exception:
+    if not group_chat_ids:
         return
+
+    if changed:
+        head = f"🔄 {name} — баланс обновлён"
+    else:
+        head = f"🔄 {name} — баланс подтверждён"
+    text = f"{head}\n💵 {float(cur_usd):.2f} $ | 🇰🇿 {int(kzt)} ₸"
+    for cid in group_chat_ids:
+        try:
+            await context.bot.send_message(chat_id=str(cid), text=text)
+        except Exception:
+            continue
 
 
 async def _billing_watch_job(
@@ -409,10 +423,31 @@ async def _billing_watch_job(
                 except Exception:
                     pass
 
-            lines.append("Через 30 минут выдам сумму с корректировками.")
+            lines.append("Через 60 минут выдам сумму с корректировками.")
 
             text = "\n".join(lines)
-            await context.bot.send_message(chat_id=group_chat_id, text=text)
+
+            targets: list[str] = []
+            try:
+                if group_chat_id:
+                    targets.append(str(group_chat_id))
+            except Exception:
+                targets = []
+            try:
+                from fb_report.client_groups import active_groups_for_account
+
+                extra = active_groups_for_account(str(aid)) or []
+                for cid in extra:
+                    if str(cid) not in set(targets):
+                        targets.append(str(cid))
+            except Exception:
+                pass
+
+            for cid in targets:
+                try:
+                    await context.bot.send_message(chat_id=str(cid), text=text)
+                except Exception:
+                    continue
 
             try:
                 if isinstance(st_prelim, dict):
@@ -420,7 +455,7 @@ async def _billing_watch_job(
             except Exception:
                 pass
 
-            due = now + timedelta(minutes=30)
+            due = now + timedelta(hours=1)
             if isinstance(st_followups, dict):
                 st_followups[str(aid)] = {
                     "due_at": _dt_iso(due),
@@ -428,6 +463,7 @@ async def _billing_watch_job(
                     "name": str(name),
                     "rate": float(rate),
                     "group_chat_id": str(group_chat_id),
+                    "group_chat_ids": list(targets),
                 }
             try:
                 logging.getLogger(__name__).info(
@@ -440,8 +476,8 @@ async def _billing_watch_job(
             try:
                 context.job_queue.run_once(
                     _billing_followup_job,
-                    when=timedelta(minutes=30),
-                    data={"aid": str(aid), "group_chat_id": str(group_chat_id)},
+                    when=timedelta(hours=1),
+                    data={"aid": str(aid), "group_chat_id": str(group_chat_id), "group_chat_ids": list(targets)},
                     name=f"billing_followup|{str(aid)}",
                 )
             except Exception:

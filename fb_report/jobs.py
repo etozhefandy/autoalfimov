@@ -21,6 +21,7 @@ from .constants import (
     MORNING_REPORT_STATE_FILE,
 )
 from .storage import load_accounts, get_account_name, resolve_autopilot_chat_id
+from .reporting import resolve_report_profile, get_cached_report, build_report_with_caller, build_account_report
 from .cpa_monitoring import format_cpa_anomaly_message
 from .autopilot_format import ap_action_text
 
@@ -606,70 +607,8 @@ async def morning_report_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             ",".join([f"{aid}:{lvl}" for aid, lvl in selected])
         )
 
-        chat_id = str(DEFAULT_REPORT_CHAT)
-        for aid, lvl in selected:
-            row = (accounts or {}).get(str(aid)) or {}
-
-            try:
-                txt = build_morning_account_message(aid=str(aid), date_str=str(yday), period=dict(period))
-            except Exception:
-                txt = ""
-            if txt:
-                await context.bot.send_message(chat_id=chat_id, text=str(txt))
-
-            try:
-                btxt = build_morning_blended_message(aid=str(aid), name=get_account_name(str(aid)), period=dict(period))
-            except Exception:
-                btxt = ""
-            if btxt:
-                await context.bot.send_message(chat_id=chat_id, text=str(btxt))
-
-            try:
-                gids = _autopilot_tracked_group_ids_from_row(row)
-            except Exception:
-                gids = []
-            for gid in gids:
-                try:
-                    grp = _autopilot_group_from_row(row, str(gid))
-                    gtxt = build_morning_group_message(aid=str(aid), gid=str(gid), grp=grp, since=str(yday), until=str(yday))
-                except Exception:
-                    gtxt = ""
-                if gtxt:
-                    await context.bot.send_message(chat_id=chat_id, text=str(gtxt))
-
-            if lvl in {"CAMPAIGN", "ADSET"}:
-                log.info("morning_report mode=%s aid=%s", str(lvl), str(aid))
-                t = build_account_report(str(aid), dict(period), level=str(lvl))
-                if t:
-                    try:
-                        parts = [p for p in str(t).split("\n────────────\n") if str(p).strip()]
-                    except Exception:
-                        parts = [str(t)]
-                    if parts:
-                        base = parts[0]
-                        blocks = parts[1:]
-                    else:
-                        base = ""
-                        blocks = []
-
-                    kept: list[str] = []
-                    for blk in blocks:
-                        s = str(blk).strip()
-                        if s == "📣 Кампании\nнет данных за период":
-                            continue
-                        if s == "🧩 Адсеты\nнет данных за период":
-                            continue
-                        if s == "🎯 Объявления\nнет данных за период":
-                            continue
-                        if "🧮" in s and "blended" in s.lower():
-                            continue
-                        kept.append(blk)
-
-                    if kept:
-                        out = str(base).rstrip() + "\n────────────\n" + "\n────────────\n".join([str(x).strip() for x in kept if str(x).strip()])
-                        out = _strip_fb_technical_lines(out)
-                        if out.strip():
-                            await context.bot.send_message(chat_id=chat_id, text=str(out), parse_mode="HTML")
+        admin_chat_id = str(DEFAULT_REPORT_CHAT)
+        await send_morning_report_to_chat(context=context, chat_id=str(admin_chat_id), account_ids=[str(a) for a, _l in selected])
 
         st = _load_morning_report_state() or {}
         st["last_sent_date"] = str(today)
@@ -680,6 +619,174 @@ async def morning_report_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         log.info("job_done name=morning_report duration_ms=%s", str(dur_ms))
     except Exception as e:
         log.exception("morning_report_error", exc_info=e)
+
+
+async def send_morning_report_to_chat(
+    *,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: str,
+    account_ids: list[str],
+) -> None:
+    if not account_ids:
+        return
+    try:
+        from fb_report.reporting import (
+            build_account_report,
+            build_morning_account_message,
+            build_morning_blended_message,
+            build_morning_group_message,
+            _autopilot_tracked_group_ids_from_row,
+            _autopilot_group_from_row,
+            _strip_fb_technical_lines,
+        )
+    except Exception:
+        return
+
+    now = datetime.now(ALMATY_TZ)
+    yday = (now.date() - timedelta(days=1)).strftime("%Y-%m-%d")
+    period = {"since": str(yday), "until": str(yday)}
+
+    accounts = load_accounts() or {}
+    for aid in [str(x) for x in (account_ids or []) if str(x).strip()]:
+        row = (accounts or {}).get(str(aid)) or {}
+
+        try:
+            txt = build_morning_account_message(aid=str(aid), date_str=str(yday), period=dict(period))
+        except Exception:
+            txt = ""
+        if txt:
+            await context.bot.send_message(chat_id=str(chat_id), text=str(txt))
+
+        try:
+            btxt = build_morning_blended_message(aid=str(aid), name=get_account_name(str(aid)), period=dict(period))
+        except Exception:
+            btxt = ""
+        if btxt:
+            await context.bot.send_message(chat_id=str(chat_id), text=str(btxt))
+
+        try:
+            gids = _autopilot_tracked_group_ids_from_row(row)
+        except Exception:
+            gids = []
+        for gid in gids:
+            try:
+                grp = _autopilot_group_from_row(row, str(gid))
+                gtxt = build_morning_group_message(
+                    aid=str(aid),
+                    gid=str(gid),
+                    grp=grp,
+                    since=str(yday),
+                    until=str(yday),
+                )
+            except Exception:
+                gtxt = ""
+            if gtxt:
+                await context.bot.send_message(chat_id=str(chat_id), text=str(gtxt))
+
+        try:
+            mr = (row or {}).get("morning_report") or {}
+            if not isinstance(mr, dict):
+                mr = {}
+            lvl = str(mr.get("level", "ACCOUNT") or "ACCOUNT").upper()
+        except Exception:
+            lvl = "ACCOUNT"
+
+        if lvl in {"CAMPAIGN", "ADSET"}:
+            t = build_account_report(str(aid), dict(period), level=str(lvl))
+            if t:
+                try:
+                    parts = [p for p in str(t).split("\n────────────\n") if str(p).strip()]
+                except Exception:
+                    parts = [str(t)]
+                if parts:
+                    base = parts[0]
+                    blocks = parts[1:]
+                else:
+                    base = ""
+                    blocks = []
+
+                kept: list[str] = []
+                for blk in blocks:
+                    s = str(blk).strip()
+                    if s == "📣 Кампании\nнет данных за период":
+                        continue
+                    if s == "🧩 Адсеты\nнет данных за период":
+                        continue
+                    if s == "🎯 Объявления\nнет данных за период":
+                        continue
+                    if "🧮" in s and "blended" in s.lower():
+                        continue
+                    kept.append(blk)
+
+                if kept:
+                    out = (
+                        str(base).rstrip()
+                        + "\n────────────\n"
+                        + "\n────────────\n".join([str(x).strip() for x in kept if str(x).strip()])
+                    )
+                    out = _strip_fb_technical_lines(out)
+                    if out.strip():
+                        await context.bot.send_message(chat_id=str(chat_id), text=str(out), parse_mode="HTML")
+
+
+async def client_groups_morning_report_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    log = logging.getLogger(__name__)
+    try:
+        from fb_report.client_groups import list_groups, enabled_accounts_for_group
+    except Exception:
+        return
+
+    now = datetime.now(ALMATY_TZ)
+    yday_dt = now.date() - timedelta(days=1)
+    yday = yday_dt.strftime("%Y-%m-%d")
+    label = yday_dt.strftime("%d.%m.%Y")
+    period = "yesterday"
+
+    try:
+        groups = list_groups() or []
+    except Exception:
+        groups = []
+
+    for cid, g in groups:
+        try:
+            if not isinstance(g, dict) or not bool(g.get("active") is True):
+                continue
+            aids = enabled_accounts_for_group(str(cid)) or []
+            if not aids:
+                continue
+
+            for aid in [str(x) for x in aids if str(x).strip()]:
+                prof = resolve_report_profile(str(aid)) or {}
+                lvl = str((prof or {}).get("level") or "ACCOUNT").upper()
+                if lvl == "OFF":
+                    continue
+
+                if lvl == "ACCOUNT":
+                    txt = get_cached_report(str(aid), period, label)
+                elif lvl == "CAMPAIGN":
+                    txt = build_account_report(str(aid), period, "CAMPAIGN", label=label)
+                elif lvl == "ADSET":
+                    txt = build_account_report(str(aid), period, "ADSET", label=label)
+                else:
+                    txt = build_account_report(str(aid), period, "AD", label=label)
+
+                if txt:
+                    await context.bot.send_message(chat_id=str(cid), text=str(txt), parse_mode="HTML")
+        except Exception as e:
+            log.exception("client_group_morning_error chat_id=%s", str(cid), exc_info=e)
+
+
+def schedule_client_groups_morning_report(app: Application) -> None:
+    log = logging.getLogger(__name__)
+    job = app.job_queue.run_daily(
+        client_groups_morning_report_job,
+        time=time(hour=9, minute=15, tzinfo=ALMATY_TZ),
+        name="client_groups_morning_report",
+    )
+    log.info(
+        "job_registered name=client_groups_morning_report next_run_at=%s",
+        _job_next_run_str(job),
+    )
 
 
 def schedule_morning_report(app: Application) -> None:

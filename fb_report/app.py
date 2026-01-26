@@ -33,6 +33,7 @@ from .constants import (
     AUTOPILOT_CHAT_ID,
     ALLOWED_USER_IDS,
     ALLOWED_CHAT_IDS,
+    SUPERADMIN_USER_ID,
     usd_to_kzt,
     kzt_round_up_1000,
     BOT_VERSION,
@@ -57,6 +58,8 @@ from .storage import (
 from .reporting import (
     fmt_int,
     get_cached_report,
+    build_report_with_caller,
+    resolve_report_profile,
     build_comparison_report,
     build_report_debug,
     send_period_report,
@@ -77,6 +80,8 @@ from .jobs import (
     schedule_cpa_alerts,
     _resolve_account_cpa,
     schedule_morning_report,
+    send_morning_report_to_chat,
+    schedule_client_groups_morning_report,
     build_heatmap_status_text,
     run_heatmap_snapshot_collector_once,
 )
@@ -106,6 +111,17 @@ import asyncio
 import time as pytime
 import uuid
 
+from .client_groups import (
+    is_superadmin,
+    is_client_group,
+    is_active_client_group,
+    activate_group,
+    deactivate_group,
+    enabled_accounts_for_group,
+    toggle_group_account,
+    check_rate_limit_and_touch,
+)
+
 
 def _allowed(update: Update) -> bool:
     chat_id = str(update.effective_chat.id) if update.effective_chat else ""
@@ -115,6 +131,126 @@ def _allowed(update: Update) -> bool:
     if user_id and user_id in ALLOWED_USER_IDS:
         return True
     return False
+
+
+def _is_private_chat(update: Update) -> bool:
+    try:
+        return bool(update.effective_chat and str(update.effective_chat.type) == "private")
+    except Exception:
+        return False
+
+
+def _silence_non_admin_dm(update: Update) -> bool:
+    if not _is_private_chat(update):
+        return False
+    uid = update.effective_user.id if update.effective_user else None
+    return not bool(is_superadmin(uid))
+
+
+def _should_silence_in_group(update: Update) -> bool:
+    try:
+        chat = update.effective_chat
+        if not chat:
+            return False
+        if str(chat.type) == "private":
+            return False
+        chat_id = str(chat.id)
+        uid = update.effective_user.id if update.effective_user else None
+        if is_superadmin(uid):
+            return False
+        if is_active_client_group(chat_id):
+            return False
+        if is_client_group(chat_id):
+            return True
+        if chat_id not in ALLOWED_CHAT_IDS:
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def client_main_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Сегодня", callback_data="c_rep_today"),
+                InlineKeyboardButton("Вчера", callback_data="c_rep_yday"),
+            ],
+            [InlineKeyboardButton("Прошедшая неделя", callback_data="c_rep_week")],
+            [InlineKeyboardButton("🗓 Свой диапазон", callback_data="c_rep_custom")],
+            [InlineKeyboardButton("🌅 Утренний отчёт (вчера)", callback_data="c_morning_yday")],
+            [InlineKeyboardButton("💳 Биллинги (текущие)", callback_data="c_billing_current")],
+        ]
+    )
+
+
+def morning_report_level_kb(aid: str) -> InlineKeyboardMarkup:
+    st = load_accounts().get(str(aid), {})
+    mr = (st or {}).get("morning_report") or {}
+    if not isinstance(mr, dict):
+        mr = {}
+    cur = str(mr.get("level", "ACCOUNT") or "ACCOUNT").upper()
+
+    def b(level: str, title: str) -> InlineKeyboardButton:
+        mark = "✅ " if str(cur) == str(level) else ""
+        return InlineKeyboardButton(f"{mark}{title}", callback_data=f"mr_set|{aid}|{level}")
+
+    return InlineKeyboardMarkup(
+        [
+            [b("OFF", "Выкл")],
+            [b("ACCOUNT", "Аккаунт")],
+            [b("CAMPAIGN", "Кампании")],
+            [b("ADSET", "Адсеты")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data=f"mr_back|{aid}")],
+        ]
+    )
+
+
+def client_admin_group_menu(*, active: bool) -> InlineKeyboardMarkup:
+    if not active:
+        return InlineKeyboardMarkup(
+            [[InlineKeyboardButton("✅ Активировать группу", callback_data="cg_activate")]]
+        )
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("⚙️ Аккаунты", callback_data="cg_accounts")],
+            [InlineKeyboardButton("⛔️ Деактивировать", callback_data="cg_deactivate")],
+        ]
+    )
+
+
+def client_group_accounts_kb(chat_id: str) -> InlineKeyboardMarkup:
+    store = load_accounts() or {}
+    ids = [aid for aid in (store or {}).keys()]
+    ids.sort(key=lambda x: str(get_account_name(str(x)) or ""))
+
+    enabled = set(enabled_accounts_for_group(str(chat_id)) or [])
+    rows: list[list[InlineKeyboardButton]] = []
+    for aid in ids:
+        if not str(aid).startswith("act_"):
+            continue
+        label = str(get_account_name(str(aid)) or str(aid))
+        if str(aid) in enabled:
+            label = "✅ " + label
+        rows.append([InlineKeyboardButton(label, callback_data=f"cg_acc_toggle|{str(aid)}")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="cg_back")])
+    return InlineKeyboardMarkup(rows)
+
+
+def client_accounts_kb(prefix: str, chat_id: str) -> InlineKeyboardMarkup:
+    store = load_accounts() or {}
+    allowed = enabled_accounts_for_group(str(chat_id)) or []
+    allowed_set = set(str(x) for x in allowed)
+
+    ids = [aid for aid in (store or {}).keys() if str(aid) in allowed_set]
+    ids.sort(key=lambda x: str(get_account_name(str(x)) or ""))
+
+    rows: list[list[InlineKeyboardButton]] = []
+    for aid in ids:
+        label = str(get_account_name(str(aid)) or str(aid))
+        rows.append([InlineKeyboardButton(label, callback_data=f"{prefix}|{str(aid)}")])
+    rows.append([InlineKeyboardButton("⬅️ В меню", callback_data="c_menu")])
+    return InlineKeyboardMarkup(rows)
 
 
 def _resolve_autopilot_chat_id_logged(*, reason: str) -> tuple[str, str]:
@@ -141,7 +277,6 @@ async def safe_edit_message(q, text: str, **kwargs):
     except BadRequest as e:
         if "Message is not modified" in str(e):
             return
-        raise
 
 
 async def _typing_loop(bot, chat_id: str, stop_event: "asyncio.Event") -> None:
@@ -3250,6 +3385,48 @@ async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if _silence_non_admin_dm(update):
+        return
+
+    chat = update.effective_chat
+    chat_id = str(chat.id) if chat else ""
+    uid = update.effective_user.id if update.effective_user else None
+    is_sa = bool(is_superadmin(uid))
+
+    if chat and str(chat.type) != "private":
+        if is_active_client_group(chat_id):
+            if is_sa:
+                await context.bot.send_message(
+                    chat_id=chat.id,
+                    text="⚙️ Клиентская группа: управление",
+                    reply_markup=client_admin_group_menu(active=True),
+                )
+                return
+            await context.bot.send_message(
+                chat_id=chat.id,
+                text="🤖 Выберите действие:",
+                reply_markup=client_main_menu(),
+            )
+            return
+
+        if is_client_group(chat_id):
+            if is_sa:
+                await context.bot.send_message(
+                    chat_id=chat.id,
+                    text="⚙️ Клиентская группа (не активна)",
+                    reply_markup=client_admin_group_menu(active=False),
+                )
+            return
+
+        if chat_id not in ALLOWED_CHAT_IDS:
+            if is_sa:
+                await context.bot.send_message(
+                    chat_id=chat.id,
+                    text="⚙️ Клиентская группа (не активна)",
+                    reply_markup=client_admin_group_menu(active=False),
+                )
+            return
+
     if not _allowed(update):
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
@@ -3268,6 +3445,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if _silence_non_admin_dm(update):
+        return
+    if _should_silence_in_group(update):
+        return
+    if is_client_group(str(update.effective_chat.id)) and not bool(is_superadmin(update.effective_user.id if update.effective_user else None)):
+        return
     if not _allowed(update):
         return
     txt = (
@@ -3322,6 +3505,13 @@ async def cmd_ap_here(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_billing(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if _silence_non_admin_dm(update):
+        return
+    if _should_silence_in_group(update):
+        return
+    if is_client_group(str(update.effective_chat.id)):
+        if not bool(is_superadmin(update.effective_user.id if update.effective_user else None)):
+            return
     if not _allowed(update):
         return
     await update.message.reply_text(
@@ -3819,9 +4009,16 @@ async def on_cb_autopilot(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    if not _allowed(update):
-        await q.edit_message_text("⛔️ Нет доступа.")
+    if _silence_non_admin_dm(update):
         return
+    if _should_silence_in_group(update):
+        return
+    if not _allowed(update):
+        # В клиентских группах доступ контролируем отдельно, без сообщений об ошибке.
+        chat_id_tmp = str(q.message.chat.id) if q.message else ""
+        if not (is_active_client_group(chat_id_tmp) or is_client_group(chat_id_tmp)):
+            await q.edit_message_text("⛔️ Нет доступа.")
+            return
 
     data = q.data or ""
     chat_id = str(q.message.chat.id)
@@ -3852,6 +4049,275 @@ async def _on_cb_internal(
     chat_id: str,
     data: str,
 ):
+    try:
+        uid = update.effective_user.id if update.effective_user else None
+        is_sa = bool(is_superadmin(uid))
+    except Exception:
+        is_sa = False
+
+    if is_active_client_group(str(chat_id)):
+        if str(data) == "c_menu":
+            await safe_edit_message(q, "🤖 Выберите действие:", reply_markup=client_main_menu())
+            return
+
+        if str(data) == "cg_accounts" or str(data) == "cg_activate" or str(data) == "cg_deactivate" or str(data).startswith("cg_"):
+            if not is_sa:
+                return
+
+            if str(data) == "cg_accounts":
+                await safe_edit_message(
+                    q,
+                    "⚙️ Аккаунты в группе (вкл/выкл):",
+                    reply_markup=client_group_accounts_kb(str(chat_id)),
+                )
+                return
+
+            if str(data) == "cg_deactivate":
+                deactivate_group(chat_id=str(chat_id))
+                logging.getLogger(__name__).info(
+                    "client_group_deactivate chat_id=%s by=%s",
+                    str(chat_id),
+                    str(uid),
+                )
+                await safe_edit_message(
+                    q,
+                    "⛔️ Группа деактивирована.",
+                    reply_markup=client_admin_group_menu(active=False),
+                )
+                return
+
+            if str(data) == "cg_back":
+                await safe_edit_message(
+                    q,
+                    "⚙️ Клиентская группа: управление",
+                    reply_markup=client_admin_group_menu(active=True),
+                )
+                return
+
+            if str(data).startswith("cg_acc_toggle|"):
+                aid = str(data).split("|", 1)[1]
+                new_val = toggle_group_account(chat_id=str(chat_id), aid=str(aid))
+                logging.getLogger(__name__).info(
+                    "client_group_account_toggle chat_id=%s aid=%s enabled=%s by=%s",
+                    str(chat_id),
+                    str(aid),
+                    "true" if new_val else "false",
+                    str(uid),
+                )
+                await safe_edit_message(
+                    q,
+                    "⚙️ Аккаунты в группе (вкл/выкл):",
+                    reply_markup=client_group_accounts_kb(str(chat_id)),
+                )
+                return
+
+        if str(data).startswith("c_"):
+            ok, msg = check_rate_limit_and_touch(chat_id=str(chat_id), user_id=int(uid or 0))
+            if not ok:
+                try:
+                    await q.answer(str(msg), show_alert=True)
+                except Exception:
+                    pass
+                return
+
+            if str(data) == "c_rep_today":
+                await safe_edit_message(
+                    q,
+                    "Выберите аккаунт:",
+                    reply_markup=client_accounts_kb("c_rep_today_acc", str(chat_id)),
+                )
+                return
+
+            if str(data) == "c_rep_yday":
+                await safe_edit_message(
+                    q,
+                    "Выберите аккаунт:",
+                    reply_markup=client_accounts_kb("c_rep_yday_acc", str(chat_id)),
+                )
+                return
+
+            if str(data) == "c_rep_week":
+                await safe_edit_message(
+                    q,
+                    "Выберите аккаунт:",
+                    reply_markup=client_accounts_kb("c_rep_week_acc", str(chat_id)),
+                )
+                return
+
+            if str(data) == "c_rep_custom":
+                await safe_edit_message(
+                    q,
+                    "Выберите аккаунт:",
+                    reply_markup=client_accounts_kb("c_rep_custom_acc", str(chat_id)),
+                )
+                return
+
+            if str(data) == "c_morning_yday":
+                aids = enabled_accounts_for_group(str(chat_id)) or []
+                if not aids:
+                    return
+                await safe_edit_message(q, "Готовлю отчёт за вчера…")
+                yday_dt = (datetime.now(ALMATY_TZ) - timedelta(days=1))
+                label = yday_dt.strftime("%d.%m.%Y")
+                for aid in [str(x) for x in aids if str(x).strip()]:
+                    prof = resolve_report_profile(str(aid)) or {}
+                    lvl = str((prof or {}).get("level") or "ACCOUNT").upper()
+                    if lvl == "OFF":
+                        continue
+                    if lvl == "ACCOUNT":
+                        txt = get_cached_report(str(aid), "yesterday", label)
+                    else:
+                        lvl_map = {"CAMPAIGN": "CAMPAIGN", "ADSET": "ADSET", "AD": "AD"}
+                        txt = build_account_report(str(aid), "yesterday", lvl_map.get(lvl, "ACCOUNT"), label=label)
+                    if txt:
+                        await context.bot.send_message(chat_id=str(chat_id), text=str(txt), parse_mode="HTML")
+                return
+
+            if str(data) == "c_billing_current":
+                aids = enabled_accounts_for_group(str(chat_id)) or []
+                if not aids:
+                    return
+                await safe_edit_message(q, "📋 Биллинги (текущие)…")
+                try:
+                    from fb_report.billing import send_billing_for_accounts
+                except Exception:
+                    send_billing_for_accounts = None  # type: ignore[assignment]
+                if send_billing_for_accounts:
+                    await send_billing_for_accounts(context, str(chat_id), [str(x) for x in aids])
+                return
+
+            if str(data).startswith("c_rep_today_acc|"):
+                aid = str(data).split("|", 1)[1]
+                label = datetime.now(ALMATY_TZ).strftime("%d.%m.%Y")
+                await safe_edit_message(q, f"Готовлю отчёт за {label}…")
+                prof = resolve_report_profile(str(aid)) or {}
+                lvl = str((prof or {}).get("level") or "ACCOUNT").upper()
+                if lvl == "OFF":
+                    return
+                if lvl == "ACCOUNT":
+                    txt = build_report_with_caller(str(aid), "today", label, caller="client_group_report")
+                elif lvl == "CAMPAIGN":
+                    txt = build_account_report(str(aid), "today", "CAMPAIGN", label=label)
+                elif lvl == "ADSET":
+                    txt = build_account_report(str(aid), "today", "ADSET", label=label)
+                else:
+                    txt = build_account_report(str(aid), "today", "AD", label=label)
+                if txt:
+                    await context.bot.send_message(chat_id=str(chat_id), text=str(txt), parse_mode="HTML")
+                return
+
+            if str(data).startswith("c_rep_yday_acc|"):
+                aid = str(data).split("|", 1)[1]
+                label = (datetime.now(ALMATY_TZ) - timedelta(days=1)).strftime("%d.%m.%Y")
+                await safe_edit_message(q, f"Готовлю отчёт за {label}…")
+                prof = resolve_report_profile(str(aid)) or {}
+                lvl = str((prof or {}).get("level") or "ACCOUNT").upper()
+                if lvl == "OFF":
+                    return
+                if lvl == "ACCOUNT":
+                    txt = get_cached_report(str(aid), "yesterday", label)
+                elif lvl == "CAMPAIGN":
+                    txt = build_account_report(str(aid), "yesterday", "CAMPAIGN", label=label)
+                elif lvl == "ADSET":
+                    txt = build_account_report(str(aid), "yesterday", "ADSET", label=label)
+                else:
+                    txt = build_account_report(str(aid), "yesterday", "AD", label=label)
+                if txt:
+                    await context.bot.send_message(chat_id=str(chat_id), text=str(txt), parse_mode="HTML")
+                return
+
+            if str(data).startswith("c_rep_week_acc|"):
+                aid = str(data).split("|", 1)[1]
+                until = datetime.now(ALMATY_TZ) - timedelta(days=1)
+                since = until - timedelta(days=6)
+                period = {"since": since.strftime("%Y-%m-%d"), "until": until.strftime("%Y-%m-%d")}
+                label = f"{since.strftime('%d.%m')}-{until.strftime('%d.%m')}"
+                await safe_edit_message(q, f"Готовлю отчёт за {label}…")
+                prof = resolve_report_profile(str(aid)) or {}
+                lvl = str((prof or {}).get("level") or "ACCOUNT").upper()
+                if lvl == "OFF":
+                    return
+                if lvl == "ACCOUNT":
+                    txt = get_cached_report(str(aid), period, label)
+                elif lvl == "CAMPAIGN":
+                    txt = build_account_report(str(aid), period, "CAMPAIGN", label=label)
+                elif lvl == "ADSET":
+                    txt = build_account_report(str(aid), period, "ADSET", label=label)
+                else:
+                    txt = build_account_report(str(aid), period, "AD", label=label)
+                if txt:
+                    await context.bot.send_message(chat_id=str(chat_id), text=str(txt), parse_mode="HTML")
+                return
+
+            if str(data).startswith("c_rep_custom_acc|"):
+                aid = str(data).split("|", 1)[1]
+                context.user_data["await_client_range_for"] = {"chat_id": str(chat_id), "aid": str(aid)}
+                await safe_edit_message(
+                    q,
+                    f"Введи даты для {get_account_name(str(aid))} форматом: 01.06.2025-07.06.2025",
+                    reply_markup=client_accounts_kb("c_rep_custom_acc", str(chat_id)),
+                )
+                return
+
+        # В активной клиентской группе всё остальное игнорируем.
+        return
+
+    if is_client_group(str(chat_id)):
+        if not is_sa:
+            return
+
+        if str(data) == "cg_activate":
+            title = ""
+            try:
+                title = str(getattr(getattr(q, "message", None), "chat", None).title or "")
+            except Exception:
+                title = ""
+            activate_group(chat_id=str(chat_id), title=str(title), actor_user_id=uid)
+            logging.getLogger(__name__).info(
+                "client_group_activate chat_id=%s by=%s title=%s",
+                str(chat_id),
+                str(uid),
+                str(title),
+            )
+            await safe_edit_message(
+                q,
+                "✅ Группа активирована.",
+                reply_markup=client_admin_group_menu(active=True),
+            )
+            return
+
+        # Неактивная клиентская группа: любые другие кнопки игнор.
+        return
+
+    if str(data) == "cg_activate" and is_sa:
+        try:
+            if str(update.effective_chat.type) == "private":
+                return
+        except Exception:
+            return
+
+        title = ""
+        try:
+            title = str(getattr(getattr(q, "message", None), "chat", None).title or "")
+        except Exception:
+            title = ""
+        activate_group(chat_id=str(chat_id), title=str(title), actor_user_id=uid)
+        logging.getLogger(__name__).info(
+            "client_group_activate chat_id=%s by=%s title=%s",
+            str(chat_id),
+            str(uid),
+            str(title),
+        )
+        await safe_edit_message(
+            q,
+            "✅ Группа активирована.",
+            reply_markup=client_admin_group_menu(active=True),
+        )
+        return
+
+    if str(update.effective_chat.type) == "private" and not is_sa:
+        return
+
     if data == "noop":
         await q.answer("Ок", show_alert=False)
         return
@@ -7339,8 +7805,101 @@ async def _on_cb_internal(
         context.user_data["await_cpa_for"] = aid
         return
 
+    if data.startswith("mr_menu|"):
+        aid = data.split("|", 1)[1]
+        await safe_edit_message(
+            q,
+            f"🌅 Утренний отчёт: {get_account_name(aid)}\nВыберите уровень:",
+            reply_markup=morning_report_level_kb(aid),
+        )
+        return
+
+    if data.startswith("mr_back|"):
+        aid = data.split("|", 1)[1]
+        await safe_edit_message(
+            q,
+            f"Настройки: {get_account_name(aid)}",
+            reply_markup=settings_kb(aid),
+        )
+        return
+
+    if data.startswith("mr_set|"):
+        _p, aid, lvl = data.split("|", 2)
+        lvl_u = str(lvl or "ACCOUNT").upper()
+        if lvl_u not in {"OFF", "ACCOUNT", "CAMPAIGN", "ADSET", "AD"}:
+            lvl_u = "ACCOUNT"
+
+        st = load_accounts()
+        row = st.get(str(aid), {})
+        mr = (row or {}).get("morning_report") or {}
+        if not isinstance(mr, dict):
+            mr = {}
+        mr["level"] = str(lvl_u)
+        row["morning_report"] = mr
+        st[str(aid)] = row
+        save_accounts(st)
+
+        await safe_edit_message(
+            q,
+            f"🌅 Утренний отчёт: {get_account_name(aid)}\nВыберите уровень:",
+            reply_markup=morning_report_level_kb(aid),
+        )
+        return
+
 
 async def on_text_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if _silence_non_admin_dm(update):
+        return
+    if _should_silence_in_group(update):
+        return
+
+    chat = update.effective_chat
+    chat_id = str(chat.id) if chat else ""
+    uid = update.effective_user.id if update.effective_user else None
+    is_sa = bool(is_superadmin(uid))
+
+    if is_active_client_group(chat_id) and context.user_data.get("await_client_range_for"):
+        ok, msg = check_rate_limit_and_touch(chat_id=str(chat_id), user_id=int(uid or 0))
+        if not ok:
+            try:
+                await update.message.reply_text(str(msg))
+            except Exception:
+                pass
+            return
+
+        payload = context.user_data.pop("await_client_range_for", None) or {}
+        aid = str(payload.get("aid") or "")
+        if not aid:
+            return
+        if str(aid) not in set(str(x) for x in (enabled_accounts_for_group(str(chat_id)) or [])):
+            return
+
+        text = str(update.message.text or "").strip()
+        parsed = parse_range(text)
+        if not parsed:
+            await update.message.reply_text("Формат дат: 01.06.2025-07.06.2025. Попробуй ещё раз.")
+            context.user_data["await_client_range_for"] = {"chat_id": str(chat_id), "aid": str(aid)}
+            return
+        period, label = parsed
+        prof = resolve_report_profile(str(aid)) or {}
+        lvl = str((prof or {}).get("level") or "ACCOUNT").upper()
+        if lvl == "OFF":
+            return
+        if lvl == "ACCOUNT":
+            txt = get_cached_report(str(aid), period, label)
+        elif lvl == "CAMPAIGN":
+            txt = build_account_report(str(aid), period, "CAMPAIGN", label=label)
+        elif lvl == "ADSET":
+            txt = build_account_report(str(aid), period, "ADSET", label=label)
+        else:
+            txt = build_account_report(str(aid), period, "AD", label=label)
+        if txt:
+            await context.bot.send_message(chat_id=str(chat_id), text=str(txt), parse_mode="HTML")
+        return
+
+    if str(update.effective_chat.type) == "private" and not is_sa:
+        return
+
     if not _allowed(update):
         return
 
@@ -8021,6 +8580,8 @@ def build_app() -> Application:
     )
 
     schedule_morning_report(app)
+
+    schedule_client_groups_morning_report(app)
 
     schedule_cpa_alerts(app)
 

@@ -42,6 +42,8 @@ ALLOWED_USER_IDS = {
 }
 ALLOWED_CHAT_IDS = {str(DEFAULT_REPORT_CHAT), "-1002679045097"}  # как строки
 
+SUPERADMIN_USER_ID = int(os.getenv("SUPERADMIN_USER_ID", "253181449") or 253181449)
+
 # ======== Пути / файлы =========
 DATA_DIR = os.getenv("DATA_DIR", "/data")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -57,6 +59,9 @@ DAILY_REPORT_CACHE_FILE = os.path.join(DATA_DIR, "daily_report_cache.json")
 MORNING_REPORT_STATE_FILE = os.path.join(DATA_DIR, "morning_report_state.json")
 MORNING_REPORT_CACHE_FILE = os.path.join(DATA_DIR, "morning_report_cache.json")
 MORNING_REPORT_CACHE_TTL = int(os.getenv("MORNING_REPORT_CACHE_TTL", "43200"))
+
+CLIENT_GROUPS_FILE = os.path.join(DATA_DIR, "client_groups.json")
+CLIENT_RATE_LIMITS_FILE = os.path.join(DATA_DIR, "client_rate_limits.json")
 
 SYNC_META_FILE = os.path.join(DATA_DIR, "sync_meta.json")
 

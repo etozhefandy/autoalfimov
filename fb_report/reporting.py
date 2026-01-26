@@ -710,6 +710,24 @@ def build_morning_report_text(*, period: str = "yesterday") -> tuple[str, dict]:
     return "\n".join(lines), debug
 
 
+def resolve_report_profile(aid: str) -> dict:
+    try:
+        from .storage import load_accounts
+
+        st = load_accounts() or {}
+        row = (st or {}).get(str(aid)) or {}
+        mr = (row or {}).get("morning_report") or {}
+        if not isinstance(mr, dict):
+            mr = {}
+        lvl = str(mr.get("level", "ACCOUNT") or "ACCOUNT").upper()
+    except Exception:
+        lvl = "ACCOUNT"
+
+    if lvl not in {"OFF", "ACCOUNT", "CAMPAIGN", "ADSET", "AD"}:
+        lvl = "ACCOUNT"
+    return {"level": str(lvl)}
+
+
 def _strip_fb_technical_lines(text: str) -> str:
     if not text:
         return text

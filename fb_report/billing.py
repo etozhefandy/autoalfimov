@@ -10,6 +10,12 @@ from .constants import ALMATY_TZ, usd_to_kzt, kzt_round_up_1000
 from .storage import iter_enabled_accounts_only, get_account_name
 from .reporting import fmt_int
 
+try:  # pragma: no cover
+    from billing_watch import _billing_cache_get_usd
+except Exception:  # noqa: BLE001
+    def _billing_cache_get_usd(_aid: str):  # type: ignore[override]
+        return None
+
 from services.facebook_api import allow_fb_api_calls
 
 
@@ -128,6 +134,104 @@ async def send_billing(ctx: ContextTypes.DEFAULT_TYPE, chat_id: str, only_inacti
         lines.append("⚠️ Ошибки API: " + ", ".join(failed))
     lines.append(
         f"debug: enabled={len(enabled_ids)} detected={int(detected)} no_access={len(no_access)} failed={len(failed)}"
+    )
+    await ctx.bot.send_message(chat_id=chat_id, text="\n".join(lines))
+
+
+async def send_billing_for_accounts(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    chat_id: str,
+    account_ids: list[str],
+    only_inactive: bool = False,
+):
+    ids = [str(x) for x in (account_ids or []) if str(x).strip()]
+    if not ids:
+        return
+
+    try:
+        rate = float(usd_to_kzt() or 0.0)
+    except Exception:
+        rate = 0.0
+
+    detected = 0
+    no_access: list[str] = []
+    failed: list[str] = []
+
+    with allow_fb_api_calls(reason="billing_current_client_group"):
+        for aid in ids:
+            try:
+                info = AdAccount(str(aid)).api_get(fields=["name", "account_status", "balance"])
+                if hasattr(info, "export_all_data"):
+                    info = info.export_all_data()
+            except FacebookRequestError as e:
+                http_status = None
+                try:
+                    http_status = int(
+                        getattr(e, "http_status", None)() if callable(getattr(e, "http_status", None)) else getattr(e, "http_status", None)
+                    )
+                except Exception:
+                    http_status = None
+                msg = None
+                try:
+                    msg = str(e)
+                except Exception:
+                    msg = None
+
+                if _is_no_access_error(http_status, msg):
+                    no_access.append(str(aid))
+                else:
+                    failed.append(str(aid))
+                continue
+            except Exception:
+                failed.append(str(aid))
+                continue
+
+            if not isinstance(info, dict):
+                failed.append(str(aid))
+                continue
+
+            name = str(info.get("name") or get_account_name(aid))
+            try:
+                status = int(info.get("account_status"))
+            except Exception:
+                status = None
+
+            cached = None
+            try:
+                cached = _billing_cache_get_usd(str(aid))
+            except Exception:
+                cached = None
+
+            try:
+                usd_live = float(info.get("balance", 0) or 0) / 100.0
+            except Exception:
+                usd_live = 0.0
+
+            usd = float(cached) if cached is not None else float(usd_live)
+            billing_detected = (status != 1) or (float(usd) < 0)
+            if bool(only_inactive) and status == 1:
+                continue
+            if not billing_detected:
+                continue
+
+            detected += 1
+            try:
+                kzt = kzt_round_up_1000(float(usd) * float(rate)) if rate > 0 else 0
+            except Exception:
+                kzt = 0
+
+            txt = f"🔴 <b>{name}</b>\n💵 {float(usd):.2f} $ | 🇰🇿 {fmt_int(int(kzt))} ₸"
+            await ctx.bot.send_message(chat_id=chat_id, text=txt, parse_mode="HTML")
+
+    lines: list[str] = []
+    if detected <= 0:
+        lines.append("📋 Биллинги: биллингов не обнаружено.")
+    if no_access:
+        lines.append("⚠️ Нет доступа (ads_read): " + ", ".join(no_access))
+    if failed:
+        lines.append("⚠️ Ошибки API: " + ", ".join(failed))
+    lines.append(
+        f"debug: enabled={len(ids)} detected={int(detected)} no_access={len(no_access)} failed={len(failed)}"
     )
     await ctx.bot.send_message(chat_id=chat_id, text="\n".join(lines))
 
