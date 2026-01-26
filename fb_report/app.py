@@ -4112,14 +4112,6 @@ async def _on_cb_internal(
                 return
 
         if str(data).startswith("c_"):
-            ok, msg = check_rate_limit_and_touch(chat_id=str(chat_id), user_id=int(uid or 0))
-            if not ok:
-                try:
-                    await q.answer(str(msg), show_alert=True)
-                except Exception:
-                    pass
-                return
-
             if str(data) == "c_rep_today":
                 await safe_edit_message(
                     q,
@@ -4150,6 +4142,14 @@ async def _on_cb_internal(
                     "Выберите аккаунт:",
                     reply_markup=client_accounts_kb("c_rep_custom_acc", str(chat_id)),
                 )
+                return
+
+            ok, msg = check_rate_limit_and_touch(chat_id=str(chat_id), user_id=int(uid or 0))
+            if not ok:
+                try:
+                    await q.answer(str(msg), show_alert=True)
+                except Exception:
+                    pass
                 return
 
             if str(data) == "c_morning_yday":
