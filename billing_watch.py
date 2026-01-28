@@ -196,6 +196,21 @@ async def _billing_followup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     if group_chat_id and group_chat_id not in set(group_chat_ids):
         group_chat_ids.append(str(group_chat_id))
 
+    if not group_chat_ids:
+        # Backward/edge compatibility: restore targets even if state/job data misses them.
+        try:
+            from fb_report.client_groups import active_groups_for_account
+
+            extra = active_groups_for_account(str(aid)) or []
+            for cid in extra:
+                if str(cid) not in set(group_chat_ids):
+                    group_chat_ids.append(str(cid))
+        except Exception:
+            pass
+
+    if not group_chat_ids:
+        return
+
     cur_usd = first_usd
     status = None
     try:
@@ -238,9 +253,27 @@ async def _billing_followup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception:
             msg = None
         _log_api_error("billing_followup", str(aid), http_status, fb_code, msg)
+        try:
+            text = f"🔄 {name or str(aid)} — не удалось уточнить баланс (ошибка API)"
+            for cid in group_chat_ids:
+                try:
+                    await context.bot.send_message(chat_id=str(cid), text=str(text))
+                except Exception:
+                    continue
+        except Exception:
+            pass
         return
     except Exception as e:
         _log_api_error("billing_followup", str(aid), None, None, str(e))
+        try:
+            text = f"🔄 {name or str(aid)} — не удалось уточнить баланс (ошибка)"
+            for cid in group_chat_ids:
+                try:
+                    await context.bot.send_message(chat_id=str(cid), text=str(text))
+                except Exception:
+                    continue
+        except Exception:
+            pass
         return
 
     _billing_cache_write(str(aid), float(cur_usd))
@@ -529,6 +562,10 @@ def init_billing_watch(
                 gchat = str(item.get("group_chat_id") or group_chat_id or "")
                 if not gchat:
                     continue
+                stored_ids = item.get("group_chat_ids") if isinstance(item, dict) else None
+                group_ids = []
+                if isinstance(stored_ids, list):
+                    group_ids = [str(x) for x in stored_ids if str(x).strip()]
                 delay = timedelta(seconds=1)
                 if due_at:
                     delta = due_at - now
@@ -536,7 +573,7 @@ def init_billing_watch(
                 app.job_queue.run_once(
                     _billing_followup_job,
                     when=delay,
-                    data={"aid": str(aid), "group_chat_id": str(gchat)},
+                    data={"aid": str(aid), "group_chat_id": str(gchat), "group_chat_ids": list(group_ids)},
                     name=f"billing_followup|{str(aid)}",
                 )
         try:
