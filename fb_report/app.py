@@ -219,6 +219,21 @@ def client_admin_group_menu(*, active: bool) -> InlineKeyboardMarkup:
     )
 
 
+def client_group_menu_for_admin(*, active: bool) -> InlineKeyboardMarkup:
+    if not active:
+        return client_admin_group_menu(active=False)
+    rows: list[list[InlineKeyboardButton]] = []
+    try:
+        rows.extend(list(client_admin_group_menu(active=True).inline_keyboard))
+    except Exception:
+        pass
+    try:
+        rows.extend(list(client_main_menu().inline_keyboard))
+    except Exception:
+        pass
+    return InlineKeyboardMarkup(rows)
+
+
 def client_group_accounts_kb(chat_id: str) -> InlineKeyboardMarkup:
     store = load_accounts() or {}
     ids = [aid for aid in (store or {}).keys()]
@@ -3398,8 +3413,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if is_sa:
                 await context.bot.send_message(
                     chat_id=chat.id,
-                    text="⚙️ Клиентская группа: управление",
-                    reply_markup=client_admin_group_menu(active=True),
+                    text="🤖 Выберите действие:",
+                    reply_markup=client_group_menu_for_admin(active=True),
                 )
                 return
             await context.bot.send_message(
@@ -4057,7 +4072,18 @@ async def _on_cb_internal(
 
     if is_active_client_group(str(chat_id)):
         if str(data) == "c_menu":
-            await safe_edit_message(q, "🤖 Выберите действие:", reply_markup=client_main_menu())
+            if is_sa:
+                await safe_edit_message(
+                    q,
+                    "🤖 Выберите действие:",
+                    reply_markup=client_group_menu_for_admin(active=True),
+                )
+            else:
+                await safe_edit_message(
+                    q,
+                    "🤖 Выберите действие:",
+                    reply_markup=client_main_menu(),
+                )
             return
 
         if str(data) == "cg_accounts" or str(data) == "cg_activate" or str(data) == "cg_deactivate" or str(data).startswith("cg_"):
@@ -4089,8 +4115,8 @@ async def _on_cb_internal(
             if str(data) == "cg_back":
                 await safe_edit_message(
                     q,
-                    "⚙️ Клиентская группа: управление",
-                    reply_markup=client_admin_group_menu(active=True),
+                    "🤖 Выберите действие:",
+                    reply_markup=client_group_menu_for_admin(active=True),
                 )
                 return
 
