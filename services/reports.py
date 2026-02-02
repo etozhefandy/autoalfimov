@@ -2,7 +2,15 @@
 from typing import Any, Dict, Optional, Tuple
 from datetime import datetime, timedelta
 
-from config import ALMATY_TZ
+try:
+    from fb_report.constants import ALMATY_TZ
+except Exception:
+    try:
+        from config import ALMATY_TZ
+    except Exception:
+        from pytz import timezone
+
+        ALMATY_TZ = timezone("Asia/Almaty")
 from services.facebook_api import fetch_insights
 from services.analytics import count_leads_from_actions
 from services.storage import (
