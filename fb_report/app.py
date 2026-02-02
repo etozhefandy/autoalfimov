@@ -86,6 +86,7 @@ from .jobs import (
     run_heatmap_snapshot_collector_once,
 )
 from .autopilot_format import ap_action_text
+from . import ads_manage
 
 from services.facebook_api import (
     pause_ad,
@@ -1277,16 +1278,25 @@ FOCUS_AI_DEEPSEEK_TIMEOUT_S = 240
 FOCUS_AI_MAX_OBJECTS = 40
 
 
-def main_menu() -> InlineKeyboardMarkup:
+def main_menu(uid=None, chat_id=None, chat_type=None) -> InlineKeyboardMarkup:
     last_sync = human_last_sync()
-    return InlineKeyboardMarkup(
+    rows = [
+        [InlineKeyboardButton("📊 Отчёты", callback_data="reports_menu")],
+        [InlineKeyboardButton("🆘 Мониторинг", callback_data="monitoring_menu")],
+        [InlineKeyboardButton("🤖 Автопилат", callback_data="autopilot_menu")],
+        [InlineKeyboardButton("💳 Биллинг", callback_data="billing")],
+        [InlineKeyboardButton("🔗 Ссылки на рекламу", callback_data="insta_links_menu")],
+        [InlineKeyboardButton("⚙️ Настройки", callback_data="choose_acc_settings")],
+    ]
+
+    try:
+        if bool(is_superadmin(uid)) and (str(chat_type) == "private" or str(chat_id or "") in ALLOWED_CHAT_IDS):
+            rows.append([InlineKeyboardButton("🛠 Управление рекламой", callback_data="ads_manage_menu")])
+    except Exception:
+        pass
+
+    rows.extend(
         [
-            [InlineKeyboardButton("📊 Отчёты", callback_data="reports_menu")],
-            [InlineKeyboardButton("🆘 Мониторинг", callback_data="monitoring_menu")],
-            [InlineKeyboardButton("🤖 Автопилат", callback_data="autopilot_menu")],
-            [InlineKeyboardButton("💳 Биллинг", callback_data="billing")],
-            [InlineKeyboardButton("🔗 Ссылки на рекламу", callback_data="insta_links_menu")],
-            [InlineKeyboardButton("⚙️ Настройки", callback_data="choose_acc_settings")],
             [
                 InlineKeyboardButton(
                     f"🔁 Синк BM (посл. {last_sync})",
@@ -1296,6 +1306,7 @@ def main_menu() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("ℹ️ Версия", callback_data="version")],
         ]
     )
+    return InlineKeyboardMarkup(rows)
 
 
 def _lead_metric_label_for_action_type(action_type: str) -> str:
@@ -3455,7 +3466,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(
         chat_id=update.effective_chat.id,
         text="🤖 Выберите действие:",
-        reply_markup=main_menu(),
+        reply_markup=main_menu(uid=uid, chat_id=chat_id, chat_type=str(chat.type) if chat else None),
     )
 
 
@@ -3582,7 +3593,10 @@ async def cmd_version(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _allowed(update):
         return
     text = _build_version_text()
-    await update.message.reply_text(text, reply_markup=main_menu())
+    uid = update.effective_user.id if update.effective_user else None
+    chat = update.effective_chat
+    chat_id = str(chat.id) if chat else ""
+    await update.message.reply_text(text, reply_markup=main_menu(uid=uid, chat_id=chat_id, chat_type=str(chat.type) if chat else None))
 
 
 async def cmd_heatmap(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4381,8 +4395,29 @@ async def _on_cb_internal(
         return
 
     if data == "menu":
-        await safe_edit_message(q, "🤖 Выберите действие:", reply_markup=main_menu())
+        await safe_edit_message(
+            q,
+            "🤖 Выберите действие:",
+            reply_markup=main_menu(
+                uid=uid,
+                chat_id=str(chat_id),
+                chat_type=str(update.effective_chat.type) if update.effective_chat else None,
+            ),
+        )
         return
+
+    if data == "ads_manage_menu":
+        if not is_sa:
+            return
+        await ads_manage.open_menu(update, context)
+        return
+
+    if str(data).startswith("am_"):
+        if not is_sa:
+            return
+        handled = await ads_manage.on_callback(update, context)
+        if handled:
+            return
 
     if data == "autopilot_menu":
         await safe_edit_message(
@@ -6513,7 +6548,15 @@ async def _on_cb_internal(
         if not aid.startswith("act_"):
             aid = "act_" + aid
         txt = _build_heatmap_debug_last_text(aid=str(aid))
-        await safe_edit_message(q, txt, reply_markup=main_menu())
+        await safe_edit_message(
+            q,
+            txt,
+            reply_markup=main_menu(
+                uid=uid,
+                chat_id=str(chat_id),
+                chat_type=str(update.effective_chat.type) if update.effective_chat else None,
+            ),
+        )
         return
 
     if data.startswith("hm7|"):
@@ -7957,7 +8000,16 @@ async def on_text_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     chat = update.effective_chat
+    try:
+        handled_ads_manage = await ads_manage.on_text(update, context)
+        if handled_ads_manage:
+            return
+    except Exception:
+        pass
+
     if chat and chat.type in ("group", "supergroup"):
+        if (not is_sa) or (str(chat_id) not in ALLOWED_CHAT_IDS):
+            return
         return
 
     text = update.message.text.strip()
