@@ -587,7 +587,7 @@ def fetch_insights(aid: str, period: Any) -> Optional[Dict[str, Any]]:
 
 # ========= КАМПАНИИ =========
 
-def fetch_campaigns(aid: str) -> List[Dict[str, Any]]:
+def fetch_campaigns(aid: str, force: bool = False) -> List[Dict[str, Any]]:
     """
     Возвращает список кампаний аккаунта:
     [
@@ -596,9 +596,10 @@ def fetch_campaigns(aid: str) -> List[Dict[str, Any]]:
     ]
     """
     cache_key = f"campaigns:{aid}"
-    cached = _cache_get(cache_key, ttl_s=21600.0)
-    if cached is not None:
-        return list(cached)
+    if not bool(force):
+        cached = _cache_get(cache_key, ttl_s=21600.0)
+        if cached is not None:
+            return list(cached)
 
     acc = AdAccount(aid)
     data = safe_api_call(
@@ -692,7 +693,7 @@ def pause_ad(ad_id: str) -> Dict[str, Any]:
 
 # ========= ADSETS =========
 
-def fetch_adsets(aid: str) -> List[Dict[str, Any]]:
+def fetch_adsets(aid: str, force: bool = False) -> List[Dict[str, Any]]:
     """
     Возвращает список адсетов в аккаунте:
     [
@@ -706,9 +707,10 @@ def fetch_adsets(aid: str) -> List[Dict[str, Any]]:
     ]
     """
     cache_key = f"adsets:{aid}"
-    cached = _cache_get(cache_key, ttl_s=21600.0)
-    if cached is not None:
-        return list(cached)
+    if not bool(force):
+        cached = _cache_get(cache_key, ttl_s=21600.0)
+        if cached is not None:
+            return list(cached)
 
     acc = AdAccount(aid)
     data = safe_api_call(
@@ -740,7 +742,7 @@ def fetch_adsets(aid: str) -> List[Dict[str, Any]]:
 
 # ========= AD CREATIVES =========
 
-def fetch_ads(aid: str) -> List[Dict[str, Any]]:
+def fetch_ads(aid: str, force: bool = False) -> List[Dict[str, Any]]:
     """
     Возвращает объявления:
     [
@@ -754,9 +756,10 @@ def fetch_ads(aid: str) -> List[Dict[str, Any]]:
     ]
     """
     cache_key = f"ads:{aid}"
-    cached = _cache_get(cache_key, ttl_s=21600.0)
-    if cached is not None:
-        return list(cached)
+    if not bool(force):
+        cached = _cache_get(cache_key, ttl_s=21600.0)
+        if cached is not None:
+            return list(cached)
 
     acc = AdAccount(aid)
     data = safe_api_call(

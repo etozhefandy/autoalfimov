@@ -316,7 +316,7 @@ async def _render_campaigns(q, context: ContextTypes.DEFAULT_TYPE, *, force: boo
 
     if force or not isinstance(st.get("items"), list) or st.get("level") != "campaigns":
         with allow_fb_api_calls(reason="ads_manage:list_campaigns"):
-            items = fetch_campaigns(aid)
+            items = fetch_campaigns(aid, force=bool(force))
         ids = [str(x.get("id") or "") for x in (items or []) if str(x.get("id") or "").strip()]
         metrics = _bulk_metrics(aid=aid, level="campaign", ids=ids, filter_field="campaign.id", id_key="campaign_id")
         st["items"] = items
@@ -341,7 +341,7 @@ async def _render_adsets(q, context: ContextTypes.DEFAULT_TYPE, *, force: bool) 
 
     if force or not isinstance(st.get("items"), list) or st.get("level") != "adsets":
         with allow_fb_api_calls(reason="ads_manage:list_adsets"):
-            all_items = fetch_adsets(aid)
+            all_items = fetch_adsets(aid, force=bool(force))
         items = [x for x in (all_items or []) if str((x or {}).get("campaign_id") or "") == str(campaign_id)]
         ids = [str(x.get("id") or "") for x in (items or []) if str(x.get("id") or "").strip()]
         metrics = _bulk_metrics(aid=aid, level="adset", ids=ids, filter_field="adset.id", id_key="adset_id")
@@ -367,7 +367,7 @@ async def _render_ads(q, context: ContextTypes.DEFAULT_TYPE, *, force: bool) -> 
 
     if force or not isinstance(st.get("items"), list) or st.get("level") != "ads":
         with allow_fb_api_calls(reason="ads_manage:list_ads"):
-            all_items = fetch_ads(aid)
+            all_items = fetch_ads(aid, force=bool(force))
         items = [x for x in (all_items or []) if str((x or {}).get("adset_id") or "") == str(adset_id)]
         ids = [str(x.get("id") or "") for x in (items or []) if str(x.get("id") or "").strip()]
         metrics = _bulk_metrics(aid=aid, level="ad", ids=ids, filter_field="ad.id", id_key="ad_id")
