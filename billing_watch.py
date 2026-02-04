@@ -22,6 +22,7 @@ from telegram.ext import Application, ContextTypes
 from fb_report.constants import ALMATY_TZ, DATA_DIR, kzt_round_up_1000
 
 from fb_report.storage import load_accounts
+from fb_report.client_groups import is_client_group
 
 from services.facebook_api import allow_fb_api_calls
 
@@ -196,17 +197,7 @@ async def _billing_followup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     if group_chat_id and group_chat_id not in set(group_chat_ids):
         group_chat_ids.append(str(group_chat_id))
 
-    if not group_chat_ids:
-        # Backward/edge compatibility: restore targets even if state/job data misses them.
-        try:
-            from fb_report.client_groups import active_groups_for_account
-
-            extra = active_groups_for_account(str(aid)) or []
-            for cid in extra:
-                if str(cid) not in set(group_chat_ids):
-                    group_chat_ids.append(str(cid))
-        except Exception:
-            pass
+    group_chat_ids = [cid for cid in group_chat_ids if cid and (not is_client_group(str(cid)))]
 
     if not group_chat_ids:
         return
@@ -276,6 +267,8 @@ async def _billing_followup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             pass
         return
 
+    billing_detected = ((status is not None) and (int(status) != 1)) or (float(cur_usd) < 0)
+
     _billing_cache_write(str(aid), float(cur_usd))
 
     changed = False
@@ -299,6 +292,9 @@ async def _billing_followup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         _save_state(state)
     except Exception:
         pass
+
+    if not billing_detected:
+        return
 
     try:
         if rate > 0:
@@ -332,6 +328,9 @@ async def _billing_watch_job(
     group_chat_id: Optional[str],
 ) -> None:
     if not group_chat_id:
+        return
+
+    if is_client_group(str(group_chat_id)):
         return
 
     global _last_status, _pending_recheck
@@ -424,7 +423,7 @@ async def _billing_watch_job(
 
         _billing_cache_write(str(aid), float(balance_usd))
 
-        billing_detected = (status != 1) or (float(balance_usd) < 0)
+        billing_detected = ((status is not None) and (int(status) != 1)) or (float(balance_usd) < 0)
 
         prev_detected = _last_status.get(aid)
         if isinstance(st_detect, dict):
@@ -466,15 +465,7 @@ async def _billing_watch_job(
                     targets.append(str(group_chat_id))
             except Exception:
                 targets = []
-            try:
-                from fb_report.client_groups import active_groups_for_account
-
-                extra = active_groups_for_account(str(aid)) or []
-                for cid in extra:
-                    if str(cid) not in set(targets):
-                        targets.append(str(cid))
-            except Exception:
-                pass
+            targets = [cid for cid in targets if cid and (not is_client_group(str(cid)))]
 
             for cid in targets:
                 try:
@@ -566,6 +557,9 @@ def init_billing_watch(
                 group_ids = []
                 if isinstance(stored_ids, list):
                     group_ids = [str(x) for x in stored_ids if str(x).strip()]
+                group_ids = [cid for cid in group_ids if cid and (not is_client_group(str(cid)))]
+                if not group_ids:
+                    continue
                 delay = timedelta(seconds=1)
                 if due_at:
                     delta = due_at - now

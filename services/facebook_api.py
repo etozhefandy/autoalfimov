@@ -443,7 +443,13 @@ def fetch_insights_bulk(
     except Exception:
         pkey = str(period)
     fields_key = ",".join([str(x) for x in (fields or [])])
-    cache_key = f"insights_bulk:{aid}:{str(level)}:{pkey}:{fields_key}"
+    extra_key = ""
+    if params_extra:
+        try:
+            extra_key = json.dumps(params_extra, ensure_ascii=False, sort_keys=True)
+        except Exception:
+            extra_key = str(params_extra)
+    cache_key = f"insights_bulk:{aid}:{str(level)}:{pkey}:{fields_key}:{extra_key}"
 
     ttl_s = 600.0 if (isinstance(period, str) and period == "today") else 3600.0
     cached = _cache_get(cache_key, ttl_s=ttl_s)
@@ -715,7 +721,7 @@ def fetch_adsets(aid: str, force: bool = False) -> List[Dict[str, Any]]:
     acc = AdAccount(aid)
     data = safe_api_call(
         acc.get_ad_sets,
-        fields=["id", "name", "daily_budget", "status", "effective_status", "campaign_id"],
+        fields=["id", "name", "daily_budget", "lifetime_budget", "status", "effective_status", "campaign_id"],
     )
 
     if not data:
@@ -730,6 +736,7 @@ def fetch_adsets(aid: str, force: bool = False) -> List[Dict[str, Any]]:
                 "name": row.get("name"),
                 "campaign_id": row.get("campaign_id"),
                 "daily_budget": float(row.get("daily_budget", 0)) / 100.0,
+                "lifetime_budget": (float(row.get("lifetime_budget", 0)) / 100.0) if row.get("lifetime_budget") is not None else None,
                 "status": row.get("status"),
                 "effective_status": row.get("effective_status"),
             })
