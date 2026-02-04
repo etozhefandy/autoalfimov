@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
+from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
 from facebook_business.adobjects.ad import Ad
@@ -28,6 +29,36 @@ from services.facebook_api import allow_fb_api_calls, fetch_adsets, fetch_ads, f
 from services.reports import fmt_int
 
 _LOG = logging.getLogger(__name__)
+
+
+async def _safe_edit_message_text(q, text: str, *, reply_markup=None, parse_mode=None) -> bool:
+    try:
+        await q.edit_message_text(str(text), reply_markup=reply_markup, parse_mode=parse_mode)
+        return True
+    except BadRequest as e:
+        msg = str(e)
+        if "Message is not modified" in msg or "message is not modified" in msg:
+            return False
+        _LOG.warning("caller=ads_manage action=edit_message_text error=%s", msg)
+        return False
+    except Exception as e:
+        _LOG.warning("caller=ads_manage action=edit_message_text error=%s", str(e))
+        return False
+
+
+async def _safe_edit_message_reply_markup(q, *, reply_markup=None) -> bool:
+    try:
+        await q.edit_message_reply_markup(reply_markup=reply_markup)
+        return True
+    except BadRequest as e:
+        msg = str(e)
+        if "Message is not modified" in msg or "message is not modified" in msg:
+            return False
+        _LOG.warning("caller=ads_manage action=edit_message_reply_markup error=%s", msg)
+        return False
+    except Exception as e:
+        _LOG.warning("caller=ads_manage action=edit_message_reply_markup error=%s", str(e))
+        return False
 
 
 def _state(context: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
@@ -187,14 +218,15 @@ async def _bp_render_accounts(q, context: ContextTypes.DEFAULT_TYPE) -> None:
     bp.clear()
 
     if not ids:
-        await q.edit_message_text("Нет включённых аккаунтов.")
+        await _safe_edit_message_text(q, "Нет включённых аккаунтов.")
         return
 
     rows: List[List[InlineKeyboardButton]] = []
     for aid in ids:
         rows.append([InlineKeyboardButton(str(get_account_name(aid) or aid), callback_data=f"am_bp_acc|{aid}")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="am_menu")])
-    await q.edit_message_text(
+    await _safe_edit_message_text(
+        q,
         "📦 <b>Бюджет-план</b>\n\nВыбери рекламный аккаунт:",
         reply_markup=InlineKeyboardMarkup(rows),
         parse_mode=ParseMode.HTML,
@@ -212,7 +244,8 @@ async def _bp_render_plans(q, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     plans = list_budget_plans(account_id=aid)
     title = f"📦 <b>Бюджет-план</b> — {str(get_account_name(aid) or aid)}"
-    await q.edit_message_text(
+    await _safe_edit_message_text(
+        q,
         title + "\n\nВыбери план или создай новый:",
         reply_markup=_bp_plans_kb(aid, plans),
         parse_mode=ParseMode.HTML,
@@ -261,7 +294,7 @@ async def _bp_render_edit(src, context: ContextTypes.DEFAULT_TYPE) -> None:
     kb = _bp_edit_kb(plan)
 
     if hasattr(src, "callback_query") and src.callback_query:
-        await src.callback_query.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        await _safe_edit_message_text(src.callback_query, text, reply_markup=kb, parse_mode=ParseMode.HTML)
     else:
         await src.effective_message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
 
@@ -294,7 +327,8 @@ async def _bp_render_pick_campaigns(q, context: ContextTypes.DEFAULT_TYPE, *, ki
 
     bp["pick"] = {"kind": kind_u, "selected": list(cur)}
     bp["pick_items"] = list(items or [])
-    await q.edit_message_text(
+    await _safe_edit_message_text(
+        q,
         title,
         reply_markup=_bp_pick_list_kb(items=items, selected=cur, prefix=prefix, done_cb=done, back_cb="am_bp_edit"),
         parse_mode=ParseMode.HTML,
@@ -322,7 +356,8 @@ async def _bp_render_pick_adsets(q, context: ContextTypes.DEFAULT_TYPE, *, kind:
         lock = plan.get("locked_adset_limits")
         locked = set(lock.keys()) if isinstance(lock, dict) else set()
         bp["pick"] = {"kind": kind_u, "selected": list(locked)}
-        await q.edit_message_text(
+        await _safe_edit_message_text(
+            q,
             "🔒 <b>Locked адсеты</b>\n\nНажимай чтобы залочить/разлочить:",
             reply_markup=_bp_locks_kb(adsets=items, locked=locked),
             parse_mode=ParseMode.HTML,
@@ -331,7 +366,8 @@ async def _bp_render_pick_adsets(q, context: ContextTypes.DEFAULT_TYPE, *, kind:
 
     cur = set([str(x) for x in (plan.get("excluded_adset_ids") or []) if str(x).strip()])
     bp["pick"] = {"kind": kind_u, "selected": list(cur)}
-    await q.edit_message_text(
+    await _safe_edit_message_text(
+        q,
         "🚫 <b>Исключить адсеты</b>\n\nВыбери адсеты (галочки):",
         reply_markup=_bp_pick_list_kb(items=items, selected=cur, prefix="am_bp_pick_excl_a", done_cb="am_bp_pick_excl_a_done", back_cb="am_bp_edit"),
         parse_mode=ParseMode.HTML,
@@ -697,10 +733,11 @@ async def _render_accounts(q, context: ContextTypes.DEFAULT_TYPE) -> None:
     st["level"] = "accounts"
 
     if not ids:
-        await q.edit_message_text("Нет включённых аккаунтов.")
+        await _safe_edit_message_text(q, "Нет включённых аккаунтов.")
         return
 
-    await q.edit_message_text(
+    await _safe_edit_message_text(
+        q,
         "🛠 <b>Управление рекламой</b>\n\nВыбери рекламный аккаунт:",
         reply_markup=_accounts_kb(ids),
         parse_mode=ParseMode.HTML,
@@ -728,7 +765,7 @@ async def _render_campaigns(q, context: ContextTypes.DEFAULT_TYPE, *, force: boo
     selected_id = str(st.get("selected_id") or "")
 
     text = _render_lines(title=f"Кампании — {get_account_name(aid)}", items=items, metrics=metrics, aid=aid, selected_id=selected_id)
-    await q.edit_message_text(text, reply_markup=_list_kb(level="campaigns", items=items, selected_id=selected_id), parse_mode=ParseMode.HTML)
+    await _safe_edit_message_text(q, text, reply_markup=_list_kb(level="campaigns", items=items, selected_id=selected_id), parse_mode=ParseMode.HTML)
 
 
 async def _render_adsets(q, context: ContextTypes.DEFAULT_TYPE, *, force: bool) -> None:
@@ -754,7 +791,7 @@ async def _render_adsets(q, context: ContextTypes.DEFAULT_TYPE, *, force: bool) 
     selected_id = str(st.get("selected_id") or "")
 
     text = _render_lines(title=f"Адсеты — {get_account_name(aid)}", items=items, metrics=metrics, aid=aid, selected_id=selected_id)
-    await q.edit_message_text(text, reply_markup=_list_kb(level="adsets", items=items, selected_id=selected_id), parse_mode=ParseMode.HTML)
+    await _safe_edit_message_text(q, text, reply_markup=_list_kb(level="adsets", items=items, selected_id=selected_id), parse_mode=ParseMode.HTML)
 
 
 async def _render_ads(q, context: ContextTypes.DEFAULT_TYPE, *, force: bool) -> None:
@@ -780,7 +817,7 @@ async def _render_ads(q, context: ContextTypes.DEFAULT_TYPE, *, force: bool) -> 
     selected_id = str(st.get("selected_id") or "")
 
     text = _render_lines(title=f"Объявления — {get_account_name(aid)}", items=items, metrics=metrics, aid=aid, selected_id=selected_id)
-    await q.edit_message_text(text, reply_markup=_list_kb(level="ads", items=items, selected_id=selected_id), parse_mode=ParseMode.HTML)
+    await _safe_edit_message_text(q, text, reply_markup=_list_kb(level="ads", items=items, selected_id=selected_id), parse_mode=ParseMode.HTML)
 
 
 async def _start_toggle(q, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -812,7 +849,8 @@ async def _start_toggle(q, context: ContextTypes.DEFAULT_TYPE) -> None:
     }
 
     human = {"campaigns": "Кампания", "adsets": "Адсет", "ads": "Объявление"}.get(level, "Объект")
-    await q.edit_message_text(
+    await _safe_edit_message_text(
+        q,
         f"{human}: <b>{str(meta.get('name') or '')}</b>\n\nПереключить статус {cur} → {new_status}?",
         reply_markup=_confirm_kb(),
         parse_mode=ParseMode.HTML,
@@ -899,7 +937,7 @@ async def _apply_confirm(q, context: ContextTypes.DEFAULT_TYPE) -> None:
                 await _render_ads(q, context, force=True)
             return
 
-        await q.edit_message_text(f"⚠️ Ошибка: {err_msg}", reply_markup=_confirm_kb(), parse_mode=ParseMode.HTML)
+        await _safe_edit_message_text(q, f"⚠️ Ошибка: {err_msg}", reply_markup=_confirm_kb(), parse_mode=ParseMode.HTML)
         return
 
     if pending.get("kind") == "budget":
@@ -937,7 +975,7 @@ async def _apply_confirm(q, context: ContextTypes.DEFAULT_TYPE) -> None:
             await _render_adsets(q, context, force=True)
             return
 
-        await q.edit_message_text(f"⚠️ Ошибка: {err_msg}", reply_markup=_confirm_kb(), parse_mode=ParseMode.HTML)
+        await _safe_edit_message_text(q, f"⚠️ Ошибка: {err_msg}", reply_markup=_confirm_kb(), parse_mode=ParseMode.HTML)
         return
 
     await q.answer("Нет действия", show_alert=False)
@@ -1113,8 +1151,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> boo
         plan["bundle_campaign_ids"] = list(cur)
         bp["edit_plan"] = plan
         items = bp.get("pick_items")
-        await q.edit_message_reply_markup(
-            reply_markup=_bp_pick_list_kb(items=list(items or []), selected=cur, prefix="am_bp_pick_bundle", done_cb="am_bp_pick_bundle_done", back_cb="am_bp_edit")
+        await _safe_edit_message_reply_markup(
+            q,
+            reply_markup=_bp_pick_list_kb(items=list(items or []), selected=cur, prefix="am_bp_pick_bundle", done_cb="am_bp_pick_bundle_done", back_cb="am_bp_edit"),
         )
         return True
 
@@ -1132,8 +1171,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> boo
         plan["excluded_campaign_ids"] = list(cur)
         bp["edit_plan"] = plan
         items = bp.get("pick_items")
-        await q.edit_message_reply_markup(
-            reply_markup=_bp_pick_list_kb(items=list(items or []), selected=cur, prefix="am_bp_pick_excl_c", done_cb="am_bp_pick_excl_c_done", back_cb="am_bp_edit")
+        await _safe_edit_message_reply_markup(
+            q,
+            reply_markup=_bp_pick_list_kb(items=list(items or []), selected=cur, prefix="am_bp_pick_excl_c", done_cb="am_bp_pick_excl_c_done", back_cb="am_bp_edit"),
         )
         return True
 
@@ -1151,8 +1191,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> boo
         plan["excluded_adset_ids"] = list(cur)
         bp["edit_plan"] = plan
         items = bp.get("pick_items")
-        await q.edit_message_reply_markup(
-            reply_markup=_bp_pick_list_kb(items=list(items or []), selected=cur, prefix="am_bp_pick_excl_a", done_cb="am_bp_pick_excl_a_done", back_cb="am_bp_edit")
+        await _safe_edit_message_reply_markup(
+            q,
+            reply_markup=_bp_pick_list_kb(items=list(items or []), selected=cur, prefix="am_bp_pick_excl_a", done_cb="am_bp_pick_excl_a_done", back_cb="am_bp_edit"),
         )
         return True
 
@@ -1191,7 +1232,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> boo
         except Exception:
             nm = ""
         title = f"🔒 <b>Locked adset</b>\n\n{str(nm or adset_id)}"
-        await q.edit_message_text(title, reply_markup=_bp_lock_item_kb(adset_id, item), parse_mode=ParseMode.HTML)
+        await _safe_edit_message_text(q, title, reply_markup=_bp_lock_item_kb(adset_id, item), parse_mode=ParseMode.HTML)
         return True
 
     if data.startswith("am_bp_lock_min|"):
@@ -1223,7 +1264,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> boo
             await _bp_render_edit(update, context)
             return True
         bp["preview"] = pv
-        await q.edit_message_text(_bp_preview_text(pv), reply_markup=_bp_preview_kb(), parse_mode=ParseMode.HTML)
+        await _safe_edit_message_text(q, _bp_preview_text(pv), reply_markup=_bp_preview_kb(), parse_mode=ParseMode.HTML)
         return True
 
     if data == "am_bp_apply":
