@@ -1213,8 +1213,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> boo
     if data == "am_bp_preview":
         with allow_fb_api_calls(reason="ads_manage:bp_preview"):
             pv = build_budget_plan_preview(plan, force=True)
-        if not isinstance(pv, dict) or not pv.get("ok"):
+        if not isinstance(pv, dict):
             await q.message.reply_text("⚠️ Не удалось построить preview")
+            await _bp_render_edit(update, context)
+            return True
+        if not pv.get("ok"):
+            err = str(pv.get("error") or "unknown_error")
+            await q.message.reply_text(f"⚠️ Preview error: {err}")
             await _bp_render_edit(update, context)
             return True
         bp["preview"] = pv
@@ -1228,9 +1233,55 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> boo
             await _bp_render_edit(update, context)
             return True
         res = apply_budget_plan_preview(pv)
-        ok = bool(res.get("ok"))
-        msg = f"✅ Применено: {int(res.get('updated') or 0)}" if ok else f"⚠️ Ошибки: {int(res.get('failed') or 0)}"
-        await q.message.reply_text(msg)
+        if not isinstance(res, dict):
+            await q.message.reply_text("⚠️ Не удалось применить")
+            bp.pop("preview", None)
+            await _bp_render_edit(update, context)
+            return True
+
+        if not res.get("ok") and res.get("error"):
+            await q.message.reply_text(f"⚠️ Apply error: {str(res.get('error'))}")
+            bp.pop("preview", None)
+            await _bp_render_edit(update, context)
+            return True
+
+        updated = int(res.get("updated") or 0)
+        skipped = int(res.get("skipped") or 0)
+        failed = int(res.get("failed") or 0)
+
+        lines: List[str] = [f"Apply: updated={updated} skipped={skipped} failed={failed}"]
+
+        name_map: Dict[str, str] = {}
+        try:
+            for ch in list((pv or {}).get("changes") or []):
+                if isinstance(ch, dict):
+                    aid2 = str(ch.get("adset_id") or "").strip()
+                    nm2 = str(ch.get("name") or "").strip()
+                    if aid2:
+                        name_map[aid2] = nm2
+        except Exception:
+            name_map = {}
+
+        failed_items: List[Dict[str, Any]] = []
+        try:
+            for r in list(res.get("results") or []):
+                if isinstance(r, dict) and str(r.get("status") or "") == "error":
+                    failed_items.append(r)
+        except Exception:
+            failed_items = []
+
+        if failed_items:
+            lines.append("Ошибки (первые):")
+            for r in failed_items[:3]:
+                adset_id = str(r.get("adset_id") or "").strip()
+                nm = str(name_map.get(adset_id) or "")
+                if len(nm) > 28:
+                    nm = nm[:25] + "…"
+                err_txt = _human_fb_error(r.get("error") if isinstance(r.get("error"), dict) else None)
+                label = nm or adset_id
+                lines.append(f"- {label}: {err_txt}")
+
+        await q.message.reply_text("\n".join(lines))
         bp.pop("preview", None)
         await _bp_render_edit(update, context)
         return True
