@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import html
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -99,7 +100,7 @@ def _bp_state(context: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
 
 
 def _bp_plan_brief(p: Dict[str, Any]) -> str:
-    name = str(p.get("name") or "<без названия>")
+    name = str(p.get("name") or "без названия")
     scope = str(p.get("scope_type") or "ACCOUNT")
     period = str(p.get("period_type") or "MONTH")
     enabled = bool(p.get("is_enabled", True))
@@ -158,7 +159,7 @@ def _bp_pick_list_kb(*, items: List[Dict[str, Any]], selected: set, prefix: str,
         oid = str((it or {}).get("id") or "").strip()
         if not oid:
             continue
-        nm = str((it or {}).get("name") or "<без названия>")
+        nm = str((it or {}).get("name") or "без названия")
         on = "✅" if oid in selected else "☑️"
         lbl = f"{on} {nm}".strip()
         if len(lbl) > 60:
@@ -175,7 +176,7 @@ def _bp_locks_kb(*, adsets: List[Dict[str, Any]], locked: set) -> InlineKeyboard
         oid = str((it or {}).get("id") or "").strip()
         if not oid:
             continue
-        nm = str((it or {}).get("name") or "<без названия>")
+        nm = str((it or {}).get("name") or "без названия")
         on = "🔒" if oid in locked else "🔓"
         lbl = f"{on} {nm}".strip()
         if len(lbl) > 60:
@@ -243,7 +244,7 @@ async def _bp_render_plans(q, context: ContextTypes.DEFAULT_TYPE) -> None:
     bp["aid"] = aid
 
     plans = list_budget_plans(account_id=aid)
-    title = f"📦 <b>Бюджет-план</b> — {str(get_account_name(aid) or aid)}"
+    title = f"📦 <b>Бюджет-план</b> — {html.escape(str(get_account_name(aid) or aid))}"
     await _safe_edit_message_text(
         q,
         title + "\n\nВыбери план или создай новый:",
@@ -261,7 +262,7 @@ async def _bp_render_edit(src, context: ContextTypes.DEFAULT_TYPE) -> None:
             await _bp_render_plans(src.callback_query, context)
         return
 
-    name = str(plan.get("name") or "<без названия>")
+    name = str(plan.get("name") or "без названия")
     scope = str(plan.get("scope_type") or "ACCOUNT")
     period = str(plan.get("period_type") or "MONTH")
     enabled = bool(plan.get("is_enabled", True))
@@ -276,9 +277,9 @@ async def _bp_render_edit(src, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     lines = [
         "📦 <b>Бюджет-план</b>",
-        f"Аккаунт: <b>{str(get_account_name(str(bp.get('aid') or st.get('aid') or '')) or '')}</b>",
+        f"Аккаунт: <b>{html.escape(str(get_account_name(str(bp.get('aid') or st.get('aid') or '')) or ''))}</b>",
         "",
-        f"Название: <b>{name}</b>",
+        f"Название: <b>{html.escape(name)}</b>",
         f"Статус: <b>{'ENABLED' if enabled else 'DISABLED'}</b>",
         f"Scope: <b>{scope}</b>",
         f"Period: <b>{period}</b>",
@@ -391,7 +392,7 @@ def _bp_preview_text(pv: Dict[str, Any]) -> str:
     if isinstance(warnings, list) and warnings:
         lines.append("⚠️ Предупреждения:")
         for w in warnings[:3]:
-            lines.append(f"- {str(w)}")
+            lines.append(f"- {html.escape(str(w))}")
         lines.append("")
 
     changes = pv.get("changes")
@@ -403,7 +404,7 @@ def _bp_preview_text(pv: Dict[str, Any]) -> str:
     for ch in changes[:10]:
         if not isinstance(ch, dict):
             continue
-        nm = str(ch.get("name") or "")
+        nm = html.escape(str(ch.get("name") or ""))
         old_u = float(ch.get("old_usd") or 0.0)
         new_u = float(ch.get("new_usd") or 0.0)
         delta = float(ch.get("delta_usd") or 0.0)
@@ -558,7 +559,7 @@ def _bulk_metrics(*, aid: str, level: str, ids: List[str], filter_field: str, id
 
 
 def _render_lines(*, title: str, items: List[Dict[str, Any]], metrics: Dict[str, Dict[str, Any]], aid: str, selected_id: str) -> str:
-    lines: List[str] = [f"<b>{title}</b>"]
+    lines: List[str] = [f"<b>{html.escape(title)}</b>"]
 
     if not items:
         lines.extend(["", "Нет данных."])
@@ -573,7 +574,7 @@ def _render_lines(*, title: str, items: List[Dict[str, Any]], metrics: Dict[str,
 
         st = _status_text(it)
         emo = _status_emoji(st)
-        nm = str(it.get("name") or "<без названия>")
+        nm = html.escape(str(it.get("name") or "без названия"))
 
         m = metrics.get(oid) or {}
         parsed = parse_insight(dict(m or {}), aid=str(aid), lead_action_type=None)
