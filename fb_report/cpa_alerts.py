@@ -195,6 +195,88 @@ def get_rule(rule_id: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def create_default_rule(*, name: str = "") -> Dict[str, Any]:
+    rid = hashlib.sha1(f"new_rule:{time.time()}".encode("utf-8")).hexdigest()[:12]
+    rule = {
+        "id": rid,
+        "name": str(name or "").strip() or f"Rule {rid}",
+        "scope_type": "ACCOUNT",
+        "scope_id": "",
+        "account_id": None,
+        "result_type": "BLENDED",
+        "target_cpa_usd": 0.0,
+        "schedule": "DAILY",
+        "active_hours": {"from": "10:30", "to": "21:30"},
+        "send_time": "10:45",
+        "min_spend_to_trigger_usd": 0.0,
+        "top_ads_limit": 5,
+        "enabled": True,
+        "last_run_at": None,
+    }
+    return _ensure_rule_defaults(rule)
+
+
+def upsert_rule(rule: Dict[str, Any]) -> Dict[str, Any]:
+    rr = _ensure_rule_defaults(rule)
+    rid = str(rr.get("id") or "").strip()
+    if not rid:
+        rr["id"] = hashlib.sha1(f"new_rule:{time.time()}".encode("utf-8")).hexdigest()[:12]
+        rid = str(rr.get("id") or "").strip()
+
+    st = load_cpa_alerts_state()
+    targets = st.get("targets") if isinstance(st.get("targets"), list) else []
+    out_targets: List[Dict[str, Any]] = []
+    replaced = False
+    for it in targets:
+        if not isinstance(it, dict):
+            continue
+        if str(it.get("id") or "").strip() == rid:
+            out_targets.append(rr)
+            replaced = True
+        else:
+            out_targets.append(it)
+    if not replaced:
+        out_targets.append(rr)
+    st["targets"] = out_targets
+    save_cpa_alerts_state(st)
+    return rr
+
+
+def delete_rule(rule_id: str) -> bool:
+    rid = str(rule_id or "").strip()
+    if not rid:
+        return False
+    st = load_cpa_alerts_state()
+    targets = st.get("targets") if isinstance(st.get("targets"), list) else []
+    out_targets: List[Dict[str, Any]] = []
+    removed = False
+    for it in targets:
+        if not isinstance(it, dict):
+            continue
+        if str(it.get("id") or "").strip() == rid:
+            removed = True
+            continue
+        out_targets.append(it)
+    st["targets"] = out_targets
+    save_cpa_alerts_state(st)
+    return bool(removed)
+
+
+def toggle_rule_enabled(rule_id: str) -> Optional[Dict[str, Any]]:
+    rr = get_rule(rule_id)
+    if not rr:
+        return None
+    rr2 = dict(rr)
+    rr2["enabled"] = not bool(rr.get("enabled") is True)
+    return upsert_rule(rr2)
+
+
+def set_global_enabled(enabled: bool) -> None:
+    st = load_cpa_alerts_state()
+    st["enabled"] = bool(enabled)
+    save_cpa_alerts_state(st)
+
+
 def _daily_cache_load() -> dict:
     st = _load_json(CPA_ALERTS_DAILY_CACHE_FILE)
     if not isinstance(st, dict):

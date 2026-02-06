@@ -86,7 +86,18 @@ from .jobs import (
     schedule_heatmap_snapshot_collector,
 )
 from .cpa_alerts import schedule_cpa_alerts
-from .cpa_alerts import list_rules as _cpa_rules_list
+from .cpa_alerts import (
+    create_default_rule as _cpa_create_default_rule,
+    delete_rule as _cpa_delete_rule,
+    ensure_cpa_alerts_state_initialized as _cpa_ensure_state,
+    ensure_default_rules_from_legacy_accounts as _cpa_ensure_defaults,
+    get_rule as _cpa_get_rule,
+    list_rules as _cpa_rules_list,
+    load_cpa_alerts_state as _cpa_load_state,
+    set_global_enabled as _cpa_set_global_enabled,
+    toggle_rule_enabled as _cpa_toggle_rule_enabled,
+    upsert_rule as _cpa_upsert_rule,
+)
 from .cpa_alerts import run_cpa_alerts_for_mode as _run_cpa_alerts_for_mode
 from .autopilot_format import ap_action_text
 from . import ads_manage
@@ -236,6 +247,147 @@ def client_group_menu_for_admin(*, active: bool) -> InlineKeyboardMarkup:
     except Exception:
         pass
     return InlineKeyboardMarkup(rows)
+
+
+def _cpa_alerts_rule_title(rule: dict) -> str:
+    rid = str((rule or {}).get("id") or "").strip()
+    nm = str((rule or {}).get("name") or rid).strip()
+    sch = str((rule or {}).get("schedule") or "").upper().strip()
+    st = str((rule or {}).get("scope_type") or "").upper().strip()
+    sid = str((rule or {}).get("scope_id") or "").strip()
+    en = "🟢" if bool((rule or {}).get("enabled") is True) else "🔴"
+    if st == "ACCOUNT" and sid:
+        sid = str(get_account_name(sid) or sid)
+    t = float((rule or {}).get("target_cpa_usd") or 0.0)
+    return f"{en} {nm} [{sch}] {st}:{sid} target={t:.2f}$".strip()
+
+
+def cpa_alerts_settings_kb(*, is_enabled: bool) -> InlineKeyboardMarkup:
+    on = "🟢" if bool(is_enabled) else "🔴"
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(f"{on} CPA-алёрты: {'ON' if is_enabled else 'OFF'}", callback_data="cpa_alerts_global_toggle")],
+            [InlineKeyboardButton("📋 Правила", callback_data="cpa_alerts_rules")],
+            [InlineKeyboardButton("➕ Создать правило", callback_data="cpa_alerts_new_rule")],
+            [InlineKeyboardButton("⬅️ Мониторинг", callback_data="monitoring_menu")],
+        ]
+    )
+
+
+def cpa_alerts_rules_kb() -> InlineKeyboardMarkup:
+    rules = _cpa_rules_list(enabled_only=False) or []
+    rows: list[list[InlineKeyboardButton]] = []
+    for r in rules[:40]:
+        if not isinstance(r, dict):
+            continue
+        rid = str(r.get("id") or "").strip()
+        if not rid:
+            continue
+        lbl = _cpa_alerts_rule_title(r)
+        if len(lbl) > 60:
+            lbl = lbl[:57] + "…"
+        rows.append([InlineKeyboardButton(lbl, callback_data=f"cpa_alerts_rule|{rid}")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="cpa_alerts_settings")])
+    return InlineKeyboardMarkup(rows)
+
+
+def cpa_alerts_rule_kb(rule_id: str) -> InlineKeyboardMarkup:
+    rid = str(rule_id or "").strip()
+    rr = _cpa_get_rule(rid) or {}
+    en = bool(rr.get("enabled") is True)
+    en_txt = "🟢 ВКЛ" if en else "🔴 ВЫКЛ"
+
+    rows: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(f"{en_txt} (переключить)", callback_data=f"cpa_alerts_rule_toggle|{rid}")],
+        [InlineKeyboardButton("🧪 Тест этого правила", callback_data=f"cpa_alerts_test|{rid}")],
+        [InlineKeyboardButton("✏️ Название", callback_data=f"cpa_alerts_edit|{rid}|name")],
+        [InlineKeyboardButton("🎯 Target CPA ($)", callback_data=f"cpa_alerts_edit|{rid}|target_cpa_usd")],
+        [InlineKeyboardButton("🧾 Scope ID", callback_data=f"cpa_alerts_edit|{rid}|scope_id")],
+    ]
+
+    st = str(rr.get("scope_type") or "ACCOUNT").upper().strip()
+    if st in {"CAMPAIGN", "ADSET"}:
+        rows.append([InlineKeyboardButton("🏦 Account ID (act_...)", callback_data=f"cpa_alerts_edit|{rid}|account_id")])
+
+    rows.extend(
+        [
+            [
+                InlineKeyboardButton("Scope: ACCOUNT", callback_data=f"cpa_alerts_set_scope|{rid}|ACCOUNT"),
+                InlineKeyboardButton("GROUP", callback_data=f"cpa_alerts_set_scope|{rid}|ENTITY_GROUP"),
+            ],
+            [
+                InlineKeyboardButton("CAMPAIGN", callback_data=f"cpa_alerts_set_scope|{rid}|CAMPAIGN"),
+                InlineKeyboardButton("ADSET", callback_data=f"cpa_alerts_set_scope|{rid}|ADSET"),
+            ],
+            [
+                InlineKeyboardButton("Result: BLENDED", callback_data=f"cpa_alerts_set_result|{rid}|BLENDED"),
+                InlineKeyboardButton("MESSAGES", callback_data=f"cpa_alerts_set_result|{rid}|MESSAGES"),
+            ],
+            [
+                InlineKeyboardButton("SUBMIT_APP", callback_data=f"cpa_alerts_set_result|{rid}|SUBMIT_APPLICATION"),
+            ],
+            [
+                InlineKeyboardButton("Schedule: HOURLY", callback_data=f"cpa_alerts_set_schedule|{rid}|HOURLY"),
+                InlineKeyboardButton("DAILY", callback_data=f"cpa_alerts_set_schedule|{rid}|DAILY"),
+            ],
+            [
+                InlineKeyboardButton("DAYS_3", callback_data=f"cpa_alerts_set_schedule|{rid}|DAYS_3"),
+                InlineKeyboardButton("WEEKLY", callback_data=f"cpa_alerts_set_schedule|{rid}|WEEKLY"),
+            ],
+            [InlineKeyboardButton("⏰ Send time (HH:MM)", callback_data=f"cpa_alerts_edit|{rid}|send_time")],
+            [InlineKeyboardButton("🕒 Active hours (HH:MM-HH:MM)", callback_data=f"cpa_alerts_edit|{rid}|active_hours")],
+            [InlineKeyboardButton("💵 Min spend ($)", callback_data=f"cpa_alerts_edit|{rid}|min_spend_to_trigger_usd")],
+            [InlineKeyboardButton("🔥 Top ads limit", callback_data=f"cpa_alerts_edit|{rid}|top_ads_limit")],
+            [InlineKeyboardButton("🗑 Удалить", callback_data=f"cpa_alerts_delete|{rid}")],
+            [InlineKeyboardButton("⬅️ К списку", callback_data="cpa_alerts_rules")],
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def cpa_alerts_rule_text(rule_id: str) -> str:
+    rr = _cpa_get_rule(str(rule_id)) or {}
+    rid = str(rr.get("id") or "")
+    nm = str(rr.get("name") or "")
+    st = str(rr.get("scope_type") or "")
+    sid = str(rr.get("scope_id") or "")
+    aid = str(rr.get("account_id") or "")
+    rt = str(rr.get("result_type") or "")
+    sch = str(rr.get("schedule") or "")
+    target = float(rr.get("target_cpa_usd") or 0.0)
+    send_time = str(rr.get("send_time") or "")
+    ah = rr.get("active_hours") or {}
+    ah_from = str((ah or {}).get("from") or "")
+    ah_to = str((ah or {}).get("to") or "")
+    ms = float(rr.get("min_spend_to_trigger_usd") or 0.0)
+    top = int(rr.get("top_ads_limit") or 0)
+    en = "ON" if bool(rr.get("enabled") is True) else "OFF"
+    last = str(rr.get("last_run_at") or "")
+
+    lines = [
+        "⚙️ CPA-алёрт — правило",
+        f"id={rid}",
+        f"name={nm}",
+        f"enabled={en}",
+        f"scope_type={st}",
+        f"scope_id={sid}",
+    ]
+    if aid:
+        lines.append(f"account_id={aid}")
+    lines.extend(
+        [
+            f"result_type={rt}",
+            f"schedule={sch}",
+            f"target_cpa_usd={target:.2f}",
+            f"send_time={send_time}",
+            f"active_hours={ah_from}-{ah_to}",
+            f"min_spend_to_trigger_usd={ms:.2f}",
+            f"top_ads_limit={top}",
+        ]
+    )
+    if last:
+        lines.append(f"last_run_at={last}")
+    return "\n".join(lines)
 
 
 def client_group_accounts_kb(chat_id: str) -> InlineKeyboardMarkup:
@@ -2602,6 +2754,14 @@ def monitoring_menu_kb(*, is_sa: bool = False) -> InlineKeyboardMarkup:
         rows.append(
             [
                 InlineKeyboardButton(
+                    "⚙️ Настройки CPA-алёртов",
+                    callback_data="cpa_alerts_settings",
+                )
+            ]
+        )
+        rows.append(
+            [
+                InlineKeyboardButton(
                     "🧪 Тест CPA-алерта",
                     callback_data="cpa_test_menu",
                 )
@@ -4090,7 +4250,9 @@ async def _on_cb_internal(
     # Legacy CPA alerts UI is disabled (new system lives in fb_report/cpa_alerts.py).
     # This prevents old branches from mutating accounts.json and avoids conflicting behavior.
     if str(data).startswith("toggle_alert|") or str(data).startswith("set_cpa|") or (
-        str(data).startswith("cpa_") and not str(data).startswith("cpa_test")
+        str(data).startswith("cpa_")
+        and (not str(data).startswith("cpa_test"))
+        and (not str(data).startswith("cpa_alerts_"))
     ):
         if is_sa:
             await safe_edit_message(
@@ -5331,6 +5493,210 @@ async def _on_cb_internal(
             "Раздел мониторинга. Выберите пункт:",
             reply_markup=monitoring_menu_kb(is_sa=bool(is_sa)),
         )
+        return
+
+    if data == "cpa_alerts_settings":
+        if not is_sa:
+            return
+        _cpa_ensure_state()
+        _cpa_ensure_defaults()
+        st = _cpa_load_state() or {}
+        is_enabled = bool(st.get("enabled") is True)
+        await safe_edit_message(
+            q,
+            "⚙️ Настройки CPA-алёртов",
+            reply_markup=cpa_alerts_settings_kb(is_enabled=is_enabled),
+        )
+        return
+
+    if data == "cpa_alerts_global_toggle":
+        if not is_sa:
+            return
+        st = _cpa_load_state() or {}
+        new_val = not bool(st.get("enabled") is True)
+        _cpa_set_global_enabled(bool(new_val))
+        await safe_edit_message(
+            q,
+            "⚙️ Настройки CPA-алёртов",
+            reply_markup=cpa_alerts_settings_kb(is_enabled=bool(new_val)),
+        )
+        return
+
+    if data == "cpa_alerts_rules":
+        if not is_sa:
+            return
+        _cpa_ensure_state()
+        _cpa_ensure_defaults()
+        await safe_edit_message(
+            q,
+            "📋 CPA-алёрты — правила",
+            reply_markup=cpa_alerts_rules_kb(),
+        )
+        return
+
+    if data == "cpa_alerts_new_rule":
+        if not is_sa:
+            return
+        rr = _cpa_create_default_rule(name="")
+        rr = _cpa_upsert_rule(rr)
+        rid = str(rr.get("id") or "").strip()
+        await safe_edit_message(
+            q,
+            cpa_alerts_rule_text(rid),
+            reply_markup=cpa_alerts_rule_kb(rid),
+        )
+        return
+
+    if data.startswith("cpa_alerts_rule|"):
+        if not is_sa:
+            return
+        rid = str(data.split("|", 1)[1] or "").strip()
+        if not rid:
+            return
+        await safe_edit_message(
+            q,
+            cpa_alerts_rule_text(rid),
+            reply_markup=cpa_alerts_rule_kb(rid),
+        )
+        return
+
+    if data.startswith("cpa_alerts_rule_toggle|"):
+        if not is_sa:
+            return
+        rid = str(data.split("|", 1)[1] or "").strip()
+        if not rid:
+            return
+        _cpa_toggle_rule_enabled(rid)
+        await safe_edit_message(
+            q,
+            cpa_alerts_rule_text(rid),
+            reply_markup=cpa_alerts_rule_kb(rid),
+        )
+        return
+
+    if data.startswith("cpa_alerts_delete|"):
+        if not is_sa:
+            return
+        rid = str(data.split("|", 1)[1] or "").strip()
+        if not rid:
+            return
+        _cpa_delete_rule(rid)
+        await safe_edit_message(
+            q,
+            "📋 CPA-алёрты — правила",
+            reply_markup=cpa_alerts_rules_kb(),
+        )
+        return
+
+    if data.startswith("cpa_alerts_set_scope|"):
+        if not is_sa:
+            return
+        _p, rid, val = data.split("|", 2)
+        rr = _cpa_get_rule(str(rid))
+        if not rr:
+            return
+        v = str(val or "ACCOUNT").upper().strip()
+        if v not in {"ACCOUNT", "ENTITY_GROUP", "CAMPAIGN", "ADSET"}:
+            v = "ACCOUNT"
+        rr2 = dict(rr)
+        rr2["scope_type"] = v
+        _cpa_upsert_rule(rr2)
+        await safe_edit_message(
+            q,
+            cpa_alerts_rule_text(rid),
+            reply_markup=cpa_alerts_rule_kb(rid),
+        )
+        return
+
+    if data.startswith("cpa_alerts_set_result|"):
+        if not is_sa:
+            return
+        _p, rid, val = data.split("|", 2)
+        rr = _cpa_get_rule(str(rid))
+        if not rr:
+            return
+        v = str(val or "BLENDED").upper().strip()
+        if v not in {"BLENDED", "MESSAGES", "SUBMIT_APPLICATION"}:
+            v = "BLENDED"
+        rr2 = dict(rr)
+        rr2["result_type"] = v
+        _cpa_upsert_rule(rr2)
+        await safe_edit_message(
+            q,
+            cpa_alerts_rule_text(rid),
+            reply_markup=cpa_alerts_rule_kb(rid),
+        )
+        return
+
+    if data.startswith("cpa_alerts_set_schedule|"):
+        if not is_sa:
+            return
+        _p, rid, val = data.split("|", 2)
+        rr = _cpa_get_rule(str(rid))
+        if not rr:
+            return
+        v = str(val or "DAILY").upper().strip()
+        if v not in {"HOURLY", "DAILY", "DAYS_3", "WEEKLY"}:
+            v = "DAILY"
+        rr2 = dict(rr)
+        rr2["schedule"] = v
+        _cpa_upsert_rule(rr2)
+        await safe_edit_message(
+            q,
+            cpa_alerts_rule_text(rid),
+            reply_markup=cpa_alerts_rule_kb(rid),
+        )
+        return
+
+    if data.startswith("cpa_alerts_edit|"):
+        if not is_sa:
+            return
+        _p, rid, field = data.split("|", 2)
+        rr = _cpa_get_rule(str(rid))
+        if not rr:
+            return
+        fld = str(field or "").strip()
+        if fld not in {
+            "name",
+            "target_cpa_usd",
+            "scope_id",
+            "account_id",
+            "send_time",
+            "active_hours",
+            "min_spend_to_trigger_usd",
+            "top_ads_limit",
+        }:
+            return
+        context.user_data["await_cpa_alerts_edit"] = {"rule_id": str(rid), "field": fld}
+        prompts = {
+            "name": "Введите название правила текстом (до 48 символов)",
+            "target_cpa_usd": "Введите target CPA в долларах (например 2.5)",
+            "scope_id": "Введите scope_id (ACCOUNT: act_... / GROUP: group_id / CAMPAIGN: campaign_id / ADSET: adset_id)",
+            "account_id": "Введите account_id вида act_... (нужно для scope CAMPAIGN/ADSET; можно оставить пустым)",
+            "send_time": "Введите время отправки HH:MM (например 10:45)",
+            "active_hours": "Введите активные часы HH:MM-HH:MM (например 10:30-21:30)",
+            "min_spend_to_trigger_usd": "Введите минимальный spend ($) для триггера (например 20)",
+            "top_ads_limit": "Введите лимит TOP ads (целое число, например 5)",
+        }
+        await safe_edit_message(
+            q,
+            str(prompts.get(fld) or "Введите значение"),
+            reply_markup=cpa_alerts_rule_kb(str(rid)),
+        )
+        return
+
+    if data.startswith("cpa_alerts_test|"):
+        if not is_sa:
+            return
+        rid = str(data.split("|", 1)[1] or "").strip()
+        if not rid:
+            return
+        rr = _cpa_get_rule(rid) or {}
+        schedule = str((rr or {}).get("schedule") or "DAILY").upper().strip()
+        mode = schedule if schedule in {"HOURLY", "DAILY", "DAYS_3", "WEEKLY"} else "DAILY"
+        await safe_edit_message(q, "🧪 Запускаю тест CPA-алерта…")
+        await _run_cpa_alerts_for_mode(context, mode=mode, rule_id=rid, test=True)
+        await safe_edit_message(q, "✅ Тест отправлен в админ-чат", reply_markup=cpa_alerts_rule_kb(rid))
         return
 
     if data == "cpa_test_menu":
@@ -8057,6 +8423,100 @@ async def on_text_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = update.message.text.strip()
+
+    if "await_cpa_alerts_edit" in context.user_data:
+        payload = context.user_data.pop("await_cpa_alerts_edit") or {}
+        rid = str(payload.get("rule_id") or "").strip()
+        field = str(payload.get("field") or "").strip()
+        rr = _cpa_get_rule(rid) or {}
+        if not rid or not rr:
+            return
+
+        raw = str(text or "").strip()
+
+        def _parse_hhmm(s: str) -> tuple[int, int] | None:
+            try:
+                a, b = str(s).split(":", 1)
+                hh = int(a)
+                mm = int(b)
+                if hh < 0 or hh > 23 or mm < 0 or mm > 59:
+                    return None
+                return hh, mm
+            except Exception:
+                return None
+
+        rr2 = dict(rr)
+        ok = True
+        err = ""
+
+        if field == "name":
+            if not raw:
+                ok = False
+                err = "Название не может быть пустым."
+            elif len(raw) > 48:
+                ok = False
+                err = "Слишком длинное название (до 48 символов)."
+            else:
+                rr2["name"] = raw
+
+        elif field == "target_cpa_usd":
+            try:
+                rr2["target_cpa_usd"] = float(raw.replace(",", "."))
+            except Exception:
+                ok = False
+                err = "Введите число, например 2.5"
+
+        elif field == "min_spend_to_trigger_usd":
+            try:
+                rr2["min_spend_to_trigger_usd"] = float(raw.replace(",", "."))
+            except Exception:
+                ok = False
+                err = "Введите число, например 20"
+
+        elif field == "top_ads_limit":
+            try:
+                rr2["top_ads_limit"] = int(float(raw.replace(",", ".")))
+            except Exception:
+                ok = False
+                err = "Введите целое число, например 5"
+
+        elif field == "scope_id":
+            rr2["scope_id"] = raw
+
+        elif field == "account_id":
+            rr2["account_id"] = raw or None
+
+        elif field == "send_time":
+            if not _parse_hhmm(raw):
+                ok = False
+                err = "Формат времени: HH:MM (например 10:45)"
+            else:
+                rr2["send_time"] = raw
+
+        elif field == "active_hours":
+            if "-" not in raw:
+                ok = False
+                err = "Формат: HH:MM-HH:MM (например 10:30-21:30)"
+            else:
+                fr, to = raw.split("-", 1)
+                if (not _parse_hhmm(fr.strip())) or (not _parse_hhmm(to.strip())):
+                    ok = False
+                    err = "Формат: HH:MM-HH:MM (например 10:30-21:30)"
+                else:
+                    rr2["active_hours"] = {"from": fr.strip(), "to": to.strip()}
+
+        else:
+            ok = False
+            err = "Поле не поддерживается."
+
+        if not ok:
+            context.user_data["await_cpa_alerts_edit"] = payload
+            await update.message.reply_text(str(err))
+            return
+
+        _cpa_upsert_rule(rr2)
+        await update.message.reply_text(cpa_alerts_rule_text(rid), reply_markup=cpa_alerts_rule_kb(rid))
+        return
 
     if "await_lead_metric_search_for" in context.user_data:
         payload = context.user_data.pop("await_lead_metric_search_for") or {}
