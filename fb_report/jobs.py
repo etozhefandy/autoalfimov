@@ -2257,25 +2257,12 @@ async def _hourly_snapshot_job(context: ContextTypes.DEFAULT_TYPE):
     return
 
 
-def schedule_cpa_alerts(app: Application):
-    # Планировщик CPA-алёртов: единый повторяющийся джоб раз в час.
-    # Внутри _cpa_alerts_job уже учитывает days/freq и решает,
-    # нужно ли слать уведомления в этот час.
-    # Stagger jobs to reduce FB burst.
-    try:
-        now = datetime.now(ALMATY_TZ)
-        first_cpa = now.replace(minute=25, second=0, microsecond=0)
-        if first_cpa <= now:
-            first_cpa = first_cpa + timedelta(hours=1)
-    except Exception:
-        first_cpa = timedelta(minutes=25)
-    app.job_queue.run_repeating(
-        _cpa_alerts_job,
-        interval=timedelta(hours=1),
-        first=first_cpa,
-    )
+def schedule_heatmap_snapshot_collector(app: Application) -> None:
+    """Schedules heatmap snapshot collector.
 
-    # Часовой снимок инсайтов за today для часового кэша
+    This is kept separate from CPA alerts to avoid coupling/legacy conflicts.
+    """
+
     # Heatmap snapshot collector: единственный компонент, который ходит в FB.
     # Запускаем раз в 10 минут; он собирает предыдущий полный час и дособирает до дедлайна.
     try:

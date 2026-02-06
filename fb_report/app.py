@@ -77,14 +77,17 @@ from .creatives import fetch_instagram_active_ads_links, format_instagram_ads_li
 from .adsets import send_adset_report
 from .billing import send_billing, send_billing_forecast, billing_digest_job
 from .jobs import (
-    schedule_cpa_alerts,
     _resolve_account_cpa,
     schedule_morning_report,
     send_morning_report_to_chat,
     schedule_client_groups_morning_report,
     build_heatmap_status_text,
     run_heatmap_snapshot_collector_once,
+    schedule_heatmap_snapshot_collector,
 )
+from .cpa_alerts import schedule_cpa_alerts
+from .cpa_alerts import list_rules as _cpa_rules_list
+from .cpa_alerts import run_cpa_alerts_for_mode as _run_cpa_alerts_for_mode
 from .autopilot_format import ap_action_text
 from . import ads_manage
 
@@ -2536,13 +2539,12 @@ def focus_ai_recommendation_kb(
     return InlineKeyboardMarkup(rows)
 
 
-def monitoring_menu_kb() -> InlineKeyboardMarkup:
+def monitoring_menu_kb(*, is_sa: bool = False) -> InlineKeyboardMarkup:
     """Подменю раздела мониторинга.
 
     Основные режимы сравнения + настройки мониторинга и заглушка плана заявок.
     """
-    return InlineKeyboardMarkup(
-        [
+    rows = [
             [
                 InlineKeyboardButton(
                     "🎯 Фокус-ИИ", callback_data="focus_ai_menu"
@@ -2594,6 +2596,20 @@ def monitoring_menu_kb() -> InlineKeyboardMarkup:
                     callback_data="mon_heatmap_menu",
                 )
             ],
+        ]
+
+    if bool(is_sa):
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "🧪 Тест CPA-алерта",
+                    callback_data="cpa_test_menu",
+                )
+            ]
+        )
+
+    rows.extend(
+        [
             [
                 InlineKeyboardButton(
                     "📈 План заявок (скоро)", callback_data="leads_plan_soon"
@@ -2602,6 +2618,7 @@ def monitoring_menu_kb() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("⬅️ В меню", callback_data="menu")],
         ]
     )
+    return InlineKeyboardMarkup(rows)
 
 
 def heatmap_hourly_accounts_kb() -> InlineKeyboardMarkup:
@@ -3214,24 +3231,10 @@ def _flag_line(aid: str) -> str:
     st = load_accounts().get(aid, {})
     enabled = st.get("enabled", True)
     m = st.get("metrics", {}) or {}
-    a = st.get("alerts", {}) or {}
     on = "🟢" if enabled else "🔴"
     mm = "💬" if m.get("messaging") else ""
     ll = "♿️" if m.get("leads") else ""
-    # CPA-индикатор: включён ли CPA-алёрт на любом уровне (аккаунт/кампания/адсет/объявление).
-    account_cpa_val = float(a.get("account_cpa", a.get("target_cpl", 0.0)) or 0.0)
-    base_enabled = bool(a.get("enabled", False)) and account_cpa_val > 0
-
-    camp_alerts = a.get("campaign_alerts", {}) or {}
-    adset_alerts = a.get("adset_alerts", {}) or {}
-    ad_alerts = a.get("ad_alerts", {}) or {}
-
-    camp_on = any(bool((cfg or {}).get("enabled", False)) for cfg in camp_alerts.values())
-    adset_on = any(bool((cfg or {}).get("enabled", False)) for cfg in adset_alerts.values())
-    ad_on = any(bool((cfg or {}).get("enabled", False)) for cfg in ad_alerts.values())
-
-    aa = "⚠️" if (base_enabled or camp_on or adset_on or ad_on) else ""
-    return f"{on} {mm}{ll}{aa}".strip()
+    return f"{on} {mm}{ll}".strip()
 
 
 def accounts_kb(prefix: str) -> InlineKeyboardMarkup:
@@ -3266,9 +3269,6 @@ def settings_kb(aid: str) -> InlineKeyboardMarkup:
     en_text = "Выключить кабинет" if st.get("enabled", True) else "Включить кабинет"
     m_on = st.get("metrics", {}).get("messaging", True)
     l_on = st.get("metrics", {}).get("leads", False)
-    a_on = st.get("alerts", {}).get("enabled", False) and (
-        st.get("alerts", {}).get("target_cpl", 0) or 0
-    ) > 0
 
     mr = st.get("morning_report") or {}
     level = str(mr.get("level", "ACCOUNT")).upper()
@@ -3296,22 +3296,6 @@ def settings_kb(aid: str) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
-                    f"⚠️ Алерт CPA: {'ON' if a_on else 'OFF'}",
-                    callback_data=f"toggle_alert|{aid}",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "⚙️ Настройки CPA-алёртов", callback_data=f"cpa_settings|{aid}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "✏️ Задать target CPA", callback_data=f"set_cpa|{aid}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
                     mr_text,
                     callback_data=f"mr_menu|{aid}",
                 )
@@ -3324,6 +3308,25 @@ def settings_kb(aid: str) -> InlineKeyboardMarkup:
             ],
         ]
     )
+
+
+def cpa_test_rules_kb() -> InlineKeyboardMarkup:
+    rules = _cpa_rules_list(enabled_only=True) or []
+    rows: list[list[InlineKeyboardButton]] = []
+    for r in rules[:30]:
+        if not isinstance(r, dict):
+            continue
+        rid = str(r.get("id") or "").strip()
+        if not rid:
+            continue
+        nm = str(r.get("name") or rid)
+        sch = str(r.get("schedule") or "")
+        lbl = f"{nm} [{sch}]"
+        if len(lbl) > 60:
+            lbl = lbl[:57] + "…"
+        rows.append([InlineKeyboardButton(lbl, callback_data=f"cpa_test_rule|{rid}")])
+    rows.append([InlineKeyboardButton("⬅️ Мониторинг", callback_data="monitoring_menu")])
+    return InlineKeyboardMarkup(rows)
 
 
 def _user_has_focus_settings(user_id: str) -> bool:
@@ -4083,6 +4086,19 @@ async def _on_cb_internal(
         is_sa = bool(is_superadmin(uid))
     except Exception:
         is_sa = False
+
+    # Legacy CPA alerts UI is disabled (new system lives in fb_report/cpa_alerts.py).
+    # This prevents old branches from mutating accounts.json and avoids conflicting behavior.
+    if str(data).startswith("toggle_alert|") or str(data).startswith("set_cpa|") or (
+        str(data).startswith("cpa_") and not str(data).startswith("cpa_test")
+    ):
+        if is_sa:
+            await safe_edit_message(
+                q,
+                "⚠️ Старые настройки CPA-алёртов отключены. Используй 🧪 Тест CPA-алерта в Мониторинге.",
+                reply_markup=monitoring_menu_kb(is_sa=True),
+            )
+        return
 
     if is_active_client_group(str(chat_id)):
         if str(data) == "c_menu":
@@ -5313,8 +5329,36 @@ async def _on_cb_internal(
         await safe_edit_message(
             q,
             "Раздел мониторинга. Выберите пункт:",
-            reply_markup=monitoring_menu_kb(),
+            reply_markup=monitoring_menu_kb(is_sa=bool(is_sa)),
         )
+        return
+
+    if data == "cpa_test_menu":
+        if not is_sa:
+            return
+        await safe_edit_message(
+            q,
+            "🧪 Тест CPA-алерта\n\nВыбери правило:",
+            reply_markup=cpa_test_rules_kb(),
+        )
+        return
+
+    if data.startswith("cpa_test_rule|"):
+        if not is_sa:
+            return
+        rid = str(data.split("|", 1)[1] or "").strip()
+        if not rid:
+            return
+        rr = None
+        try:
+            rr = next((x for x in (_cpa_rules_list(enabled_only=True) or []) if str((x or {}).get("id") or "").strip() == rid), None)
+        except Exception:
+            rr = None
+        schedule = str((rr or {}).get("schedule") or "DAILY").upper().strip()
+        mode = schedule if schedule in {"HOURLY", "DAILY", "DAYS_3", "WEEKLY"} else "DAILY"
+        await safe_edit_message(q, "🧪 Запускаю тест CPA-алерта…")
+        await _run_cpa_alerts_for_mode(context, mode=mode, rule_id=rid, test=True)
+        await safe_edit_message(q, "✅ Тест отправлен в админ-чат", reply_markup=monitoring_menu_kb(is_sa=True))
         return
 
     if data == "heatmap_status_menu":
@@ -8688,6 +8732,7 @@ def build_app() -> Application:
 
     schedule_client_groups_morning_report(app)
 
+    schedule_heatmap_snapshot_collector(app)
     schedule_cpa_alerts(app)
 
     try:
